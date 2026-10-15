@@ -26,9 +26,12 @@ struct SearchView: View {
                                 Text("· \(soulseek.hiddenCount) filtered out")
                             }
                             Spacer()
-                            if soulseek.filters.activeCount > 0 {
-                                Button("Clear Filters") { soulseek.filters = ResultFilters(sort: soulseek.filters.sort) }
-                                    .font(.footnote.weight(.semibold))
+                            if soulseek.filters.activeCount > 0 || soulseek.audioOnly {
+                                Button("Clear Filters") {
+                                    soulseek.audioOnly = false
+                                    soulseek.filters = ResultFilters(sort: soulseek.filters.sort)
+                                }
+                                .font(.footnote.weight(.semibold))
                             }
                         }
                         .font(.footnote)
@@ -43,7 +46,7 @@ struct SearchView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Search")
-            .searchable(text: $query, prompt: "Artist, album or track")
+            .searchable(text: $query, prompt: "Search any file, album, zip, book…")
             .onSubmit(of: .search) { soulseek.search(query) }
             .onReceive(router.$pendingSearch) { pending in
                 // colon3://search?q=… from Shortcuts.
@@ -60,7 +63,7 @@ struct SearchView: View {
                     Button {
                         showFilters = true
                     } label: {
-                        Image(systemName: soulseek.filters.activeCount > 0
+                        Image(systemName: (soulseek.filters.activeCount > 0 || soulseek.audioOnly)
                               ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
                     }
                 }
@@ -72,7 +75,7 @@ struct SearchView: View {
             .overlay {
                 if soulseek.currentQuery.isEmpty && soulseek.isLoggedIn {
                     EmptyStateView(title: "Search Soulseek",
-                                   message: "Results arrive over about 30 seconds as people answer.",
+                                   message: "Search for music, videos, archives, books or any file. Results arrive over ~30 seconds.",
                                    systemImage: "magnifyingglass")
                 }
             }
@@ -152,7 +155,7 @@ struct FolderDetailView: View {
                     }
                     .disabled(!soulseek.isLoggedIn)
                 } footer: {
-                    Text("From \(folder.username) · \(folder.folder). The album cover is fetched too when the folder has one; otherwise it's looked up online.")
+                    Text("From \(folder.username) · \(folder.folder). Audio files go to your music library; other files are saved in Documents/Downloads.")
                 }
 
                 Section {
@@ -191,7 +194,12 @@ struct FileRow: View {
     }
 
     private var details: String {
-        var parts = [Formatting.bytes(file.size)]
+        var parts: [String] = []
+        let ext = file.fileExtension.uppercased()
+        if !ext.isEmpty {
+            parts.append(ext)
+        }
+        parts.append(Formatting.bytes(file.size))
         if let duration = file.attributes.duration { parts.append(Formatting.duration(Double(duration))) }
         if let bitrate = file.attributes.bitrate { parts.append("\(bitrate) kbps") }
         if let depth = file.attributes.bitDepth, let rate = file.attributes.sampleRate {
@@ -212,9 +220,16 @@ struct FileRow: View {
             }
             .buttonStyle(.borderless)
             .disabled(!soulseek.isLoggedIn)
-        case .some(.completed):
-            Image(systemName: "checkmark.circle.fill")
-                .foregroundStyle(.green)
+        case let .some(.completed(url)):
+            HStack(spacing: 10) {
+                ShareLink(item: url) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.body)
+                }
+                .buttonStyle(.borderless)
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
         default:
             ProgressView()
         }
@@ -236,8 +251,8 @@ struct SearchFiltersView: View {
                     }
                 }
 
-                Section("Quality") {
-                    Picker("File Type", selection: $soulseek.filters.fileType) {
+                Section("File Type & Quality") {
+                    Picker("Category", selection: $soulseek.filters.fileType) {
                         ForEach(ResultFilters.FileType.allCases) { Text($0.rawValue).tag($0) }
                     }
                     Picker("Minimum Bitrate", selection: $soulseek.filters.minBitrate) {
@@ -245,7 +260,7 @@ struct SearchFiltersView: View {
                             Text(kbps == 0 ? "Any" : "\(kbps) kbps").tag(kbps)
                         }
                     }
-                    Toggle("Playable Formats Only", isOn: $soulseek.audioOnly)
+                    Toggle("Audio Formats Only", isOn: $soulseek.audioOnly)
                 }
 
                 Section {
@@ -256,11 +271,11 @@ struct SearchFiltersView: View {
                 } header: {
                     Text("Availability")
                 } footer: {
-                    Text("A minimum of around 6 files skips loose singles and finds complete albums.")
+                    Text("A minimum of around 6 files skips single files and finds larger folders/packs.")
                 }
 
                 Section {
-                    TextField("live, remix, karaoke", text: $soulseek.filters.excludeWords)
+                    TextField("live, remix, sample", text: $soulseek.filters.excludeWords)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
@@ -269,9 +284,12 @@ struct SearchFiltersView: View {
                     Text("Hides folders whose path contains any of these.")
                 }
 
-                if !soulseek.filters.isDefault {
+                if !soulseek.filters.isDefault || soulseek.audioOnly {
                     Section {
-                        Button("Reset Filters", role: .destructive) { soulseek.filters = ResultFilters() }
+                        Button("Reset Filters", role: .destructive) {
+                            soulseek.audioOnly = false
+                            soulseek.filters = ResultFilters()
+                        }
                     }
                 }
             }
@@ -313,15 +331,15 @@ struct FilterChips: View {
                 }
 
                 Button {
-                    soulseek.filters.freeSlotOnly.toggle()
+                    soulseek.audioOnly.toggle()
                 } label: {
-                    chip("Free Slot", systemImage: "checkmark.circle", active: soulseek.filters.freeSlotOnly)
+                    chip("Audio Only", systemImage: "music.note", active: soulseek.audioOnly)
                 }
 
                 Button {
-                    soulseek.filters.minFiles = soulseek.filters.minFiles > 1 ? 1 : 6
+                    soulseek.filters.freeSlotOnly.toggle()
                 } label: {
-                    chip("Albums", systemImage: "square.stack", active: soulseek.filters.minFiles > 1)
+                    chip("Free Slot", systemImage: "checkmark.circle", active: soulseek.filters.freeSlotOnly)
                 }
 
                 Button {
