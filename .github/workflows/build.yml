@@ -82,8 +82,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild build \
-            -project colon3.xcodeproj \
-            -scheme colon3 \
+            -project Seekios.xcodeproj \
+            -scheme Seekios \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -95,18 +95,18 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             | tee xcodebuild.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/colon3.app
+          test -d build/Build/Products/Release-iphoneos/Seekios.app
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
-          zip -qry colon3.ipa Payload
+          cp -R build/Build/Products/Release-iphoneos/Seekios.app Payload/
+          zip -qry Seekios.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: colon3-unsigned
-          path: colon3.ipa
+          name: Seekios-unsigned
+          path: Seekios.ipa
           retention-days: 30
 
       - name: Keep build log on failure
@@ -145,7 +145,7 @@ jobs:
       - uses: actions/download-artifact@v4
         if: steps.check.outputs.enabled == 'true'
         with:
-          name: colon3-unsigned
+          name: Seekios-unsigned
           path: dist
 
       - name: Cache zsign
@@ -187,10 +187,10 @@ jobs:
       - name: Sign
         if: steps.check.outputs.enabled == 'true'
         run: |
-          args=(-k "$RUNNER_TEMP/cert.p12" -p "$SIGNING_P12_PASSWORD" -m "$RUNNER_TEMP/profile.mobileprovision" -o colon3-signed.ipa)
+          args=(-k "$RUNNER_TEMP/cert.p12" -p "$SIGNING_P12_PASSWORD" -m "$RUNNER_TEMP/profile.mobileprovision" -o Seekios-signed.ipa)
           if [ -n "$SIGN_BUNDLE_ID" ]; then args+=(-b "$SIGN_BUNDLE_ID"); fi
-          ~/zsign-bin/zsign "${args[@]}" dist/colon3.ipa
-          test -s colon3-signed.ipa
+          ~/zsign-bin/zsign "${args[@]}" dist/Seekios.ipa
+          test -s Seekios-signed.ipa
 
       - name: Configure Pages
         id: pages
@@ -206,7 +206,7 @@ jobs:
           # Pages hosts one site, so each deploy carries both channels: this build's files, plus
           # the other channel's current files copied from the live site.
           if [ "$CHANNEL" = beta ]; then mine=beta/; other=""; else mine=""; other=beta/; fi
-          files="index.html manifest.plist version.json colon3.ipa"
+          files="index.html manifest.plist version.json Seekios.ipa"
           mkdir -p "site/$other"
           for f in $files; do
             curl -fsSL "$BASE/$other$f" -o "site/$other$f" || rm -f "site/$other$f"
@@ -215,7 +215,7 @@ jobs:
           # the event payload, so it never becomes shell code).
           notes="$(scripts/changelog-section.sh "${{ needs.build.outputs.version }}")"
           if [ -z "$notes" ]; then notes="$(git log -1 --format=%B)"; fi
-          python3 scripts/make-ota-site.py colon3-signed.ipa \
+          python3 scripts/make-ota-site.py Seekios-signed.ipa \
             --base-url "$BASE/${mine%/}" \
             --out "site/$mine" \
             --channel "$CHANNEL" \
@@ -262,14 +262,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: colon3-unsigned
+          name: Seekios-unsigned
           path: dist
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          file="dist/colon3-${GITHUB_REF_NAME#v}-unsigned.ipa"
-          mv dist/colon3.ipa "$file"
+          file="dist/Seekios-${GITHUB_REF_NAME#v}-unsigned.ipa"
+          mv dist/Seekios.ipa "$file"
           args=()
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then args+=(--prerelease); fi
           # Use the CHANGELOG section when there is one, otherwise GitHub's generated notes.
@@ -277,5 +277,5 @@ jobs:
           if [ -s notes.md ]; then args+=(--notes-file notes.md); else args+=(--generate-notes); fi
           gh release create "$GITHUB_REF_NAME" "$file" \
             --repo "$GITHUB_REPOSITORY" \
-            --title "colon3 ${GITHUB_REF_NAME#v}" \
+            --title "Seekios ${GITHUB_REF_NAME#v}" \
             "${args[@]}"
