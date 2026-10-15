@@ -1,5 +1,5 @@
 # XcodeGen spec. Run `xcodegen generate` to produce colon3.xcodeproj (it's gitignored).
-name: Seekios
+name: colon3
 options:
   bundleIdPrefix: com.aminewallah
   deploymentTarget:
@@ -23,7 +23,7 @@ targets:
     info:
       path: Support/Info.plist
       properties:
-        CFBundleDisplayName: colon3
+        CFBundleDisplayName: Seekios
         # Filled from MARKETING_VERSION / CURRENT_PROJECT_VERSION below; CI overrides both.
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
