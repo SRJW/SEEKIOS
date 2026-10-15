@@ -49,6 +49,13 @@ struct DownloadsView: View {
         soulseek.visibleDownloads.filter { selection.contains($0.id) }
     }
 
+    private var selectedCompletedURLs: [URL] {
+        selectedItems.compactMap { item in
+            if case let .completed(url) = item.state { return url }
+            return nil
+        }
+    }
+
     var body: some View {
         NavigationStack {
             List(selection: $selection) {
@@ -73,6 +80,25 @@ struct DownloadsView: View {
                                                 Label("Retry", systemImage: "arrow.clockwise")
                                             }
                                             .tint(.blue)
+                                        }
+                                    }
+                                    .contextMenu {
+                                        if case let .completed(url) = item.state {
+                                            ShareLink(item: url) {
+                                                Label("Share / Save to Files…", systemImage: "square.and.arrow.up")
+                                            }
+                                        }
+                                        if case .failed = item.state {
+                                            Button {
+                                                soulseek.retry(item)
+                                            } label: {
+                                                Label("Retry", systemImage: "arrow.clockwise")
+                                            }
+                                        }
+                                        Button(role: .destructive) {
+                                            soulseek.cancel(item)
+                                        } label: {
+                                            Label(item.isActive ? "Cancel Download" : "Remove from List", systemImage: "xmark")
                                         }
                                     }
                             }
@@ -114,7 +140,7 @@ struct DownloadsView: View {
             .confirmationDialog(deleteTitle, isPresented: $confirmDeleteFiles, titleVisibility: .visible) {
                 Button("Delete Files", role: .destructive) { deleteSelectedFiles() }
             } message: {
-                Text("Finished songs are removed from this iPhone. Unfinished downloads are cancelled.")
+                Text("Finished files are permanently removed from this iPhone. Unfinished downloads are cancelled.")
             }
             .overlay {
                 if soulseek.visibleDownloads.isEmpty && soulseek.uploads.isEmpty {
@@ -176,6 +202,7 @@ struct DownloadsView: View {
         let items = selectedItems
         let failed = items.filter { if case .failed = $0.state { return true } else { return false } }.count
         let finishedSongs = soulseek.libraryTracks(for: selection)
+        let urls = selectedCompletedURLs
         return HStack {
             Button {
                 soulseek.retry(selection)
@@ -184,6 +211,12 @@ struct DownloadsView: View {
             }
             .disabled(failed == 0)
             Spacer()
+            if !urls.isEmpty {
+                ShareLink(items: urls) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+                Spacer()
+            }
             Menu {
                 Button { player.playNext(finishedSongs) } label: { Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward") }
                 Button { player.addToQueue(finishedSongs) } label: { Label("Add to Queue", systemImage: "text.line.last.and.arrowtriangle.forward") }
@@ -216,18 +249,23 @@ struct DownloadsView: View {
     }
 
     private var deleteTitle: String {
-        let count = soulseek.libraryTracks(for: selection).count
-        return count == 0 ? "Remove \(selection.count) item\(selection.count == 1 ? "" : "s")?"
-            : "Delete \(count) downloaded song\(count == 1 ? "" : "s")?"
+        let completedCount = selectedCompletedURLs.count
+        return completedCount == 0 ? "Remove \(selection.count) item\(selection.count == 1 ? "" : "s")?"
+            : "Delete \(completedCount) downloaded file\(completedCount == 1 ? "" : "s")?"
     }
 
     private func deleteSelectedFiles() {
         let tracks = soulseek.libraryTracks(for: selection)
+        let trackURLs = Set(tracks.map { $0.url.standardizedFileURL })
         if !tracks.isEmpty {
             player.remove(tracks)
             favorites.forget(tracks)
             playlists.forget(tracks)
             library.delete(tracks)
+        }
+        // Also delete non-audio files from disk (`Documents/Downloads`)
+        for url in selectedCompletedURLs where !trackURLs.contains(url.standardizedFileURL) {
+            try? FileManager.default.removeItem(at: url)
         }
         soulseek.remove(selection)
         selection.removeAll()
@@ -355,24 +393,35 @@ struct DownloadRow: View {
                 .font(.caption)
                 .foregroundStyle(statusColor)
             }
+            if case let .completed(url) = item.state {
+                ShareLink(item: url) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.body)
+                        .foregroundStyle(.tint)
+                        .padding(.leading, 4)
+                }
+                .buttonStyle(.borderless)
+            }
         }
         .padding(.vertical, 2)
     }
 
     private var status: String {
+        let ext = SharedFile(path: item.id.path, size: item.size).fileExtension.uppercased()
+        let prefix = ext.isEmpty ? "" : "\(ext) · "
         switch item.state {
         case .requesting:
-            return "Contacting peer…"
+            return prefix + "Contacting peer…"
         case let .queued(place):
-            return place.map { "Queued (#\($0))" } ?? "Queued"
+            return prefix + (place.map { "Queued (#\($0))" } ?? "Queued")
         case .starting:
-            return "Starting…"
+            return prefix + "Starting…"
         case .transferring:
-            return "\(Formatting.bytes(item.received)) of \(Formatting.bytes(item.size))"
+            return prefix + "\(Formatting.bytes(item.received)) of \(Formatting.bytes(item.size))"
         case .completed:
-            return "Done · \(Formatting.bytes(item.size))"
+            return prefix + "Done · \(Formatting.bytes(item.size))"
         case let .failed(reason):
-            return reason
+            return prefix + reason
         }
     }
 
