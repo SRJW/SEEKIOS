@@ -4,15 +4,31 @@ import SoulseekKit
 /// Search result filters and ordering, saved between launches.
 struct ResultFilters: Codable, Equatable {
     enum FileType: String, Codable, CaseIterable, Identifiable {
-        case any = "Any Type", lossless = "Lossless", lossy = "Lossy", flac = "FLAC", mp3 = "MP3",
-             aac = "AAC / M4A", wav = "WAV / AIFF"
+        case any = "Any File"
+        case audio = "All Audio"
+        case lossless = "Lossless Audio"
+        case lossy = "Lossy Audio"
+        case flac = "FLAC"
+        case mp3 = "MP3"
+        case aac = "AAC / M4A"
+        case wav = "WAV / AIFF"
+        case video = "Video"
+        case archive = "Archives / IPA / ZIP"
+        case document = "Books / Docs"
+        case image = "Images"
+
         var id: String { rawValue }
 
         var shortLabel: String {
             switch self {
             case .any: return "Type"
+            case .audio: return "Audio"
+            case .lossless: return "Lossless"
+            case .lossy: return "Lossy"
             case .aac: return "AAC"
             case .wav: return "WAV"
+            case .archive: return "Archives"
+            case .document: return "Docs"
             default: return rawValue
             }
         }
@@ -33,6 +49,12 @@ struct ResultFilters: Codable, Equatable {
             }
         }
     }
+
+    static let audioSet: Set<String> = ["mp3", "flac", "wav", "aif", "aiff", "alac", "m4a", "aac", "ogg", "opus", "wma", "wv", "ape", "dsf", "dff", "mpc"]
+    static let videoSet: Set<String> = ["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "ts"]
+    static let archiveSet: Set<String> = ["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "dmg", "ipa", "apk", "pkg", "exe"]
+    static let documentSet: Set<String> = ["pdf", "epub", "mobi", "azw3", "djvu", "txt", "rtf", "doc", "docx", "cbr", "cbz"]
+    static let imageSet: Set<String> = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "svg", "heic"]
 
     var fileType: FileType = .any
     /// Minimum kbps for lossy files; lossless files always pass.
@@ -65,15 +87,32 @@ struct ResultFilters: Codable, Equatable {
         let path = folder.folder.lowercased()
         if excludedTerms.contains(where: { path.contains($0) }) { return false }
 
-        let extensions = Set(folder.files.map(\.fileExtension))
+        let extensions = Set(folder.files.map { $0.fileExtension.lowercased() })
         switch fileType {
-        case .any: break
-        case .lossless: if !folder.isLossless { return false }
-        case .lossy: if folder.isLossless { return false }
-        case .flac: if !extensions.isSubset(of: ["flac"]) { return false }
-        case .mp3: if !extensions.isSubset(of: ["mp3"]) { return false }
-        case .aac: if !extensions.isSubset(of: ["m4a", "aac", "mp4", "m4b"]) { return false }
-        case .wav: if !extensions.isSubset(of: ["wav", "aif", "aiff"]) { return false }
+        case .any:
+            break
+        case .audio:
+            if extensions.isDisjoint(with: Self.audioSet) { return false }
+        case .lossless:
+            if !folder.isLossless { return false }
+        case .lossy:
+            if folder.isLossless || extensions.isDisjoint(with: Self.audioSet) { return false }
+        case .flac:
+            if !extensions.contains("flac") { return false }
+        case .mp3:
+            if !extensions.contains("mp3") { return false }
+        case .aac:
+            if extensions.isDisjoint(with: ["m4a", "aac", "mp4", "m4b"]) { return false }
+        case .wav:
+            if extensions.isDisjoint(with: ["wav", "aif", "aiff"]) { return false }
+        case .video:
+            if extensions.isDisjoint(with: Self.videoSet) { return false }
+        case .archive:
+            if extensions.isDisjoint(with: Self.archiveSet) { return false }
+        case .document:
+            if extensions.isDisjoint(with: Self.documentSet) { return false }
+        case .image:
+            if extensions.isDisjoint(with: Self.imageSet) { return false }
         }
 
         if minBitrate > 0, !folder.isLossless {
@@ -148,7 +187,6 @@ struct ResultFilters: Codable, Equatable {
         }
         if covered == terms.count { score += 10 }
         if !phrase.isEmpty, name.contains(phrase) || (parents + " " + name).contains(phrase) { score += 8 }
-        // Extra matching songs suggest an album rather than a stray single.
         score += min(folder.files.count, 12) / 4
         return score
     }
@@ -161,14 +199,14 @@ struct ResultFilters: Codable, Equatable {
     }
 
     static func load() -> ResultFilters {
-        guard let data = UserDefaults.standard.data(forKey: "search.filters.v2"),
+        guard let data = UserDefaults.standard.data(forKey: "search.filters.v3"),
               let filters = try? JSONDecoder().decode(ResultFilters.self, from: data) else { return ResultFilters() }
         return filters
     }
 
     func save() {
         if let data = try? JSONEncoder().encode(self) {
-            UserDefaults.standard.set(data, forKey: "search.filters.v2")
+            UserDefaults.standard.set(data, forKey: "search.filters.v3")
         }
     }
 }
@@ -176,17 +214,20 @@ struct ResultFilters: Codable, Equatable {
 extension FolderResult {
     var isLossless: Bool {
         !files.isEmpty && files.allSatisfy { file in
-            ["flac", "wav", "aif", "aiff", "alac"].contains(file.fileExtension) || file.attributes.bitDepth != nil
+            ["flac", "wav", "aif", "aiff", "alac"].contains(file.fileExtension.lowercased()) || file.attributes.bitDepth != nil
         }
     }
 
-    /// Rough ordering: hi-res lossless > lossless > high-bitrate lossy.
+    /// Rough ordering: hi-res lossless > lossless > high-bitrate lossy > larger general files.
     var qualityScore: Int {
         if isLossless {
             let depth = files.compactMap(\.attributes.bitDepth).max() ?? 16
             let rate = files.compactMap(\.attributes.sampleRate).max() ?? 44_100
             return 10_000 + Int(depth) * 100 + Int(rate / 1000)
         }
-        return Int(files.compactMap(\.attributes.bitrate).min() ?? 0)
+        if let minBitrate = files.compactMap(\.attributes.bitrate).min() {
+            return Int(minBitrate)
+        }
+        return Int(min(totalSize / 1_048_576, 5_000))
     }
 }
