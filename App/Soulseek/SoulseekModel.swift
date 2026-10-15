@@ -1,6 +1,15 @@
 import Foundation
 import SoulseekKit
 
+/// Estructura para guardar el historial en el disco duro del iPhone
+struct SavedHistoryItem: Codable {
+    let username: String
+    let path: String
+    let size: UInt64
+    let isCompleted: Bool
+    let urlPath: String?
+}
+
 /// A folder from one user's search results — can contain music or any other files.
 struct FolderResult: Identifiable {
     let id: String
@@ -144,9 +153,12 @@ final class SoulseekModel: ObservableObject {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         self.otherDownloadsDirectory = docs.appendingPathComponent("Downloads", isDirectory: true)
         try? FileManager.default.createDirectory(at: self.otherDownloadsDirectory, withIntermediateDirectories: true)
-
+        
         client = SoulseekClient(downloadDirectory: library.root,
                                 incompleteDirectory: support.appendingPathComponent("Incomplete", isDirectory: true))
+        
+        loadHistory() // Carga el historial al abrir la app
+
         client.onEvent = { [weak self] event in self?.handle(event) }
         library.onSharesChanged = { [weak self] shares in self?.client.updateShares(shares) }
     }
@@ -190,6 +202,36 @@ final class SoulseekModel: ObservableObject {
     func logOut() {
         client.disconnect()
     }
+    
+    // MARK: Persistencia del Historial
+    
+    private func saveHistory() {
+        let history = downloads.compactMap { item -> SavedHistoryItem? in
+            switch item.state {
+            case let .completed(url):
+                return SavedHistoryItem(username: item.id.username, path: item.id.path, size: item.size, isCompleted: true, urlPath: url.path)
+            default:
+                // Si la app se cierra, queda como interrumpida/fallida
+                return SavedHistoryItem(username: item.id.username, path: item.id.path, size: item.size, isCompleted: false, urlPath: nil)
+            }
+        }
+        if let data = try? JSONEncoder().encode(history) {
+            UserDefaults.standard.set(data, forKey: "downloads_history_v2")
+        }
+    }
+
+    private func loadHistory() {
+        guard let data = UserDefaults.standard.data(forKey: "downloads_history_v2"),
+              let history = try? JSONDecoder().decode([SavedHistoryItem].self, from: data) else { return }
+
+        self.downloads = history.map { saved in
+            let id = DownloadID(username: saved.username, path: saved.path)
+            let state: DownloadState = (saved.isCompleted && saved.urlPath != nil)
+                ? .completed(URL(fileURLWithPath: saved.urlPath!))
+                : .failed("Interrupted")
+            return DownloadItem(id: id, state: state, received: saved.isCompleted ? saved.size : 0, size: saved.size)
+        }
+    }
 
     // MARK: Search
 
@@ -205,7 +247,6 @@ final class SoulseekModel: ObservableObject {
         searchToken = client.search(trimmed)
     }
 
-    /// Separate from the main search so it doesn't replace what's on the Search tab.
     func findTrack(artist: String, title: String) {
         guard isLoggedIn else { return }
         trackCandidates = []
@@ -301,8 +342,6 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    /// Once per folder: asks the peer for the full listing, which gives the album's cover image
-    /// (downloaded so the library has local art) and its complete tracklist (for missing songs).
     private func fetchCover(username: String, folder: String, knownImages: [SharedFile]) {
         let key = username + "|" + folder
         guard !coverRequested.contains(key) else { return }
@@ -317,14 +356,12 @@ final class SoulseekModel: ObservableObject {
             if let best = Self.bestCover(images.isEmpty ? knownImages : images) {
                 self.client.download(username: username, file: best)
             }
-            // Synced lyrics some rippers keep next to the music; tiny, so take them all.
             for lyrics in (files ?? []) where lyrics.folder == folder && lyrics.fileExtension == "lrc" && lyrics.size < 512_000 {
                 self.client.download(username: username, file: lyrics)
             }
         }
     }
 
-    /// Downloads a missing song straight into the album's existing folder.
     func downloadMissing(_ file: SharedFile, from username: String, into album: Album) {
         client.download(username: username, file: file, folderName: album.folder.lastPathComponent)
     }
@@ -349,14 +386,12 @@ final class SoulseekModel: ObservableObject {
         remove([item.id])
     }
 
-    /// Cancels anything still running and drops the entries. The client forgets them too, so the
-    /// same file can be downloaded again later.
     func remove(_ ids: Set<DownloadID>) {
         for id in ids { client.cancel(id) }
         downloads.removeAll { ids.contains($0.id) }
+        saveHistory() // Guarda historial tras eliminar
     }
 
-    /// Retries the failed ones among `ids`; returns how many.
     @discardableResult
     func retry(_ ids: Set<DownloadID>) -> Int {
         var count = 0
@@ -390,7 +425,6 @@ final class SoulseekModel: ObservableObject {
         remove(Set(downloads.filter(\.isActive).map(\.id)))
     }
 
-    /// Finished downloads among `ids` that are songs in the library.
     func libraryTracks(for ids: Set<DownloadID>) -> [Track] {
         downloads.compactMap { item -> Track? in
             guard ids.contains(item.id), case let .completed(url) = item.state else { return nil }
@@ -414,8 +448,6 @@ final class SoulseekModel: ObservableObject {
         downloads.first { $0.id == DownloadID(username: username, path: file.path) }?.state
     }
 
-    /// Moves non-audio files out of the music library into `Documents/Downloads/<FolderName>/<FileName>`
-    /// so the music player doesn't try to parse them as songs.
     private func relocateToOtherDownloads(fileURL: URL, remotePath: String) -> URL {
         let fm = FileManager.default
         let shared = SharedFile(path: remotePath, size: 0)
@@ -478,20 +510,38 @@ final class SoulseekModel: ObservableObject {
                 }()
                 if !wasCompleted { stats?.recordDownload(bytes: update.size, from: update.id.username) }
 
-                // If it's NOT audio and NOT album cover/lyrics, move it straight to Documents/Downloads
                 if !isAudio && !isSidecar {
                     let movedURL = relocateToOtherDownloads(fileURL: url, remotePath: update.id.path)
                     finalState = .completed(movedURL)
                 }
             }
+            
+            // Determinar si es un estado definitivo
+            let isFinal: Bool
+            switch finalState {
+            case .completed, .failed: isFinal = true
+            default: isFinal = false
+            }
 
             if let index = downloads.firstIndex(where: { $0.id == update.id }) {
+                let wasFinal: Bool
+                switch downloads[index].state {
+                case .completed, .failed: wasFinal = true
+                default: wasFinal = false
+                }
+                
                 downloads[index].state = finalState
                 downloads[index].received = update.received
                 downloads[index].size = update.size
+                
+                // Si acaba de terminar o fallar, guarda en el historial
+                if isFinal && !wasFinal {
+                    saveHistory()
+                }
             } else {
                 downloads.insert(DownloadItem(id: update.id, state: finalState,
                                               received: update.received, size: update.size), at: 0)
+                saveHistory() // Guarda al agregarlo a la lista por primera vez
             }
 
             if case .completed = finalState {
@@ -504,7 +554,6 @@ final class SoulseekModel: ObservableObject {
                         library.bumpArtwork()
                     }
                 } else if isAudio {
-                    // Only rescan the music library when an actual audio track finishes!
                     library.rescan()
                 }
             }
