@@ -1,13 +1,7 @@
 name: CI/CD
 
-# Every push and PR: protocol tests on Linux, then an unsigned IPA from macOS.
-# Pushes to main: also sign with the distribution cert (if the secrets are set)
-#   and publish an over-the-air install page on GitHub Pages.
-# Tags v*: also attach the unsigned IPA to a GitHub Release.
-
 on:
   push:
-    # main → the stable install page; beta → a separate beta page at /beta/.
     branches: [main, beta]
     tags: ["v*"]
   pull_request:
@@ -18,10 +12,9 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
-  # Pinned so signing doesn't change underneath us; bump deliberately.
   ZSIGN_COMMIT: 614caa8d1ca949e260e5746144aa52d27a4b08d6
 
 jobs:
@@ -55,10 +48,8 @@ jobs:
           else
             version="$(sed -nE 's/^ *MARKETING_VERSION: *"?([^"]+)"?.*/\1/p' project.yml | head -1)"
           fi
-          # Beta branch and tags like v0.4.0-beta.1 build the beta channel.
           channel=stable
           if [[ "$GITHUB_REF" == refs/heads/beta || "$version" == *-* ]]; then channel=beta; fi
-          # iOS wants plain numbers here: v0.4.0-beta.1 → 0.4.0.
           version="${version%%-*}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "build=$GITHUB_RUN_NUMBER" >> "$GITHUB_OUTPUT"
@@ -66,7 +57,6 @@ jobs:
           echo "Version $version (build $GITHUB_RUN_NUMBER, $channel)"
 
       - name: Use the newest Xcode on the runner
-        # Xcode 26+ builds the native Liquid Glass mini player; older ones fall back to a floating pill.
         run: |
           latest="$(find /Applications -maxdepth 1 -name 'Xcode_*.app' | grep -vi beta | sort -V | tail -1)"
           if [ -n "$latest" ]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
@@ -81,9 +71,11 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" App/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" App/Info.plist 2>/dev/null || true
           xcodebuild build \
-            -project Seekios.xcodeproj \
-            -scheme Seekios \
+            -project colon3.xcodeproj \
+            -scheme colon3 \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
@@ -91,16 +83,19 @@ jobs:
             MARKETING_VERSION="${{ steps.version.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
             COLON3_CHANNEL="${{ steps.version.outputs.channel }}" \
+            INFOPLIST_KEY_CFBundleDisplayName="Seekios" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             | tee xcodebuild.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/Seekios.app
+          test -d build/Build/Products/Release-iphoneos/colon3.app
 
       - name: Package IPA
         run: |
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/Seekios.app Payload/
+          cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" Payload/colon3.app/Info.plist 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" Payload/colon3.app/Info.plist || true
           zip -qry Seekios.ipa Payload
 
       - uses: actions/upload-artifact@v4
@@ -115,141 +110,6 @@ jobs:
         with:
           name: xcodebuild-log
           path: xcodebuild.log
-
-  sign:
-    name: Sign and stage install page
-    needs: build
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/beta')
-    runs-on: ubuntu-latest
-    outputs:
-      enabled: ${{ steps.check.outputs.enabled }}
-    env:
-      SIGNING_P12_BASE64: ${{ secrets.SIGNING_P12_BASE64 }}
-      SIGNING_P12_PASSWORD: ${{ secrets.SIGNING_P12_PASSWORD }}
-      SIGNING_PROFILE_BASE64: ${{ secrets.SIGNING_PROFILE_BASE64 }}
-      SIGN_BUNDLE_ID: ${{ vars.SIGN_BUNDLE_ID }}
-    steps:
-      - name: Check signing secrets
-        id: check
-        run: |
-          if [ -n "$SIGNING_P12_BASE64" ] && [ -n "$SIGNING_PROFILE_BASE64" ]; then
-            echo "enabled=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Signing secrets not set; skipping signing and the install page. See README › CI/CD."
-          fi
-
-      - uses: actions/checkout@v4
-        if: steps.check.outputs.enabled == 'true'
-
-      - uses: actions/download-artifact@v4
-        if: steps.check.outputs.enabled == 'true'
-        with:
-          name: Seekios-unsigned
-          path: dist
-
-      - name: Cache zsign
-        id: zsign-cache
-        if: steps.check.outputs.enabled == 'true'
-        uses: actions/cache@v4
-        with:
-          path: ~/zsign-bin
-          key: zsign-${{ runner.os }}-${{ env.ZSIGN_COMMIT }}
-
-      - name: Build zsign
-        if: steps.check.outputs.enabled == 'true' && steps.zsign-cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq g++ pkg-config libssl-dev
-          git init -q zsign && cd zsign
-          git fetch -q --depth 1 https://github.com/zhlynn/zsign.git "$ZSIGN_COMMIT"
-          git checkout -q FETCH_HEAD
-          cd build/linux && make clean >/dev/null && make
-          mkdir -p ~/zsign-bin && cp ../../bin/zsign ~/zsign-bin/
-
-      - name: Decode certificate and profile
-        if: steps.check.outputs.enabled == 'true'
-        run: |
-          umask 077
-          echo "$SIGNING_P12_BASE64" | base64 -d > "$RUNNER_TEMP/cert.p12"
-          echo "$SIGNING_PROFILE_BASE64" | base64 -d > "$RUNNER_TEMP/profile.mobileprovision"
-
-      - name: Check certificate (revocation)
-        if: steps.check.outputs.enabled == 'true'
-        continue-on-error: true
-        run: |
-          {
-            echo '### Signing certificate'
-            echo '```'
-            ~/zsign-bin/zsign -C "$RUNNER_TEMP/cert.p12" -p "$SIGNING_P12_PASSWORD" 2>&1 || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Sign
-        if: steps.check.outputs.enabled == 'true'
-        run: |
-          args=(-k "$RUNNER_TEMP/cert.p12" -p "$SIGNING_P12_PASSWORD" -m "$RUNNER_TEMP/profile.mobileprovision" -o Seekios-signed.ipa)
-          if [ -n "$SIGN_BUNDLE_ID" ]; then args+=(-b "$SIGN_BUNDLE_ID"); fi
-          ~/zsign-bin/zsign "${args[@]}" dist/Seekios.ipa
-          test -s Seekios-signed.ipa
-
-      - name: Configure Pages
-        id: pages
-        if: steps.check.outputs.enabled == 'true'
-        uses: actions/configure-pages@v5
-
-      - name: Build install page
-        if: steps.check.outputs.enabled == 'true'
-        env:
-          BASE: ${{ steps.pages.outputs.base_url }}
-          CHANNEL: ${{ needs.build.outputs.channel }}
-        run: |
-          # Pages hosts one site, so each deploy carries both channels: this build's files, plus
-          # the other channel's current files copied from the live site.
-          if [ "$CHANNEL" = beta ]; then mine=beta/; other=""; else mine=""; other=beta/; fi
-          files="index.html manifest.plist version.json Seekios.ipa"
-          mkdir -p "site/$other"
-          for f in $files; do
-            curl -fsSL "$BASE/$other$f" -o "site/$other$f" || rm -f "site/$other$f"
-          done
-          # Notes: this version's CHANGELOG section, else the commit message (read from git, not
-          # the event payload, so it never becomes shell code).
-          notes="$(scripts/changelog-section.sh "${{ needs.build.outputs.version }}")"
-          if [ -z "$notes" ]; then notes="$(git log -1 --format=%B)"; fi
-          python3 scripts/make-ota-site.py Seekios-signed.ipa \
-            --base-url "$BASE/${mine%/}" \
-            --out "site/$mine" \
-            --channel "$CHANNEL" \
-            --commit "$GITHUB_SHA" \
-            --notes "$notes"
-          echo "Install page ($CHANNEL): $BASE/$mine" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-pages-artifact@v3
-        if: steps.check.outputs.enabled == 'true'
-        with:
-          path: site
-
-      - name: Remove secrets from disk
-        if: always()
-        run: rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/profile.mobileprovision"
-
-  deploy:
-    name: Deploy install page
-    needs: sign
-    if: needs.sign.outputs.enabled == 'true'
-    runs-on: ubuntu-latest
-    # main and beta deploy one after the other, never at once.
-    concurrency:
-      group: pages-deploy
-      cancel-in-progress: false
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
 
   release:
     name: GitHub Release
@@ -272,8 +132,7 @@ jobs:
           mv dist/Seekios.ipa "$file"
           args=()
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then args+=(--prerelease); fi
-          # Use the CHANGELOG section when there is one, otherwise GitHub's generated notes.
-          scripts/changelog-section.sh "${{ needs.build.outputs.version }}" > notes.md
+          scripts/changelog-section.sh "${{ needs.build.outputs.version }}" > notes.md || true
           if [ -s notes.md ]; then args+=(--notes-file notes.md); else args+=(--generate-notes); fi
           gh release create "$GITHUB_REF_NAME" "$file" \
             --repo "$GITHUB_REPOSITORY" \
