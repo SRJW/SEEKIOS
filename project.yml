@@ -1,5 +1,5 @@
 # XcodeGen spec. Run `xcodegen generate` to produce colon3.xcodeproj (it's gitignored).
-name: colon3
+name: Seekios
 options:
   bundleIdPrefix: com.aminewallah
   deploymentTarget:
