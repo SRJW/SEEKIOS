@@ -1,7 +1,7 @@
 import Foundation
 import SoulseekKit
 
-/// A folder from one user's search results — usually an album.
+/// A folder from one user's search results — can contain music or any other files.
 struct FolderResult: Identifiable {
     let id: String
     let username: String
@@ -18,7 +18,7 @@ struct FolderResult: Identifiable {
         return parts.last.map(String.init) ?? username
     }
 
-    /// Parent folders, e.g. "Music\Artist" — helps tell same-named albums apart.
+    /// Parent folders, e.g. "Music\Artist" — helps tell same-named folders apart.
     var parentPath: String {
         folder.split(separator: "\\").dropLast().joined(separator: " › ")
     }
@@ -29,8 +29,15 @@ struct FolderResult: Identifiable {
     var coverQuery: String { CoverLookup.query(forFolderPath: folder) }
 
     var formatSummary: String {
-        let extensions = Set(files.map { $0.fileExtension.uppercased() })
-        var summary = extensions.sorted().joined(separator: "/")
+        let extensions = Set(files.map {
+            let ext = $0.fileExtension.uppercased()
+            return ext.isEmpty ? "FILE" : ext
+        })
+        let sorted = extensions.sorted()
+        var summary = sorted.prefix(4).joined(separator: "/")
+        if sorted.count > 4 {
+            summary += " +\(sorted.count - 4)"
+        }
         if let file = files.first(where: { $0.attributes.bitDepth != nil }),
            let depth = file.attributes.bitDepth, let rate = file.attributes.sampleRate {
             summary += " \(depth)/\(Formatting.kilohertz(rate))"
@@ -51,8 +58,9 @@ struct DownloadItem: Identifiable {
     var folderPath: String { SharedFile(path: id.path, size: size).folder }
 
     /// Cover images and .lrc lyrics fetched alongside albums; kept out of the downloads list.
+    /// Now always false so direct image/file downloads remain visible to the user.
     var isArtwork: Bool {
-        LibraryStore.sidecarExtensions.contains(SharedFile(path: id.path, size: size).fileExtension)
+        false
     }
 
     var progress: Double {
@@ -100,7 +108,8 @@ final class SoulseekModel: ObservableObject {
     @Published private(set) var isFindingTrack = false
     @Published private(set) var logLines: [String] = []
     @Published var username: String = UserDefaults.standard.string(forKey: "username") ?? ""
-    @Published var audioOnly = true {
+    /// Changed default to `false` so all file types appear in searches by default.
+    @Published var audioOnly = false {
         didSet { rebuildResults() }
     }
     @Published var filters = ResultFilters.load() {
@@ -114,6 +123,8 @@ final class SoulseekModel: ObservableObject {
 
     let client: SoulseekClient
     let library: LibraryStore
+    /// Directory where non-audio files are saved (`Documents/Downloads`).
+    let otherDownloadsDirectory: URL
     /// Set by the app; receives full folder listings for the missing-songs view.
     weak var completeness: AlbumCompletenessStore?
     weak var stats: StatsStore?
@@ -130,6 +141,10 @@ final class SoulseekModel: ObservableObject {
     init(library: LibraryStore) {
         self.library = library
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        self.otherDownloadsDirectory = docs.appendingPathComponent("Downloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: self.otherDownloadsDirectory, withIntermediateDirectories: true)
+
         client = SoulseekClient(downloadDirectory: library.root,
                                 incompleteDirectory: support.appendingPathComponent("Incomplete", isDirectory: true))
         client.onEvent = { [weak self] event in self?.handle(event) }
@@ -281,7 +296,9 @@ final class SoulseekModel: ObservableObject {
 
     func downloadFolder(_ folder: FolderResult) {
         folder.files.forEach { client.download(username: folder.username, file: $0) }
-        fetchCover(username: folder.username, folder: folder.folder, knownImages: folder.images)
+        if folder.files.contains(where: { LibraryStore.audioExtensions.contains($0.fileExtension) }) {
+            fetchCover(username: folder.username, folder: folder.folder, knownImages: folder.images)
+        }
     }
 
     /// Once per folder: asks the peer for the full listing, which gives the album's cover image
@@ -397,6 +414,34 @@ final class SoulseekModel: ObservableObject {
         downloads.first { $0.id == DownloadID(username: username, path: file.path) }?.state
     }
 
+    /// Moves non-audio files out of the music library into `Documents/Downloads/<FolderName>/<FileName>`
+    /// so the music player doesn't try to parse them as songs.
+    private func relocateToOtherDownloads(fileURL: URL, remotePath: String) -> URL {
+        let fm = FileManager.default
+        let shared = SharedFile(path: remotePath, size: 0)
+        let folderName = shared.folder.split(separator: "\\").last.map(String.init) ?? "Misc"
+        let targetSubfolder = otherDownloadsDirectory.appendingPathComponent(folderName, isDirectory: true)
+        try? fm.createDirectory(at: targetSubfolder, withIntermediateDirectories: true)
+
+        let destinationURL = targetSubfolder.appendingPathComponent(fileURL.lastPathComponent)
+        if fileURL.standardizedFileURL == destinationURL.standardizedFileURL {
+            return fileURL
+        }
+        try? fm.removeItem(at: destinationURL)
+        do {
+            try fm.moveItem(at: fileURL, to: destinationURL)
+            let parentDir = fileURL.deletingLastPathComponent()
+            if parentDir.standardizedFileURL != library.root.standardizedFileURL,
+               let contents = try? fm.contentsOfDirectory(atPath: parentDir.path),
+               contents.isEmpty {
+                try? fm.removeItem(at: parentDir)
+            }
+            return destinationURL
+        } catch {
+            return fileURL
+        }
+    }
+
     // MARK: Events
 
     private func handle(_ event: ClientEvent) {
@@ -421,32 +466,45 @@ final class SoulseekModel: ObservableObject {
             }
 
         case let .download(update):
-            if case .completed = update.state, !LibraryStore.sidecarExtensions.contains(SharedFile(path: update.id.path, size: 0).fileExtension) {
+            var finalState = update.state
+            let ext = SharedFile(path: update.id.path, size: 0).fileExtension.lowercased()
+            let isAudio = LibraryStore.audioExtensions.contains(ext)
+            let isSidecar = LibraryStore.sidecarExtensions.contains(ext)
+
+            if case let .completed(url) = update.state {
                 let wasCompleted: Bool = {
                     guard let old = downloads.first(where: { $0.id == update.id }), case .completed = old.state else { return false }
                     return true
                 }()
                 if !wasCompleted { stats?.recordDownload(bytes: update.size, from: update.id.username) }
+
+                // If it's NOT audio and NOT album cover/lyrics, move it straight to Documents/Downloads
+                if !isAudio && !isSidecar {
+                    let movedURL = relocateToOtherDownloads(fileURL: url, remotePath: update.id.path)
+                    finalState = .completed(movedURL)
+                }
             }
+
             if let index = downloads.firstIndex(where: { $0.id == update.id }) {
-                downloads[index].state = update.state
+                downloads[index].state = finalState
                 downloads[index].received = update.received
                 downloads[index].size = update.size
             } else {
-                downloads.insert(DownloadItem(id: update.id, state: update.state,
+                downloads.insert(DownloadItem(id: update.id, state: finalState,
                                               received: update.received, size: update.size), at: 0)
             }
-            if case .completed = update.state {
-                let ext = SharedFile(path: update.id.path, size: 0).fileExtension
+
+            if case .completed = finalState {
                 if ext == "lrc" {
-                    // Sidecar lyrics: nothing to rescan, LyricsView looks for them when it opens.
+                    // Sidecar lyrics: nothing to rescan.
                 } else if LibraryStore.imageExtensions.contains(ext) {
                     let library = self.library
                     Task {
                         await ArtworkStore.shared.invalidateFolders()
                         library.bumpArtwork()
                     }
-                } else {
+                } else if isAudio {
+                    // Only rescan the music library when an actual audio track finishes!
                     library.rescan()
                 }
             }
