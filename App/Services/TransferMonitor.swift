@@ -2,13 +2,10 @@ import ActivityKit
 import Combine
 import Foundation
 import SoulseekKit
+import UserNotifications
 
-/// Watches Soulseek transfers and playback. While transfers run and nothing is playing it shows a
-/// Live Activity (Dynamic Island / Lock Screen) and keeps the app awake in the background.
-/// When music plays, the system's Now Playing takes the Island instead.
-///
-/// Seeding Mode does the same with no transfers at all: the app stays online in the background
-/// so peers can keep downloading from you, and reconnects if the server drops it.
+/// Watches Soulseek transfers and playback. Shows both a Live Activity (Lock Screen / Dynamic Island)
+/// and an updating system notification with a progress bar so progress is visible in all environments.
 @MainActor
 final class TransferMonitor {
     private let soulseek: SoulseekModel
@@ -24,8 +21,15 @@ final class TransferMonitor {
     private var lastSample = Date()
     private var speed: Double = 0
 
-    /// Everything in the current burst of transfers, finished ones included, so the island's
-    /// percentage climbs to 100% instead of resetting each time a file completes.
+    /// Control para no saturar el centro de notificaciones de iOS
+    private var lastNotifiedPercent: Int = -1
+    private var lastNotifiedFile: String = ""
+    private var wasDownloading = false
+    private let progressNotificationID = "seekios.transfer.progress"
+    private let finishedNotificationID = "seekios.transfer.finished"
+
+    /// Everything in the current burst of transfers, finished ones included, so the percentage
+    /// climbs to 100% instead of resetting each time a file completes.
     private struct Progress { var done: UInt64; var size: UInt64 }
     private var downloadBatch: [DownloadID: Progress] = [:]
     private var uploadBatch: [DownloadID: Progress] = [:]
@@ -34,6 +38,8 @@ final class TransferMonitor {
         self.soulseek = soulseek
         self.player = player
         self.stats = stats
+
+        requestNotificationPermission()
 
         // Activities left over from a previous run (crash, force quit) would otherwise linger.
         for stale in Activity<TransferActivityAttributes>.activities {
@@ -62,6 +68,10 @@ final class TransferMonitor {
     }
 
     var isSeeding: Bool { AppSettings.seedingEnabled }
+
+    private func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
+    }
 
     func refresh() {
         update(downloads: soulseek.downloads, uploads: soulseek.uploads, isPlaying: player.isPlaying)
@@ -99,19 +109,31 @@ final class TransferMonitor {
             keeper.stop()
         }
 
+        let fraction = batchFraction(downloads: downloads, uploads: uploads, busy: busy)
+
+        // Actualizar notificación con barra de progreso en el Centro de Notificaciones
+        updateSystemNotification(
+            activeDownloads: activeDownloads,
+            moving: moving,
+            sending: sending,
+            fraction: fraction,
+            currentSpeed: moving.isEmpty && sending.isEmpty ? 0 : speed
+        )
+
         guard AppSettings.flag(AppSettings.transferActivityKey) else {
             endActivity(finished: false)
             return
         }
-        let fraction = batchFraction(downloads: downloads, uploads: uploads, busy: busy)
-        if (busy || seeding), !isPlaying {
+
+        // Ahora muestra la Live Activity también aunque estés reproduciendo música
+        if busy || seeding {
             let state = TransferActivityAttributes.ContentState(
                 downloading: moving.count,
                 uploading: sending.count,
                 queued: activeDownloads.count - moving.count,
                 fraction: fraction,
                 bytesPerSecond: moving.isEmpty && sending.isEmpty ? 0 : speed,
-                currentFile: moving.first?.filename ?? sending.first?.filename ?? "",
+                currentFile: moving.first?.filename ?? sending.first?.filename ?? activeDownloads.first?.filename ?? "",
                 finished: false,
                 seeding: seeding ? soulseek.library.tracks.count : 0,
                 sessionUploaded: Double(stats?.sessionUploadedBytes ?? 0))
@@ -131,10 +153,9 @@ final class TransferMonitor {
         for item in downloads where !item.isArtwork {
             switch item.state {
             case .completed:
-                // Only files that were part of this burst count as done.
                 if downloadBatch[item.id] != nil { current[item.id] = Progress(done: item.size, size: item.size) }
             case .failed:
-                break  // Leaves the batch; a retry adds it back.
+                break
             default:
                 current[item.id] = Progress(done: min(item.received, item.size), size: item.size)
             }
@@ -159,6 +180,74 @@ final class TransferMonitor {
         let done = all.reduce(UInt64(0)) { $0 + $1.done }
         return size > 0 ? min(1, Double(done) / Double(size)) : 0
     }
+
+    // MARK: - Notificación de Sistema con Barra de Progreso
+
+    private static func visualProgressBar(fraction: Double, width: Int = 12) -> String {
+        let clamped = min(max(fraction, 0), 1)
+        let filled = Int((clamped * Double(width)).rounded())
+        let empty = max(0, width - filled)
+        return String(repeating: "▰", count: filled) + String(repeating: "▱", count: empty)
+    }
+
+    private func updateSystemNotification(
+        activeDownloads: [DownloadItem],
+        moving: [DownloadItem],
+        sending: [UploadItem],
+        fraction: Double,
+        currentSpeed: Double
+    ) {
+        let center = UNUserNotificationCenter.current()
+
+        if !activeDownloads.isEmpty {
+            wasDownloading = true
+            let percent = Int((fraction * 100).rounded())
+            let currentName = moving.first?.filename ?? activeDownloads.first?.filename ?? "Downloading…"
+
+            // Actualiza si el porcentaje cambió al menos un 2% o cambió el archivo
+            guard abs(percent - lastNotifiedPercent) >= 2 || currentName != lastNotifiedFile else { return }
+            lastNotifiedPercent = percent
+            lastNotifiedFile = currentName
+
+            let bar = Self.visualProgressBar(fraction: fraction)
+            let speedStr = currentSpeed > 0
+                ? " · " + ByteCountFormatter.string(fromByteCount: Int64(currentSpeed), countStyle: .file) + "/s"
+                : ""
+
+            let content = UNMutableNotificationContent()
+            content.title = "Seekios · Downloading (\(percent)%)"
+            content.subtitle = "\(bar) \(percent)%\(speedStr)"
+            if activeDownloads.count > 1 {
+                content.body = "\(currentName) (+\(activeDownloads.count - 1) more)"
+            } else {
+                content.body = currentName
+            }
+            content.sound = nil
+            if #available(iOS 15.0, *) {
+                content.interruptionLevel = .passive
+            }
+
+            let request = UNNotificationRequest(identifier: progressNotificationID, content: content, trigger: nil)
+            center.add(request)
+        } else if wasDownloading {
+            // Terminaron todas las descargas activas
+            wasDownloading = false
+            lastNotifiedPercent = -1
+            lastNotifiedFile = ""
+            center.removeDeliveredNotifications(withIdentifiers: [progressNotificationID])
+
+            let content = UNMutableNotificationContent()
+            content.title = "Seekios · Downloads Complete"
+            content.subtitle = "▰▰▰▰▰▰▰▰▰▰▰▰ 100%"
+            content.body = "All active downloads have finished."
+            content.sound = .default
+
+            let request = UNNotificationRequest(identifier: finishedNotificationID, content: content, trigger: nil)
+            center.add(request)
+        }
+    }
+
+    // MARK: - Live Activity (Lock Screen / Dynamic Island)
 
     private func showActivity(_ state: TransferActivityAttributes.ContentState) {
         let content = ActivityContent(state: state, staleDate: Date().addingTimeInterval(90))
