@@ -1,181 +1,34 @@
-# colon3 (:3)
+# Seekios 📱🎧
 
-A native Soulseek client and music player for iOS. Search the Soulseek network, download straight to the phone, and play from a local library. No server or desktop client in between.
+**Seekios** es un cliente open-source de Soulseek elegante y nativo para iOS, construido en Swift y SwiftUI. Diseñado originalmente como un reproductor de música, ha sido adaptado para convertirse en un **gestor universal de descargas y buscador P2P** directamente en tu iPhone o iPad.
 
-- **Library:** albums and loose songs in a 2-column grid, A–Z side scrubber, Songs, Artists and Playlists views, favourites, multi-select, and import from Files or other apps.
-- **Playlists:** your own (reorder, rename, .m3u8 import/export), plus Favorite Songs and Most Played.
-- **Artwork:** a cover you picked (Photos or Files), then cover files from the album folder, then art embedded in the music, then an iTunes lookup. Album downloads fetch the folder's cover (and any .lrc lyrics) from the peer too.
-- **Player:** Apple Music-style full screen with synced lyrics (a .lrc next to the song, else LRCLIB), queue editing, shuffle and repeat, AirPlay, and the Liquid Glass mini player on iOS 26+.
-- **Sound:** 10-band EQ with presets, and a bit-perfect mode for USB DACs. Multichannel and Dolby Atmos files play through AVPlayer with spatial audio instead, with no EQ.
-- **Transfers:** multi-select retry/cancel/clear/delete, a Live Activity, Seeding Mode, and Wi-Fi Transfer from a computer's browser.
-- **Stats:** listening time, top songs/artists/albums, upload/download totals.
-- **Last.fm** scrobbling with your own API key, and optional Discord "Listening to" status.
+---
 
-Meant for sideloading. It won't pass App Store review.
+## ✨ Características Principales
 
-## Layout
+* **Búsqueda Universal de Archivos:** Ya no está limitado solo a música. Busca, filtra y descarga **cualquier tipo de archivo** (Videos, Archivos comprimidos `.zip`/`.rar`, Documentos, Libros, Imágenes, Apps y Audio Lossless/Lossy).
+* **Gestor de Descargas Persistente:** El historial de descargas se guarda automáticamente en el disco de tu dispositivo. Si cierras la app o se interrumpe una descarga, al reabrirla podrás reanudarla con un solo toque (*Retry*).
+* **Historial de Búsqueda Desplegable:** Al tocar la barra de búsqueda, se despliega tu historial reciente de términos buscados para repetirlos al instante.
+* **Mini-Buscador en Vivo por Palabras Clave:** Cuenta con una barra de filtrado rápido justo encima de los resultados para acotar la búsqueda por extensiones, palabras clave o nombres de usuario sin necesidad de realizar una nueva petición a la red.
+* **Explorador de Carpetas Raíz y Contenedoras:** Al pulsar sobre cualquier nivel de la ruta de un archivo o carpeta, puedes navegar libremente por los directorios compartidos del usuario (migas de pan / breadcrumbs) y descargar carpetas enteras o archivos individuales.
+* **Barra de Progreso en Notificaciones y Live Activities:** Monitorea tus descargas en tiempo real mediante notificaciones del sistema con barra de progreso visual (▰▰▰▱▱) y soporte para Dynamic Island / Lock Screen.
+* **Exportación Nativa (Share Sheet):** Envía tus archivos descargados a cualquier otra app, guárdalos en iCloud / Archivos o compártelos por AirDrop con el botón integrado de compartir.
 
-```
-App/
-  Library/                 scanning, metadata (incl. a small FLAC tag reader), albums, artwork, favourites
-  Playback/                AVAudioEngine + EQ backend, AVPlayer spatial backend, queue
-  Services/                LRCLIB lyrics, Last.fm, keychain and settings
-  Soulseek/                search results, downloads, cover fetching
-  Views/                   SwiftUI screens
-Packages/SoulseekKit/      Protocol package (no dependencies)
-  Sources/SoulseekKit/
-    Bytes, Framing, Zlib, MD5        primitives, all Linux-testable
-    ServerMessages, PeerMessages     message codecs
-    SoulseekClient.swift             Network.framework client (Apple platforms only)
-  Tests/SoulseekKitTests/            codec tests against bytes produced by Nicotine+
-scripts/gen_fixtures.py    regenerates the test fixtures from Nicotine+'s encoders
-scripts/make-ota-site.py   builds an over-the-air install page for a signed IPA
-project.yml                XcodeGen spec
-.github/workflows/build.yml  CI/CD: tests, IPA build, signing, install page, releases
-```
+---
 
-## Building
+## 🛠️ Compilación Automática (GitHub Actions)
 
-### Protocol tests (Linux, no Mac needed)
+Este repositorio incluye un flujo de trabajo preconfigurado en GitHub Actions (`.github/workflows/build.yml`) que compila automáticamente el proyecto y genera el archivo **`Seekios.ipa`** listo para firmar e instalar mediante SideStore, AltStore, Feather o LiveContainer.
 
-```sh
-# Needs a Swift toolchain: the swift.org tarball, or `swift-bin` from the AUR on CachyOS
-swift test --package-path Packages/SoulseekKit
-```
+Para lanzar una nueva versión en tu propio GitHub:
+1. Ve a la pestaña **Releases** de tu repositorio.
+2. Crea un nuevo Tag (etiqueta) que empiece por `v` (por ejemplo, `v1.0.0`).
+3. Publica el Release y GitHub Actions generará y adjuntará automáticamente el archivo **`Seekios-1.0.0-unsigned.ipa`**.
 
-The tests decode and encode byte streams generated by Nicotine+'s own message classes, so a failure means we disagree with a real client. To regenerate them:
+---
 
-```sh
-git clone --depth 1 https://github.com/nicotine-plus/nicotine-plus /tmp/nicotine-plus
-python3 scripts/gen_fixtures.py /tmp/nicotine-plus > Packages/SoulseekKit/Tests/SoulseekKitTests/Fixtures.swift
-```
+## 📲 Instalación
 
-### App in a macOS VM
-
-```sh
-xcodegen generate
-xcodebuild -project colon3.xcodeproj -scheme colon3 -configuration Release \
-  -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
-  CODE_SIGNING_ALLOWED=NO build
-mkdir -p Payload && cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/ && zip -qry colon3.ipa Payload
-```
-
-Homebrew no longer supports Intel Macs, which includes QEMU macOS VMs. Install XcodeGen from its [release zip](https://github.com/yonaskolb/XcodeGen/releases) instead: copy `bin/xcodegen` to `/usr/local/bin` and `share/xcodegen` to `/usr/local/share`.
-
-## CI/CD
-
-`.github/workflows/build.yml` runs on every push and pull request:
-
-| Job | When | What it does |
-|---|---|---|
-| Protocol tests | always | `swift test` for SoulseekKit on Linux |
-| Build unsigned IPA | always | XcodeGen + `xcodebuild` on a macOS runner. Version comes from `MARKETING_VERSION` in `project.yml` (or the tag), build number from the run number. The IPA is kept as a run artifact for 30 days. |
-| Sign and stage install page | pushes to `main` or `beta`, if signing secrets are set | Signs the IPA with zsign and the distribution cert, checks the cert's revocation status (shown in the run summary), and builds the install page: `main` at the site root, `beta` under `/beta/` |
-| Deploy install page | after signing | Publishes the page to GitHub Pages |
-| GitHub Release | tags `v*` | Attaches the unsigned IPA to a release (a pre-release for tags like `v0.4.0-beta.1`) |
-
-The macOS runner is only free for public repos.
-
-### One-time setup for the install page
-
-1. **Enable Pages:** repo Settings › Pages › Build and deployment › Source: **GitHub Actions**.
-2. **Add the signing secrets** from the folder holding your distribution `.p12` and `.mobileprovision` (works in fish and bash):
-   ```sh
-   base64 -w0 dist.p12 | gh secret set SIGNING_P12_BASE64
-   gh secret set SIGNING_P12_PASSWORD        # prompts for the password
-   base64 -w0 dist.mobileprovision | gh secret set SIGNING_PROFILE_BASE64
-   ```
-3. **Only if the profile is locked to one bundle ID** (its `application-identifier` isn't `TEAMID.*`), set that ID as a variable:
-   `gh variable set SIGN_BUNDLE_ID --body com.example.app`
-
-After that, every push to `main` updates `https://<user>.github.io/colon3/`. Open it in Safari on the phone and tap **Install**. Installing over an existing copy keeps your downloaded music and login.
-
-Things to know:
-- **The page is public.** Pages on a public repo is open to anyone who finds the URL. It's marked `noindex`, but anyone with the link can install your signed build. That's harmless for you, but wide distribution under a shared enterprise cert makes revocation more likely.
-- **Secrets never reach pull requests.** The signing job only runs for pushes to `main`.
-- **If the cert gets revoked,** the run summary's certificate check shows it. Replace the three secrets with the new cert and re-run the workflow.
-
-### Beta channel
-
-Push risky changes to a `beta` branch first. Its signed build goes to `<pages url>/beta/` and leaves the stable page alone; each deploy copies the other channel's files from the live site so both stay up. Builds report their channel, and Settings › Software Update follows the matching page (switchable between Stable and Beta).
-
-One-time: Settings › Environments › `github-pages` › Deployment branches and tags › add `beta`, or its deploy is rejected.
-
-When the beta works, fast-forward main to it:
-
-```sh
-git switch main && git merge --ff-only beta && git push
-```
-
-### Releases
-
-Write the notes in `CHANGELOG.md` under `## X.Y.Z` before tagging. CI uses that section for the GitHub Release and for "What's New" in Settings › Software Update.
-
-```sh
-git tag v0.2.0 && git push origin v0.2.0
-```
-
-This builds version 0.2.0 and attaches `colon3-0.2.0-unsigned.ipa` to a GitHub Release, ready for SideStore or any signer.
-
-## Installing
-
-- **Install page (recommended):** see [CI/CD](#cicd). Push to `main`, then open the Pages URL in Safari.
-- **Locally, without CI:** sign the IPA, then serve an install page through a temporary HTTPS tunnel:
-  ```sh
-  zsign -k dist.p12 -p 'PASSWORD' -m dist.mobileprovision -o colon3-signed.ipa colon3.ipa
-  cloudflared tunnel --url http://localhost:8000      # note the https:// URL it prints
-  python3 scripts/make-ota-site.py colon3-signed.ipa --base-url https://<tunnel-url> --out ~/colon3-dist
-  cd ~/colon3-dist && python3 -m http.server 8000
-  ```
-  Serve only that output folder, never your home or Downloads folder. Stop both servers when you're done.
-- **SideStore / AltStore:** open the unsigned IPA from a release or workflow artifact. They sign it with your Apple ID on-device. Free accounts: 7-day expiry, 3 apps max.
-
-## Using it
-
-1. **Account tab:** enter a username and password. An unused username gets registered on first login. There's no password reset. Soulseek's rules forbid throwaway or random usernames, so pick a real one.
-2. **Search:** results stream in over roughly 30 seconds and are grouped by folder (usually an album). Free-slot peers sort first.
-3. Open a folder, tap a file or **Download all**.
-4. Finished files go to *On My iPhone › colon3 › Music*. They show up in the Files app, and you can drop your own music there too.
-5. **Library:** tap an album, or long-press anything for Play Next, Add to Queue, Favorite and Delete. **Select** enables multi-select.
-6. **Player:** tap the mini player. The speech-bubble button shows lyrics (tap a line to jump there) and the list button the queue. The ••• menu opens the equalizer.
-
-### Software Update
-
-Settings › Software Update compares the installed build with `version.json`, which CI publishes next to the install page on every signed build. **Install Update** opens the over-the-air install prompt; the music library and settings are kept. The Settings tab shows a badge when an update is waiting.
-
-### Links
-
-`colon3://player`, `colon3://downloads`, `colon3://library`, `colon3://search?q=…` and `colon3://wifi` open those screens, for Shortcuts or Back Tap (Settings › Accessibility › Touch › Back Tap › a shortcut that opens the URL). Tapping the transfers Live Activity opens Downloads.
-
-### Bit-perfect mode
-
-Settings › Playback. With a wired USB DAC, each song's sample rate is requested from the hardware and the EQ and gain stages are skipped, so the DAC receives the file's samples unchanged. Keep the iPhone volume at maximum and use the DAC's volume. The Now Playing badge says when it's achieved, or why not (Bluetooth, AirPlay, the speaker, or a DAC that refused the rate).
-
-### Wi-Fi Transfer
-
-Settings › Wi-Fi Transfer, then open the address on a computer on the same network and enter the code. Drop files or folders in, download or delete files. Over a cable on Linux: `ifuse --documents com.aminewallah.colon3 ~/iphone`.
-
-### Discord
-
-Settings › Discord. iOS apps have no official way to set Discord presence, so this logs into Discord's gateway with your account token, like Kizzy does on Android. That breaks Discord's Terms of Service and could get the account flagged. For cover art, create an application at discord.com/developers named colon3 and paste its Application ID.
-
-### Last.fm
-
-Create an API account at [last.fm/api/account/create](https://www.last.fm/api/account/create) (any app name works). In Settings › Last.fm, enter the API key, shared secret, your username and password. The password is only used once to get a session key. Everything is stored in the Keychain. Scrobbles made offline are queued and sent later.
-
-## How it works (and what it can't do)
-
-iOS apps can't usefully accept incoming connections: no port forwarding on mobile data/CGNAT, and the OS suspends the app in the background. So colon3 **never listens**.
-
-- **Receiving search results and files:** a peer that can't reach us asks the server to relay a `ConnectToPeer`. colon3 dials out to that peer and sends `PierceFireWall`. This only works if *the peer* has an open port, which most dedicated sharers do.
-- **Requesting downloads:** colon3 opens a direct connection (`GetPeerAddress` → `PeerInit`) and sends `QueueUpload`. Any peer that just sent us results is reachable, so this works.
-- **Peers who are also firewalled** can't exchange anything with us. Their results never arrive, so you won't see them.
-- **Background:** transfers stall when iOS suspends the app. Playing music keeps the app alive (background audio mode), so downloads continue while you listen. Partial files are kept in Application Support/Incomplete, and retrying resumes from where the transfer stopped.
-- **Sharing back:** downloaded music is shared under a virtual `colon3\…` folder. colon3 answers browse requests and serves uploads one at a time, but only to peers it can connect to directly. The distributed search network is not joined, so other users' searches won't find your files.
-- **Formats:** "Playable formats only" (on by default) hides what AVPlayer can't decode on iOS: Ogg Vorbis, Opus outside CAF, WMA, APE.
-
-Protocol details follow Nicotine+'s [`SLSKPROTOCOL.md`](https://github.com/nicotine-plus/nicotine-plus/blob/master/doc/SLSKPROTOCOL.md). The client logs in with major version 177, which the doc reserves for experimental clients.
-
-## Debugging
-
-The *Account › Connection log* screen shows server/peer events. For protocol work, run Nicotine+ on your PC with a second account. Search for something only it shares, and watch both sides.
+1. Descarga el archivo `Seekios-unsigned.ipa` desde la sección de [Releases](https://github.com/SRJW/SEEKIOS/releases) de este repositorio.
+2. Instálalo en tu dispositivo iOS utilizando tu instalador de confianza (SideStore, AltStore, LiveContainer, etc.).
+3. ¡Inicia sesión con cualquier nombre de usuario de Soulseek (si no existe, se registrará automáticamente) y comienza a buscar y descargar!
