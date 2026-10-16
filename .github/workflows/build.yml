@@ -46,7 +46,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
-            version="$(sed -nE 's/^ *MARKETING_VERSION: *"?([^"]+)"?.*/\1/p' project.yml | head -1)"
+            version="1.0.0"
           fi
           channel=stable
           if [[ "$GITHUB_REF" == refs/heads/beta || "$version" == *-* ]]; then channel=beta; fi
@@ -65,14 +65,18 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Generate project
-        run: xcodegen generate
+      - name: Set Seekios identity in project.yml and Generate project
+        run: |
+          # Asegura el esquema de compilación y reemplaza el Bundle ID y la versión por los de Seekios
+          sed -i '' 's/^name: .*/name: colon3/' project.yml
+          sed -i '' 's/MARKETING_VERSION: .*/MARKETING_VERSION: "1.0.0"/g' project.yml
+          sed -i '' 's/com\.aminewallah\.colon3/com.srjw.seekios/g' project.yml
+          sed -i '' 's/com\.aminewallah/com.srjw/g' project.yml
+          xcodegen generate
 
       - name: Build
         run: |
           set -o pipefail
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" App/Info.plist 2>/dev/null || \
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" App/Info.plist 2>/dev/null || true
           xcodebuild build \
             -project colon3.xcodeproj \
             -scheme colon3 \
@@ -94,8 +98,22 @@ jobs:
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" Payload/colon3.app/Info.plist 2>/dev/null || \
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" Payload/colon3.app/Info.plist || true
+          # Inyecta el nombre, versión e identificador real de Seekios en el Info.plist final
+          PLIST="Payload/colon3.app/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" "$PLIST" || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Seekios" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.srjw.seekios" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PLIST" 2>/dev/null || true
+
+          # Si existe el widget interno, sincroniza su Bundle ID para que sea hijo de com.srjw.seekios
+          for PlugIn in Payload/colon3.app/PlugIns/*.appex; do
+            if [ -f "$PlugIn/Info.plist" ]; then
+              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.srjw.seekios.widget" "$PlugIn/Info.plist" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PlugIn/Info.plist" 2>/dev/null || true
+            fi
+          done
+
           zip -qry Seekios.ipa Payload
 
       - uses: actions/upload-artifact@v4
