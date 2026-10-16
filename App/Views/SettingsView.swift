@@ -23,7 +23,25 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                SoftwareUpdateSection()
+                // Apartado limpio de Versión y redirección a GitHub
+                Section("Version") {
+                    HStack {
+                        Label("Seekios", systemImage: "info.circle")
+                        Spacer()
+                        Text("v1.0.0")
+                            .foregroundStyle(.secondary)
+                    }
+                    Link(destination: URL(string: "https://github.com/SRJW/SEEKIOS/releases")!) {
+                        HStack {
+                            Label("View Releases on GitHub", systemImage: "globe")
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
 
                 Section {
                     NavigationLink { StatsView() } label: { StatsPreview() }
@@ -87,7 +105,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Transfers")
                 } footer: {
-                    Text("When nothing is playing, colon3 plays silence (mixed under other audio) so iOS doesn't freeze transfers in the background, like iTorrent does. It costs some battery and stops when transfers finish. Seeding Mode keeps it running all the time so people can keep downloading from you, and reconnects if Soulseek drops.")
+                    Text("When nothing is playing, Seekios plays silence (mixed under other audio) so iOS doesn't freeze transfers in the background, like iTorrent does. It costs some battery and stops when transfers finish. Seeding Mode keeps it running all the time so people can keep downloading from you, and reconnects if Soulseek drops.")
                 }
 
                 LastFMSection(scrobbling: $scrobbling)
@@ -221,92 +239,6 @@ struct LastFMSection: View {
     }
 }
 
-struct SoftwareUpdateSection: View {
-    @EnvironmentObject private var updates: UpdateChecker
-    @State private var showNotes = false
-
-    var body: some View {
-        Section {
-            LabeledContent("Installed", value: "\(updates.currentVersion) (\(updates.currentBuild))"
-                           + (updates.builtChannel == .beta ? " Beta" : ""))
-            Picker("Channel", selection: $updates.channel) {
-                ForEach(UpdateChecker.Channel.allCases) { Text($0.label).tag($0) }
-            }
-            status
-            Button {
-                Task { await updates.check() }
-            } label: {
-                Label("Check Now", systemImage: "arrow.clockwise")
-            }
-            .disabled(updates.state == .checking)
-            Toggle("Check Automatically", isOn: $updates.automatic)
-        } header: {
-            Text("Software Update")
-        } footer: {
-            Text("Beta follows the beta branch, Stable follows main. Updates come from \(updates.source). Installing keeps your music and settings; colon3 closes while iOS installs it.")
-        }
-    }
-
-    @ViewBuilder
-    private var status: some View {
-        switch updates.state {
-        case .idle:
-            EmptyView()
-        case .checking:
-            HStack(spacing: 10) {
-                ProgressView()
-                Text("Checking…").foregroundStyle(.secondary)
-            }
-        case .upToDate:
-            VStack(alignment: .leading, spacing: 2) {
-                Label("colon3 is up to date", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                if let checked = updates.lastChecked {
-                    Text("Checked \(checked.formatted(.relative(presentation: .named)))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-        case let .available(remote):
-            VStack(alignment: .leading, spacing: 6) {
-                Label("Update available", systemImage: "arrow.down.app.fill")
-                    .font(.headline)
-                    .foregroundStyle(.tint)
-                Text(details(remote))
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                let notes = remote.cleanNotes
-                if !notes.isEmpty {
-                    Text((try? AttributedString(markdown: notes, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-                         ?? AttributedString(notes))
-                        .font(.footnote)
-                        .lineLimit(showNotes ? nil : 3)
-                        .onTapGesture { showNotes.toggle() }
-                }
-            }
-            .padding(.vertical, 4)
-            Button {
-                updates.install(remote)
-            } label: {
-                Text("Install Update")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .listRowSeparator(.hidden)
-            Button("Open Install Page") { updates.openPage() }
-        case let .failed(message):
-            Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
-        }
-    }
-
-    private func details(_ remote: UpdateChecker.Remote) -> String {
-        var parts = ["Version \(remote.version) (\(remote.build))"]
-        if let date = remote.builtDate { parts.append(date.formatted(date: .abbreviated, time: .shortened)) }
-        if let size = remote.size { parts.append(Formatting.bytes(UInt64(max(size, 0)))) }
-        return parts.joined(separator: " · ")
-    }
-}
-
 /// Live output details while bit-perfect mode is on.
 struct BitPerfectStatus: View {
     @EnvironmentObject private var player: Player
@@ -371,8 +303,8 @@ struct DiscordSection: View {
             Text("Discord")
         } footer: {
             Text(discord.hasToken
-                 ? "Shows “Listening to colon3” with the song and artist while music plays. For cover art, create an application at discord.com/developers (name it colon3) and paste its Application ID."
-                 : "Discord has no official way for iPhone apps to set your status, so colon3 logs into Discord in a web view and reads your account token once. Pasting it yourself works too (Discord in a browser › Developer Tools › Network › any request › Authorization header). It's stored in the Keychain and only sent to Discord.")
+                 ? "Shows “Listening to Seekios” with the song and artist while music plays. For cover art, create an application at discord.com/developers (name it Seekios) and paste its Application ID."
+                 : "Discord has no official way for iPhone apps to set your status, so Seekios logs into Discord in a web view and reads your account token once. Pasting it yourself works too (Discord in a browser › Developer Tools › Network › any request › Authorization header). It's stored in the Keychain and only sent to Discord.")
         }
         .sheet(isPresented: $showLogin) {
             DiscordLoginView { token in discord.saveToken(token) }
