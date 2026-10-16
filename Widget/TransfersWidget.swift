@@ -94,7 +94,7 @@ struct LockScreenTransfers: View {
                 .foregroundStyle(accent)
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
-                    Text("colon3 · " + state.title).font(.headline).lineLimit(1)
+                    Text("Seekios · " + state.title).font(.headline).lineLimit(1)
                     Spacer()
                     Text(state.compactText).font(.headline.monospacedDigit())
                 }
