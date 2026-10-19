@@ -4,8 +4,7 @@ import Foundation
 import SoulseekKit
 import UserNotifications
 
-/// Watches Soulseek transfers and playback. Shows both a Live Activity (Lock Screen / Dynamic Island)
-/// and an updating system notification with a progress bar so progress is visible in all environments.
+/// Mantiene las transferencias activas en segundo plano y envía una notificación únicamente cuando finalizan.
 @MainActor
 final class TransferMonitor {
     private let soulseek: SoulseekModel
@@ -21,15 +20,10 @@ final class TransferMonitor {
     private var lastSample = Date()
     private var speed: Double = 0
 
-    /// Control para no saturar el centro de notificaciones de iOS
-    private var lastNotifiedPercent: Int = -1
-    private var lastNotifiedFile: String = ""
-    private var wasDownloading = false
-    private let progressNotificationID = "seekios.transfer.progress"
-    private let finishedNotificationID = "seekios.transfer.finished"
+    /// Registro de descargas ya notificadas para avisar solo cuando cada archivo finaliza
+    private var notifiedCompletedIDs = Set<DownloadID>()
+    private var initializedCompleted = false
 
-    /// Everything in the current burst of transfers, finished ones included, so the percentage
-    /// climbs to 100% instead of resetting each time a file completes.
     private struct Progress { var done: UInt64; var size: UInt64 }
     private var downloadBatch: [DownloadID: Progress] = [:]
     private var uploadBatch: [DownloadID: Progress] = [:]
@@ -41,20 +35,28 @@ final class TransferMonitor {
 
         requestNotificationPermission()
 
-        // Activities left over from a previous run (crash, force quit) would otherwise linger.
+        // Limpia cualquier notificación de progreso vieja o Live Activity previa
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["seekios.transfer.progress"])
         for stale in Activity<TransferActivityAttributes>.activities {
             Task { await stale.end(nil, dismissalPolicy: .immediate) }
         }
 
+        // Registra las que ya estaban completadas en el historial al abrir la app para no re-notificarlas
+        for item in soulseek.downloads {
+            if case .completed = item.state {
+                notifiedCompletedIDs.insert(item.id)
+            }
+        }
+        initializedCompleted = true
+
         soulseek.$downloads
             .combineLatest(soulseek.$uploads, player.$isPlaying)
-            .throttle(for: .seconds(1.5), scheduler: DispatchQueue.main, latest: true)
+            .throttle(for: .seconds(1.0), scheduler: DispatchQueue.main, latest: true)
             .sink { [weak self] _, _, _ in
                 MainActor.assumeIsolated { self?.refresh() }
             }
             .store(in: &subscriptions)
 
-        // Settings toggles (seeding, activity, background) take effect right away.
         NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)
             .debounce(for: .milliseconds(300), scheduler: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -79,29 +81,15 @@ final class TransferMonitor {
 
     private func update(downloads: [DownloadItem], uploads: [UploadItem], isPlaying: Bool) {
         let activeDownloads = downloads.filter { $0.isActive && !$0.isArtwork }
-        let moving = activeDownloads.filter { $0.state == .transferring || $0.state == .starting }
         let sending = uploads.filter { $0.state == .transferring }
         let busy = !activeDownloads.isEmpty || !sending.isEmpty
         let seeding = isSeeding && soulseek.hasCredentials
 
-        // Seeding: stay logged in even if the server or network dropped us.
         if seeding, !soulseek.isLoggedIn, Date().timeIntervalSince(lastReconnect) > 60 {
             lastReconnect = Date()
             soulseek.reconnectIfNeeded()
         }
 
-        // Combined speed across everything that's moving.
-        let bytes = downloads.reduce(UInt64(0)) { $0 + $1.received } + uploads.reduce(UInt64(0)) { $0 + $1.sent }
-        let now = Date()
-        let elapsed = now.timeIntervalSince(lastSample)
-        if elapsed > 0.5 {
-            let delta = bytes >= lastBytes ? Double(bytes - lastBytes) : 0
-            speed = speed * 0.4 + (delta / elapsed) * 0.6
-            lastBytes = bytes
-            lastSample = now
-        }
-
-        // Keep-alive only matters when music isn't already keeping the app running.
         let wantsKeeper = (busy && AppSettings.flag(AppSettings.backgroundTransfersKey)) || seeding
         if wantsKeeper, !isPlaying {
             keeper.start()
@@ -109,166 +97,43 @@ final class TransferMonitor {
             keeper.stop()
         }
 
-        let fraction = batchFraction(downloads: downloads, uploads: uploads, busy: busy)
-
-        // Actualizar notificación con barra de progreso en el Centro de Notificaciones
-        updateSystemNotification(
-            activeDownloads: activeDownloads,
-            moving: moving,
-            sending: sending,
-            fraction: fraction,
-            currentSpeed: moving.isEmpty && sending.isEmpty ? 0 : speed
-        )
-
-        guard AppSettings.flag(AppSettings.transferActivityKey) else {
-            endActivity(finished: false)
-            return
-        }
-
-        // Ahora muestra la Live Activity también aunque estés reproduciendo música
-        if busy || seeding {
-            let state = TransferActivityAttributes.ContentState(
-                downloading: moving.count,
-                uploading: sending.count,
-                queued: activeDownloads.count - moving.count,
-                fraction: fraction,
-                bytesPerSecond: moving.isEmpty && sending.isEmpty ? 0 : speed,
-                currentFile: moving.first?.filename ?? sending.first?.filename ?? activeDownloads.first?.filename ?? "",
-                finished: false,
-                seeding: seeding ? soulseek.library.tracks.count : 0,
-                sessionUploaded: Double(stats?.sessionUploadedBytes ?? 0))
-            showActivity(state)
-        } else {
-            endActivity(finished: !busy && !seeding)
-        }
+        // Verifica si alguna descarga acaba de finalizar y envía la notificación
+        notifyNewlyCompletedDownloads(downloads)
     }
 
-    private func batchFraction(downloads: [DownloadItem], uploads: [UploadItem], busy: Bool) -> Double {
-        guard busy else {
-            downloadBatch.removeAll()
-            uploadBatch.removeAll()
-            return 0
-        }
-        var current: [DownloadID: Progress] = [:]
+    private func notifyNewlyCompletedDownloads(_ downloads: [DownloadItem]) {
+        guard initializedCompleted else { return }
+        var newlyFinished: [DownloadItem] = []
+
         for item in downloads where !item.isArtwork {
-            switch item.state {
-            case .completed:
-                if downloadBatch[item.id] != nil { current[item.id] = Progress(done: item.size, size: item.size) }
-            case .failed:
-                break
-            default:
-                current[item.id] = Progress(done: min(item.received, item.size), size: item.size)
-            }
-        }
-        downloadBatch = current
-
-        var sent: [DownloadID: Progress] = [:]
-        for item in uploads {
-            switch item.state {
-            case .transferring:
-                sent[item.id] = Progress(done: min(item.sent, item.size), size: item.size)
-            case .completed:
-                if uploadBatch[item.id] != nil { sent[item.id] = Progress(done: item.size, size: item.size) }
-            default:
-                break
-            }
-        }
-        uploadBatch = sent
-
-        let all = Array(downloadBatch.values) + Array(uploadBatch.values)
-        let size = all.reduce(UInt64(0)) { $0 + $1.size }
-        let done = all.reduce(UInt64(0)) { $0 + $1.done }
-        return size > 0 ? min(1, Double(done) / Double(size)) : 0
-    }
-
-    // MARK: - Notificación de Sistema con Barra de Progreso
-
-    private static func visualProgressBar(fraction: Double, width: Int = 12) -> String {
-        let clamped = min(max(fraction, 0), 1)
-        let filled = Int((clamped * Double(width)).rounded())
-        let empty = max(0, width - filled)
-        return String(repeating: "▰", count: filled) + String(repeating: "▱", count: empty)
-    }
-
-    private func updateSystemNotification(
-        activeDownloads: [DownloadItem],
-        moving: [DownloadItem],
-        sending: [UploadItem],
-        fraction: Double,
-        currentSpeed: Double
-    ) {
-        let center = UNUserNotificationCenter.current()
-
-        if !activeDownloads.isEmpty {
-            wasDownloading = true
-            let percent = Int((fraction * 100).rounded())
-            let currentName = moving.first?.filename ?? activeDownloads.first?.filename ?? "Downloading…"
-
-            // Actualiza si el porcentaje cambió al menos un 2% o cambió el archivo
-            guard abs(percent - lastNotifiedPercent) >= 2 || currentName != lastNotifiedFile else { return }
-            lastNotifiedPercent = percent
-            lastNotifiedFile = currentName
-
-            let bar = Self.visualProgressBar(fraction: fraction)
-            let speedStr = currentSpeed > 0
-                ? " · " + ByteCountFormatter.string(fromByteCount: Int64(currentSpeed), countStyle: .file) + "/s"
-                : ""
-
-            let content = UNMutableNotificationContent()
-            content.title = "Seekios · Downloading (\(percent)%)"
-            content.subtitle = "\(bar) \(percent)%\(speedStr)"
-            if activeDownloads.count > 1 {
-                content.body = "\(currentName) (+\(activeDownloads.count - 1) more)"
+            if case .completed = item.state {
+                if !notifiedCompletedIDs.contains(item.id) {
+                    notifiedCompletedIDs.insert(item.id)
+                    newlyFinished.append(item)
+                }
             } else {
-                content.body = currentName
+                // Si se reintenta una descarga, permite volver a notificar cuando termine
+                notifiedCompletedIDs.remove(item.id)
             }
-            content.sound = nil
-            if #available(iOS 15.0, *) {
-                content.interruptionLevel = .passive
-            }
-
-            let request = UNNotificationRequest(identifier: progressNotificationID, content: content, trigger: nil)
-            center.add(request)
-        } else if wasDownloading {
-            // Terminaron todas las descargas activas
-            wasDownloading = false
-            lastNotifiedPercent = -1
-            lastNotifiedFile = ""
-            center.removeDeliveredNotifications(withIdentifiers: [progressNotificationID])
-
-            let content = UNMutableNotificationContent()
-            content.title = "Seekios · Downloads Complete"
-            content.subtitle = "▰▰▰▰▰▰▰▰▰▰▰▰ 100%"
-            content.body = "All active downloads have finished."
-            content.sound = .default
-
-            let request = UNNotificationRequest(identifier: finishedNotificationID, content: content, trigger: nil)
-            center.add(request)
         }
-    }
 
-    // MARK: - Live Activity (Lock Screen / Dynamic Island)
+        guard !newlyFinished.isEmpty else { return }
 
-    private func showActivity(_ state: TransferActivityAttributes.ContentState) {
-        let content = ActivityContent(state: state, staleDate: Date().addingTimeInterval(90))
-        if let activity {
-            Task { await activity.update(content) }
-            return
+        let content = UNMutableNotificationContent()
+        if newlyFinished.count == 1, let first = newlyFinished.first {
+            content.title = "Download Complete"
+            content.body = "\(first.filename) (\(Formatting.bytes(first.size)))"
+        } else if let first = newlyFinished.first {
+            content.title = "\(newlyFinished.count) Downloads Complete"
+            content.body = "\(first.filename) and \(newlyFinished.count - 1) more finished."
         }
-        guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-        let accent = UserDefaults.standard.string(forKey: AccentPalette.storageKey) ?? AccentPalette.defaultHex
-        activity = try? Activity.request(attributes: TransferActivityAttributes(accentHex: accent),
-                                         content: content, pushType: nil)
-    }
+        content.sound = .default
 
-    private func endActivity(finished: Bool) {
-        guard let activity else { return }
-        self.activity = nil
-        let final = TransferActivityAttributes.ContentState(
-            downloading: 0, uploading: 0, queued: 0, fraction: 1, bytesPerSecond: 0, currentFile: "", finished: finished)
-        Task {
-            await activity.end(ActivityContent(state: final, staleDate: nil),
-                               dismissalPolicy: finished ? .after(Date().addingTimeInterval(5)) : .immediate)
-        }
+        let req = UNNotificationRequest(
+            identifier: "seekios.done.\(UUID().uuidString)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(req)
     }
 }
