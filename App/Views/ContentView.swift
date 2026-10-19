@@ -23,7 +23,6 @@ struct ContentView: View {
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
                 SettingsView()
             }
-            .badge(updates.isUpdateAvailable ? 1 : 0)
         }
         .modifier(TabAccessoryMiniPlayer(isVisible: player.current != nil, open: openPlayer))
         .modifier(RouterPresenters(active: !router.showPlayer))
