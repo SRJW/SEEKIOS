@@ -65,13 +65,12 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
 
-      - name: Set Seekios identity in project.yml and Generate project
-        run: |
-          sed -i '' 's/^name: .*/name: colon3/' project.yml
-          xcodegen generate
+      - name: Generate project
+        run: xcodegen generate
 
       - name: Build
         run: |
+          set -o pipefail
           xcodebuild build \
             -project colon3.xcodeproj \
             -scheme colon3 \
@@ -82,34 +81,20 @@ jobs:
             MARKETING_VERSION="${{ steps.version.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
             COLON3_CHANNEL="${{ steps.version.outputs.channel }}" \
-            PRODUCT_BUNDLE_IDENTIFIER="com.srjw.seekios" \
-            INFOPLIST_KEY_CFBundleDisplayName="Seekios" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            2>&1 | tee xcodebuild.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
-          # Verifica que el ejecutable real de la app exista y no sea una carpeta vacía
-          test -f build/Build/Products/Release-iphoneos/colon3.app/colon3
+            2>&1 | tee xcodebuild.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+          if [ ! -f build/Build/Products/Release-iphoneos/colon3.app/colon3 ]; then
+            echo "=== ERROR DE COMPILACION EN XCODE ==="
+            grep -E "error:" xcodebuild.log -B 2 -A 2 || tail -n 50 xcodebuild.log
+            exit 1
+          fi
 
       - name: Package IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
-          PLIST="Payload/colon3.app/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Seekios" "$PLIST" 2>/dev/null || \
-          /usr/libexec/PlistBuddy -c "Add :CFBundleDisplayName string Seekios" "$PLIST" || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleName Seekios" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.srjw.seekios" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PLIST" 2>/dev/null || true
-          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable colon3" "$PLIST" 2>/dev/null || true
-
-          for PlugIn in Payload/colon3.app/PlugIns/*.appex; do
-            if [ -f "$PlugIn/Info.plist" ]; then
-              /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.srjw.seekios.widget" "$PlugIn/Info.plist" 2>/dev/null || true
-              /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PlugIn/Info.plist" 2>/dev/null || true
-            fi
-          done
-
           zip -qry Seekios.ipa Payload
           ls -lh Seekios.ipa
 
