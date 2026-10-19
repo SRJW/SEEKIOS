@@ -136,10 +136,10 @@ jobs:
           fi
 
           file="dist/Seekios-${VERSION}.ipa"
-          cp dist/Seekios.ipa "$file"
+          mv dist/Seekios.ipa "$file"
 
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
-          gh release create "$TAG" "$file" "dist/Seekios.ipa" \
+          gh release create "$TAG" "$file" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Seekios v${VERSION}" \
             --generate-notes
