@@ -41,15 +41,16 @@ final class UpdateChecker: ObservableObject {
     var builtChannel: Channel { .stable }
     var source: String { "github.com/SRJW/SEEKIOS" }
 
-    /// Propiedades que Colon3App.swift y ContentView.swift consultan
     var hasUpdate: Bool { false }
     var isUpdateAvailable: Bool { false }
     var availableUpdate: Remote? { nil }
 
     init() {}
 
-    func checkForUpdate() async {}
-    func checkIfNeeded() async {}
+    /// Funciones exactas que llama Colon3App.swift en las líneas 67 y 89
+    func checkIfDue() {}
+    func checkForUpdate() {}
+    func checkIfNeeded() {}
     func check() async {}
     func install(_ remote: Remote) {}
     func openPage() {
