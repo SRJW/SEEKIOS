@@ -1,7 +1,7 @@
 # XcodeGen spec. Run `xcodegen generate` to produce colon3.xcodeproj (it's gitignored).
 name: colon3
 options:
-  bundleIdPrefix: com.aminewallah
+  bundleIdPrefix: com.srjw
   deploymentTarget:
     iOS: "18.0"
   createIntermediateGroups: true
@@ -24,10 +24,9 @@ targets:
       path: Support/Info.plist
       properties:
         CFBundleDisplayName: Seekios
-        # Filled from MARKETING_VERSION / CURRENT_PROJECT_VERSION below; CI overrides both.
+        CFBundleName: Seekios
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
-        # "stable" or "beta"; CI sets it from the branch. Picks the default update channel.
         Colon3Channel: "$(COLON3_CHANNEL)"
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
@@ -36,13 +35,10 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
         NSSupportsLiveActivities: true
-        # Wi-Fi Transfer serves a page to computers on the same network.
-        NSLocalNetworkUsageDescription: "colon3 uses the local network for Wi-Fi Transfer, so a computer on your Wi-Fi can add or download music."
-        # colon3://player, colon3://downloads, … from the Dynamic Island, Shortcuts and Back Tap.
+        NSLocalNetworkUsageDescription: "Seekios uses the local network for Wi-Fi Transfer, so a computer on your Wi-Fi can add or download files."
         CFBundleURLTypes:
-          - CFBundleURLName: com.aminewallah.colon3
-            CFBundleURLSchemes: [colon3]
-        # Lets Files and other apps "Open in" / "Copy to" colon3.
+          - CFBundleURLName: com.srjw.seekios
+            CFBundleURLSchemes: [colon3, seekios]
         CFBundleDocumentTypes:
           - CFBundleTypeName: Audio
             LSHandlerRank: Alternate
@@ -57,15 +53,14 @@ targets:
               - public.aifc-audio
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.aminewallah.colon3
+        PRODUCT_BUNDLE_IDENTIFIER: com.srjw.seekios
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        MARKETING_VERSION: "0.4.0"
+        MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         COLON3_CHANNEL: stable
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
         CODE_SIGN_STYLE: Automatic
-        # Set this to your Apple ID team in Xcode (Signing & Capabilities) when building in the VM.
         DEVELOPMENT_TEAM: ""
     scheme: {}
 
@@ -79,15 +74,15 @@ targets:
     info:
       path: Support/Widget-Info.plist
       properties:
-        CFBundleDisplayName: colon3 Transfers
+        CFBundleDisplayName: Seekios Transfers
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         NSExtension:
           NSExtensionPointIdentifier: com.apple.widgetkit-extension
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.aminewallah.colon3.TransfersWidget
-        MARKETING_VERSION: "0.4.0"
+        PRODUCT_BUNDLE_IDENTIFIER: com.srjw.seekios.TransfersWidget
+        MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
