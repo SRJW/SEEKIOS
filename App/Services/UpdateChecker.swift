@@ -41,12 +41,14 @@ final class UpdateChecker: ObservableObject {
     var builtChannel: Channel { .stable }
     var source: String { "github.com/SRJW/SEEKIOS" }
 
-    /// Siempre falso para que ContentView nunca ponga el badge "1" en el tab de Settings
+    /// Propiedades que Colon3App.swift y ContentView.swift consultan
     var hasUpdate: Bool { false }
+    var isUpdateAvailable: Bool { false }
     var availableUpdate: Remote? { nil }
 
     init() {}
 
+    func checkForUpdate() async {}
     func checkIfNeeded() async {}
     func check() async {}
     func install(_ remote: Remote) {}
