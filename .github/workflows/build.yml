@@ -46,7 +46,6 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME#v}"
           else
-            # Aumenta el número automáticamente en cada cambio (ej. 1.0.12, 1.0.13...)
             version="1.0.${GITHUB_RUN_NUMBER}"
           fi
           channel=stable
@@ -69,14 +68,10 @@ jobs:
       - name: Set Seekios identity in project.yml and Generate project
         run: |
           sed -i '' 's/^name: .*/name: colon3/' project.yml
-          sed -i '' "s/MARKETING_VERSION: .*/MARKETING_VERSION: \"${{ steps.version.outputs.version }}\"/g" project.yml
-          sed -i '' 's/com\.aminewallah\.colon3/com.srjw.seekios/g' project.yml
-          sed -i '' 's/com\.aminewallah/com.srjw/g' project.yml
           xcodegen generate
 
       - name: Build
         run: |
-          set -o pipefail
           xcodebuild build \
             -project colon3.xcodeproj \
             -scheme colon3 \
@@ -87,12 +82,14 @@ jobs:
             MARKETING_VERSION="${{ steps.version.outputs.version }}" \
             CURRENT_PROJECT_VERSION="${{ steps.version.outputs.build }}" \
             COLON3_CHANNEL="${{ steps.version.outputs.channel }}" \
+            PRODUCT_BUNDLE_IDENTIFIER="com.srjw.seekios" \
             INFOPLIST_KEY_CFBundleDisplayName="Seekios" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            | tee xcodebuild.log | grep -E "error:|warning:|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/colon3.app
+            2>&1 | tee xcodebuild.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)"
+          # Verifica que el ejecutable real de la app exista y no sea una carpeta vacía
+          test -f build/Build/Products/Release-iphoneos/colon3.app/colon3
 
       - name: Package IPA
         run: |
@@ -104,6 +101,7 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleName Seekios" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.srjw.seekios" "$PLIST" 2>/dev/null || true
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable colon3" "$PLIST" 2>/dev/null || true
 
           for PlugIn in Payload/colon3.app/PlugIns/*.appex; do
             if [ -f "$PlugIn/Info.plist" ]; then
@@ -113,6 +111,7 @@ jobs:
           done
 
           zip -qry Seekios.ipa Payload
+          ls -lh Seekios.ipa
 
       - uses: actions/upload-artifact@v4
         with:
@@ -130,7 +129,6 @@ jobs:
   release:
     name: GitHub Release
     needs: build
-    # Se ejecuta automáticamente en cada push a main o cuando se crea un tag v*
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
@@ -155,7 +153,6 @@ jobs:
           file="dist/Seekios-${VERSION}.ipa"
           cp dist/Seekios.ipa "$file"
 
-          # También adjunta Seekios.ipa con nombre fijo por si usas un link directo siempre igual
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$TAG" "$file" "dist/Seekios.ipa" \
             --repo "$GITHUB_REPOSITORY" \
