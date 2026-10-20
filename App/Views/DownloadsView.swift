@@ -13,6 +13,7 @@ struct DownloadsView: View {
     @State private var selection = Set<DownloadID>()
     @State private var confirmDeleteFiles = false
     @State private var showSavedFolderSheet = false
+    @State private var previewItem: QuickLookPreviewItem?
 
     private var isSelecting: Bool { editMode.isEditing }
 
@@ -63,7 +64,6 @@ struct DownloadsView: View {
                     Section { ConnectionBanner() }
                 }
 
-                // Botón fijo en la parte superior para abrir la carpeta donde se guardan las descargas
                 Section {
                     Button {
                         showSavedFolderSheet = true
@@ -76,7 +76,7 @@ struct DownloadsView: View {
                                 Text("Open Downloaded Files Folder")
                                     .font(.subheadline.weight(.semibold))
                                     .foregroundStyle(.primary)
-                                Text("View storage path & manage all saved files on iPhone")
+                                Text("View storage path, preview files & extract archives")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -93,44 +93,51 @@ struct DownloadsView: View {
                     Section {
                         if !collapsed.contains(group.username) {
                             ForEach(group.items) { item in
-                                DownloadRow(item: item)
-                                    .swipeActions(edge: .trailing) {
-                                        Button(role: .destructive) {
-                                            soulseek.cancel(item)
+                                DownloadRow(item: item, onPreview: { url in
+                                    previewItem = QuickLookPreviewItem(url: url)
+                                })
+                                .swipeActions(edge: .trailing) {
+                                    Button(role: .destructive) {
+                                        soulseek.cancel(item)
+                                    } label: {
+                                        Label(item.isActive ? "Cancel" : "Remove", systemImage: "xmark")
+                                    }
+                                    if case .failed = item.state {
+                                        Button {
+                                            soulseek.retry(item)
                                         } label: {
-                                            Label(item.isActive ? "Cancel" : "Remove", systemImage: "xmark")
+                                            Label("Retry", systemImage: "arrow.clockwise")
                                         }
-                                        if case .failed = item.state {
-                                            Button {
-                                                soulseek.retry(item)
-                                            } label: {
-                                                Label("Retry", systemImage: "arrow.clockwise")
-                                            }
-                                            .tint(.blue)
+                                        .tint(.blue)
+                                    }
+                                }
+                                .contextMenu {
+                                    if case let .completed(url) = item.state {
+                                        Button {
+                                            previewItem = QuickLookPreviewItem(url: url)
+                                        } label: {
+                                            Label("Quick Look (Preview)", systemImage: "eye")
+                                        }
+                                        ShareLink(item: url) {
+                                            Label("Share / Save to Files…", systemImage: "square.and.arrow.up")
+                                        }
+                                        ShareLink(item: url.deletingLastPathComponent()) {
+                                            Label("Export Containing Folder…", systemImage: "folder")
                                         }
                                     }
-                                    .contextMenu {
-                                        if case let .completed(url) = item.state {
-                                            ShareLink(item: url) {
-                                                Label("Share / Save to Files…", systemImage: "square.and.arrow.up")
-                                            }
-                                            ShareLink(item: url.deletingLastPathComponent()) {
-                                                Label("Export Containing Folder…", systemImage: "folder")
-                                            }
-                                        }
-                                        if case .failed = item.state {
-                                            Button {
-                                                soulseek.retry(item)
-                                            } label: {
-                                                Label("Retry", systemImage: "arrow.clockwise")
-                                            }
-                                        }
-                                        Button(role: .destructive) {
-                                            soulseek.cancel(item)
+                                    if case .failed = item.state {
+                                        Button {
+                                            soulseek.retry(item)
                                         } label: {
-                                            Label(item.isActive ? "Cancel Download" : "Remove from List", systemImage: "xmark")
+                                            Label("Retry", systemImage: "arrow.clockwise")
                                         }
                                     }
+                                    Button(role: .destructive) {
+                                        soulseek.cancel(item)
+                                    } label: {
+                                        Label(item.isActive ? "Cancel Download" : "Remove from List", systemImage: "xmark")
+                                    }
+                                }
                             }
                         }
                     } header: {
@@ -169,13 +176,14 @@ struct DownloadsView: View {
                     musicLibraryURL: library.root
                 )
             }
-            .onChange(of: soulseek.downloads.map(\.id)) { _, ids in
-                selection.formIntersection(ids)
+            .sheet(item: $previewItem) { item in
+                QuickLookPreview(url: item.url)
+                    .ignoresSafeArea()
             }
             .confirmationDialog(deleteTitle, isPresented: $confirmDeleteFiles, titleVisibility: .visible) {
                 Button("Delete Files", role: .destructive) { deleteSelectedFiles() }
             } message: {
-                Text("Finished files are permanently removed from this iPhone. Unfinished downloads are cancelled.")
+                Text("Finished files are permanently removed from this iPhone.")
             }
         }
     }
@@ -323,23 +331,6 @@ struct DownloadsView: View {
                 }
             }
         }
-        .contextMenu {
-            Button {
-                withAnimation { editMode = .active }
-                selection.formUnion(group.items.map(\.id))
-                collapsed.remove(group.username)
-            } label: {
-                Label("Select All from \(group.username)", systemImage: "checkmark.circle")
-            }
-            if group.failed > 0 {
-                Button { soulseek.retryFailed(from: group.username) } label: {
-                    Label("Retry Failed", systemImage: "arrow.clockwise")
-                }
-            }
-            Button(role: .destructive) { soulseek.cancelAll(from: group.username) } label: {
-                Label("Cancel and Remove All", systemImage: "xmark")
-            }
-        }
     }
 
     private func summary(_ group: UserGroup) -> String {
@@ -369,7 +360,6 @@ struct DownloadsView: View {
     }
 }
 
-/// Visor interactivo que muestra la carpeta exacta donde Seekios guarda las descargas y lista todos los archivos en disco
 struct SavedDownloadsFolderView: View {
     let otherDownloadsURL: URL
     let musicLibraryURL: URL
@@ -377,6 +367,8 @@ struct SavedDownloadsFolderView: View {
     @State private var selectedTab = 0
     @State private var files: [URL] = []
     @State private var copiedPath = false
+    @State private var previewItem: QuickLookPreviewItem?
+    @State private var unzipping = false
 
     private var activeRootURL: URL {
         selectedTab == 0 ? otherDownloadsURL : musicLibraryURL
@@ -415,30 +407,51 @@ struct SavedDownloadsFolderView: View {
                     }
 
                     ShareLink(item: activeRootURL) {
-                        Label("Export / Save Folder to iOS Files App…", systemImage: "folder.badge.plus")
+                        Label("Export Folder to iOS Files App…", systemImage: "folder.badge.plus")
                     }
                 }
 
-                Section("Saved Files in This Folder (\(files.count))") {
+                Section("Saved Files (\(files.count)) - Tap to Open") {
                     if files.isEmpty {
                         Text("No files saved in this folder yet.")
                             .foregroundStyle(.secondary)
                     } else {
                         ForEach(files, id: \.path) { fileURL in
                             HStack(spacing: 12) {
-                                Image(systemName: icon(for: fileURL))
-                                    .font(.title3)
-                                    .foregroundStyle(.tint)
-                                    .frame(width: 28)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(fileURL.lastPathComponent)
-                                        .font(.subheadline.weight(.medium))
-                                        .lineLimit(2)
-                                    Text(fileDetails(for: fileURL))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                Button {
+                                    previewItem = QuickLookPreviewItem(url: fileURL)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: icon(for: fileURL))
+                                            .font(.title3)
+                                            .foregroundStyle(.tint)
+                                            .frame(width: 28)
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(fileURL.lastPathComponent)
+                                                .font(.subheadline.weight(.medium))
+                                                .foregroundStyle(.primary)
+                                                .lineLimit(2)
+                                            Text(fileDetails(for: fileURL))
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
                                 }
+                                .buttonStyle(.plain)
+
                                 Spacer()
+
+                                if fileURL.pathExtension.lowercased() == "zip" {
+                                    Button {
+                                        unzip(fileURL)
+                                    } label: {
+                                        Image(systemName: "arrow.down.doc.fill")
+                                            .font(.body)
+                                            .foregroundStyle(.tint)
+                                    }
+                                    .buttonStyle(.borderless)
+                                }
+
                                 ShareLink(item: fileURL) {
                                     Image(systemName: "square.and.arrow.up")
                                         .font(.body)
@@ -461,21 +474,29 @@ struct SavedDownloadsFolderView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button {
-                        reloadFiles()
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                    }
+                    Button { reloadFiles() } label: { Image(systemName: "arrow.clockwise") }
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .sheet(item: $previewItem) { item in
+                QuickLookPreview(url: item.url)
+                    .ignoresSafeArea()
             }
             .onAppear { reloadFiles() }
             .onChange(of: selectedTab) { _, _ in
                 copiedPath = false
                 reloadFiles()
             }
+        }
+    }
+
+    private func unzip(_ fileURL: URL) {
+        unzipping = true
+        ArchiveManager.unzipFile(at: fileURL) { _ in
+            unzipping = false
+            reloadFiles()
         }
     }
 
@@ -546,6 +567,7 @@ struct UploadRow: View {
 
 struct DownloadRow: View {
     let item: DownloadItem
+    var onPreview: ((URL) -> Void)? = nil
     @EnvironmentObject private var library: LibraryStore
 
     private var artwork: ArtworkSource {
@@ -573,11 +595,12 @@ struct DownloadRow: View {
                 .foregroundStyle(statusColor)
             }
             if case let .completed(url) = item.state {
-                ShareLink(item: url) {
-                    Image(systemName: "square.and.arrow.up")
-                        .font(.body)
+                Button {
+                    onPreview?(url)
+                } label: {
+                    Image(systemName: "eye.circle.fill")
+                        .font(.title3)
                         .foregroundStyle(.tint)
-                        .padding(.leading, 4)
                 }
                 .buttonStyle(.borderless)
             }
