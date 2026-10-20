@@ -8,8 +8,8 @@ struct SearchView: View {
     @State private var keywordFilter = ""
     @State private var isSearchFocused = false
     @State private var showFilters = false
+    @State private var showPeersSheet = false
 
-    /// Resultados filtrados en tiempo real por el segundo mini-buscador
     private var displayedResults: [FolderResult] {
         let trimmed = keywordFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !trimmed.isEmpty else { return soulseek.results }
@@ -23,16 +23,14 @@ struct SearchView: View {
         }
     }
 
-    /// Historial filtrado mientras escribes en el buscador principal
     private var matchingHistory: [String] {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return soulseek.searchHistory }
         return soulseek.searchHistory.filter { $0.localizedCaseInsensitiveContains(trimmed) }
     }
 
-    /// Muestra el historial cuando pulsas el buscador o cuando aún no hay una búsqueda activa
-    private var shouldShowHistory: Bool {
-        !soulseek.searchHistory.isEmpty && (isSearchFocused || soulseek.currentQuery.isEmpty)
+    private var shouldShowHomeSections: Bool {
+        isSearchFocused || soulseek.currentQuery.isEmpty
     }
 
     var body: some View {
@@ -42,8 +40,92 @@ struct SearchView: View {
                     Section { ConnectionBanner() }
                 }
 
-                // Desplegable de historial de búsqueda al pulsar buscar
-                if shouldShowHistory && !matchingHistory.isEmpty {
+                // 1. Sección de Wishlist (Búsquedas Guardadas / Auto-Search)
+                if shouldShowHomeSections && !soulseek.wishlist.isEmpty {
+                    Section {
+                        ForEach(soulseek.wishlist) { item in
+                            Button {
+                                query = item.query
+                                keywordFilter = ""
+                                isSearchFocused = false
+                                soulseek.search(item.query)
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "star.fill")
+                                        .foregroundStyle(.yellow)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(item.query)
+                                            .font(.subheadline.weight(.medium))
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        if let checked = item.lastChecked {
+                                            Text("Checked \(checked.formatted(.relative(presentation: .named)))")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if item.lastMatchCount > 0 {
+                                        Text("\(item.lastMatchCount) hits")
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 3)
+                                            .background(Color.green.opacity(0.2), in: Capsule())
+                                            .foregroundStyle(.green)
+                                    }
+                                }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                Button(role: .destructive) {
+                                    soulseek.removeWishlistItem(item)
+                                } label: {
+                                    Label("Remove", systemImage: "trash")
+                                }
+                            }
+                        }
+                    } header: {
+                        HStack {
+                            Label("Wishlist", systemImage: "star.circle.fill")
+                            Spacer()
+                            Button {
+                                soulseek.checkAllWishlist()
+                            } label: {
+                                if soulseek.isCheckingWishlist {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Text("Check All")
+                                }
+                            }
+                            .font(.caption.weight(.semibold))
+                            .textCase(nil)
+                            .disabled(!soulseek.isLoggedIn || soulseek.isCheckingWishlist)
+                        }
+                    }
+                }
+
+                // 2. Sección de Usuarios Favoritos (Acceso directo a sus carpetas)
+                if shouldShowHomeSections && !soulseek.favoriteUsers.isEmpty {
+                    Section("Favorite Users (Tap to Browse)") {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(soulseek.favoriteUsers, id: \.self) { user in
+                                    NavigationLink(value: BrowseTarget(username: user, folder: "")) {
+                                        Label(user, systemImage: "person.crop.circle.badge.checkmark")
+                                            .font(.caption.weight(.semibold))
+                                            .padding(.horizontal, 12)
+                                            .padding(.vertical, 7)
+                                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                }
+
+                // 3. Historial de búsqueda desplegable
+                if shouldShowHomeSections && !matchingHistory.isEmpty {
                     Section {
                         ForEach(matchingHistory, id: \.self) { item in
                             Button {
@@ -59,9 +141,13 @@ struct SearchView: View {
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
                                     Spacer()
-                                    Image(systemName: "arrow.up.left")
-                                        .font(.caption)
-                                        .foregroundStyle(.tertiary)
+                                    Button {
+                                        soulseek.toggleWishlist(item)
+                                    } label: {
+                                        Image(systemName: soulseek.isInWishlist(item) ? "star.fill" : "star")
+                                            .foregroundStyle(soulseek.isInWishlist(item) ? .yellow : .secondary)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                             .swipeActions(edge: .trailing) {
@@ -85,6 +171,7 @@ struct SearchView: View {
                     }
                 }
 
+                // 4. Resultados de búsqueda activa
                 if !soulseek.currentQuery.isEmpty && !isSearchFocused {
                     Section {
                         FilterChips(showAll: $showFilters)
@@ -92,7 +179,7 @@ struct SearchView: View {
                             .listRowBackground(Color.clear)
                     }
 
-                    // Segundo mini-buscador para filtrar por palabras clave dentro de los resultados
+                    // Mini-buscador por palabras clave y botón para guardar en Wishlist
                     Section {
                         HStack(spacing: 8) {
                             Image(systemName: "line.3.horizontal.decrease")
@@ -109,6 +196,16 @@ struct SearchView: View {
                                 }
                                 .buttonStyle(.plain)
                             }
+                            Divider().frame(height: 18)
+                            Button {
+                                soulseek.toggleWishlist(soulseek.currentQuery)
+                            } label: {
+                                Label(soulseek.isInWishlist(soulseek.currentQuery) ? "Saved" : "Wishlist",
+                                      systemImage: soulseek.isInWishlist(soulseek.currentQuery) ? "star.fill" : "star")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(soulseek.isInWishlist(soulseek.currentQuery) ? .yellow : .accentColor)
+                            }
+                            .buttonStyle(.plain)
                         }
                         .padding(.vertical, 2)
                     }
@@ -135,7 +232,10 @@ struct SearchView: View {
 
                     ForEach(displayedResults) { folder in
                         NavigationLink(value: folder.id) {
-                            FolderRow(folder: folder)
+                            FolderRow(
+                                folder: folder,
+                                isFavorite: soulseek.isFavoriteUser(folder.username)
+                            )
                         }
                         .contextMenu {
                             NavigationLink(value: BrowseTarget(username: folder.username, folder: folder.folder)) {
@@ -150,6 +250,18 @@ struct SearchView: View {
                                 soulseek.downloadFolder(folder)
                             } label: {
                                 Label("Download Folder", systemImage: "arrow.down.circle")
+                            }
+                            Divider()
+                            Button {
+                                soulseek.toggleFavoriteUser(folder.username)
+                            } label: {
+                                Label(soulseek.isFavoriteUser(folder.username) ? "Remove Favorite User" : "Favorite User (\(folder.username))",
+                                      systemImage: soulseek.isFavoriteUser(folder.username) ? "star.slash" : "star")
+                            }
+                            Button(role: .destructive) {
+                                soulseek.toggleBlockedUser(folder.username)
+                            } label: {
+                                Label("Block User (\(folder.username))", systemImage: "hand.raised.fill")
                             }
                         }
                     }
@@ -178,7 +290,12 @@ struct SearchView: View {
                 RemoteFolderBrowserView(target: target)
             }
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItemGroup(placement: .topBarTrailing) {
+                    Button {
+                        showPeersSheet = true
+                    } label: {
+                        Image(systemName: "person.2.crop.square.stack")
+                    }
                     Button {
                         showFilters = true
                     } label: {
@@ -191,8 +308,11 @@ struct SearchView: View {
                 SearchFiltersView()
                     .presentationDetents([.medium, .large])
             }
+            .sheet(isPresented: $showPeersSheet) {
+                PeersManagerSheet()
+            }
             .overlay {
-                if soulseek.currentQuery.isEmpty && soulseek.searchHistory.isEmpty && soulseek.isLoggedIn && !isSearchFocused {
+                if soulseek.currentQuery.isEmpty && soulseek.searchHistory.isEmpty && soulseek.wishlist.isEmpty && soulseek.isLoggedIn && !isSearchFocused {
                     EmptyStateView(title: "Search Soulseek",
                                    message: "Search for music, videos, archives, books or any file. Results arrive over ~30 seconds.",
                                    systemImage: "magnifyingglass")
@@ -202,8 +322,88 @@ struct SearchView: View {
     }
 }
 
+/// Panel para administrar Usuarios Favoritos y Usuarios Bloqueados (Blacklist)
+struct PeersManagerSheet: View {
+    @EnvironmentObject private var soulseek: SoulseekModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var newUsername = ""
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Add User Manually") {
+                    HStack {
+                        TextField("Soulseek username…", text: $newUsername)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Button("Favorite") {
+                            let trimmed = newUsername.trimmingCharacters(in: .whitespaces)
+                            guard !trimmed.isEmpty else { return }
+                            if !soulseek.isFavoriteUser(trimmed) {
+                                soulseek.toggleFavoriteUser(trimmed)
+                            }
+                            newUsername = ""
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .disabled(newUsername.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                }
+
+                Section("Favorite Users (\(soulseek.favoriteUsers.count))") {
+                    if soulseek.favoriteUsers.isEmpty {
+                        Text("Long-press any search result folder to favorite a fast user.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(soulseek.favoriteUsers, id: \.self) { user in
+                            HStack {
+                                Label(user, systemImage: "star.fill")
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Button("Remove", role: .destructive) {
+                                    soulseek.toggleFavoriteUser(user)
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
+                }
+
+                Section("Blocked Users / Blacklist (\(soulseek.blockedUsers.count))") {
+                    if soulseek.blockedUsers.isEmpty {
+                        Text("Blocked users are automatically hidden from all search results.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(soulseek.blockedUsers, id: \.self) { user in
+                            HStack {
+                                Label(user, systemImage: "hand.raised.fill")
+                                    .foregroundStyle(.red)
+                                Spacer()
+                                Button("Unblock") {
+                                    soulseek.toggleBlockedUser(user)
+                                }
+                                .font(.caption)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Favorite & Blocked Users")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 struct FolderRow: View {
     let folder: FolderResult
+    var isFavorite: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
@@ -230,7 +430,8 @@ struct FolderRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
-                    Label(folder.username, systemImage: "person")
+                    Label(folder.username, systemImage: isFavorite ? "star.fill" : "person")
+                        .foregroundStyle(isFavorite ? .yellow : .primary)
                         .lineLimit(1)
                     if folder.slotFree {
                         Label("Free slot", systemImage: "checkmark.circle.fill")
@@ -276,7 +477,6 @@ struct FolderDetailView: View {
                     .listRowBackground(Color.clear)
                 }
 
-                // Navegador de Carpeta Raíz y Carpetas Contenedoras (pulsando sobre cualquier nivel)
                 Section("Container & Root Folders (Tap to Browse)") {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
@@ -317,6 +517,13 @@ struct FolderDetailView: View {
                         Label("Download All (\(folder.files.count) files)", systemImage: "arrow.down.circle.fill")
                     }
                     .disabled(!soulseek.isLoggedIn)
+
+                    Button {
+                        soulseek.toggleFavoriteUser(folder.username)
+                    } label: {
+                        Label(soulseek.isFavoriteUser(folder.username) ? "Remove \(folder.username) from Favorites" : "Add \(folder.username) to Favorite Users",
+                              systemImage: soulseek.isFavoriteUser(folder.username) ? "star.slash" : "star")
+                    }
                 } footer: {
                     Text("From \(folder.username) · \(folder.folder). Tap any folder badge above to navigate through its root/parent directories.")
                 }
@@ -355,7 +562,6 @@ struct FolderDetailView: View {
     }
 }
 
-/// Vista completa para explorar cualquier carpeta contenedora o raíz de un usuario
 struct RemoteFolderBrowserView: View {
     let target: BrowseTarget
     @EnvironmentObject private var soulseek: SoulseekModel
@@ -363,9 +569,7 @@ struct RemoteFolderBrowserView: View {
     @State private var isLoading = true
     @State private var filterText = ""
 
-    private var currentPath: String {
-        target.folder
-    }
+    private var currentPath: String { target.folder }
 
     private var folderTitle: String {
         currentPath.split(separator: "\\").last.map(String.init) ?? target.username
@@ -386,7 +590,6 @@ struct RemoteFolderBrowserView: View {
         }
     }
 
-    /// Subcarpetas inmediatas dentro de esta carpeta contenedora
     private var subfolders: [(name: String, fullPath: String, fileCount: Int)] {
         let prefix = currentPath.isEmpty ? "" : currentPath + "\\"
         let prefixLower = prefix.lowercased()
@@ -421,7 +624,6 @@ struct RemoteFolderBrowserView: View {
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    /// Archivos que están directamente dentro de esta carpeta
     private var directFiles: [SharedFile] {
         let trimmed = filterText.trimmingCharacters(in: .whitespaces).lowercased()
         return allPeerFiles.filter { file in
@@ -436,7 +638,6 @@ struct RemoteFolderBrowserView: View {
 
     var body: some View {
         List {
-            // Barra de ruta interactiva (migas de pan) para saltar a cualquier carpeta superior o a la raíz
             Section {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
@@ -479,7 +680,6 @@ struct RemoteFolderBrowserView: View {
                 Text("Path Navigation")
             }
 
-            // Mini-buscador dentro del explorador de carpetas
             Section {
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass")
@@ -561,7 +761,13 @@ struct RemoteFolderBrowserView: View {
         .navigationTitle(folderTitle)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button {
+                    soulseek.toggleFavoriteUser(target.username)
+                } label: {
+                    Image(systemName: soulseek.isFavoriteUser(target.username) ? "star.fill" : "star")
+                        .foregroundStyle(soulseek.isFavoriteUser(target.username) ? .yellow : .primary)
+                }
                 Button {
                     loadFolder(force: true)
                 } label: {
@@ -734,7 +940,6 @@ struct SearchFiltersView: View {
     }
 }
 
-/// One-tap sort and filter controls above the results.
 struct FilterChips: View {
     @Binding var showAll: Bool
     @EnvironmentObject private var soulseek: SoulseekModel
