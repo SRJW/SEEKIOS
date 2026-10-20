@@ -10,6 +10,14 @@ struct SavedHistoryItem: Codable {
     let urlPath: String?
 }
 
+/// Elemento de la Lista de Deseos (Wishlist)
+struct WishlistItem: Codable, Identifiable, Equatable {
+    var id: String { query.lowercased() }
+    let query: String
+    var lastMatchCount: Int
+    var lastChecked: Date?
+}
+
 /// Navegación hacia una carpeta remota de un usuario en Soulseek
 struct BrowseTarget: Hashable, Identifiable {
     let username: String
@@ -23,7 +31,6 @@ struct FolderResult: Identifiable {
     let username: String
     let folder: String
     var files: [SharedFile]
-    /// Image files seen in this folder (usually only when the search terms matched the folder name).
     var images: [SharedFile] = []
     let slotFree: Bool
     let speed: UInt32
@@ -34,19 +41,16 @@ struct FolderResult: Identifiable {
         return parts.last.map(String.init) ?? username
     }
 
-    /// Parent folders, e.g. "Music\Artist" — helps tell same-named folders apart.
     var parentPath: String {
         folder.split(separator: "\\").dropLast().joined(separator: " › ")
     }
 
-    /// Ruta de la carpeta padre inmediata (un nivel arriba)
     var parentFolderPath: String? {
         let parts = folder.split(separator: "\\")
         guard parts.count > 1 else { return nil }
         return parts.dropLast().joined(separator: "\\")
     }
 
-    /// Todos los niveles de carpetas desde la raíz hasta la carpeta actual para poder pulsar sobre cualquiera
     var pathLevels: [(name: String, fullPath: String)] {
         let parts = folder.split(separator: "\\").map(String.init)
         var current = ""
@@ -57,8 +61,6 @@ struct FolderResult: Identifiable {
     }
 
     var totalSize: UInt64 { files.reduce(0) { $0 + $1.size } }
-
-    /// "artist album" guess for an online cover lookup.
     var coverQuery: String { CoverLookup.query(forFolderPath: folder) }
 
     var formatSummary: String {
@@ -89,11 +91,7 @@ struct DownloadItem: Identifiable {
 
     var filename: String { SharedFile(path: id.path, size: size).filename }
     var folderPath: String { SharedFile(path: id.path, size: size).folder }
-
-    /// Now always false so direct image/file downloads remain visible to the user.
-    var isArtwork: Bool {
-        false
-    }
+    var isArtwork: Bool { false }
 
     var progress: Double {
         size > 0 ? min(1, Double(received) / Double(size)) : 0
@@ -107,7 +105,6 @@ struct DownloadItem: Identifiable {
     }
 }
 
-/// A file from a one-off "find this song" search (missing album tracks).
 struct TrackCandidate: Identifiable {
     let username: String
     let file: SharedFile
@@ -135,6 +132,10 @@ final class SoulseekModel: ObservableObject {
     @Published private(set) var responseCount = 0
     @Published private(set) var currentQuery = ""
     @Published private(set) var searchHistory: [String] = []
+    @Published private(set) var wishlist: [WishlistItem] = []
+    @Published private(set) var isCheckingWishlist = false
+    @Published private(set) var favoriteUsers: [String] = []
+    @Published private(set) var blockedUsers: [String] = []
     @Published private(set) var downloads: [DownloadItem] = []
     @Published private(set) var uploads: [UploadItem] = []
     @Published private(set) var trackCandidates: [TrackCandidate] = []
@@ -150,19 +151,17 @@ final class SoulseekModel: ObservableObject {
             rebuildResults()
         }
     }
-    /// Folders found but hidden by the filters.
     @Published private(set) var hiddenCount = 0
 
     let client: SoulseekClient
     let library: LibraryStore
-    /// Directory where non-audio files are saved (`Documents/Downloads`).
     let otherDownloadsDirectory: URL
-    /// Set by the app; receives full folder listings for the missing-songs view.
     weak var completeness: AlbumCompletenessStore?
     weak var stats: StatsStore?
 
     private var searchToken: UInt32?
     private var trackSearchToken: UInt32?
+    private var wishlistTokens: [UInt32: String] = [:]
     private var trackSearchTitle = ""
     private var responses: [SearchResponse] = []
     private var pendingResponses: [SearchResponse] = []
@@ -172,6 +171,9 @@ final class SoulseekModel: ObservableObject {
     private var browseCache: [String: [SharedFile]] = [:]
 
     private let searchHistoryKey = "search_history_v1"
+    private let wishlistKey = "wishlist_items_v1"
+    private let favoriteUsersKey = "favorite_users_v1"
+    private let blockedUsersKey = "blocked_users_v1"
 
     init(library: LibraryStore) {
         self.library = library
@@ -185,6 +187,7 @@ final class SoulseekModel: ObservableObject {
 
         loadHistory()
         loadSearchHistory()
+        loadWishlistAndPeers()
 
         client.onEvent = { [weak self] event in self?.handle(event) }
         library.onSharesChanged = { [weak self] shares in self?.client.updateShares(shares) }
@@ -230,7 +233,96 @@ final class SoulseekModel: ObservableObject {
         client.disconnect()
     }
 
-    // MARK: Historial de Búsqueda Persistente
+    // MARK: - Wishlist & Usuarios Favoritos / Bloqueados
+
+    private func loadWishlistAndPeers() {
+        if let data = UserDefaults.standard.data(forKey: wishlistKey),
+           let decoded = try? JSONDecoder().decode([WishlistItem].self, from: data) {
+            wishlist = decoded
+        }
+        favoriteUsers = UserDefaults.standard.stringArray(forKey: favoriteUsersKey) ?? []
+        blockedUsers = UserDefaults.standard.stringArray(forKey: blockedUsersKey) ?? []
+    }
+
+    private func saveWishlist() {
+        if let data = try? JSONEncoder().encode(wishlist) {
+            UserDefaults.standard.set(data, forKey: wishlistKey)
+        }
+    }
+
+    func isInWishlist(_ query: String) -> Bool {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return wishlist.contains { $0.query.caseInsensitiveCompare(trimmed) == .orderedSame }
+    }
+
+    func toggleWishlist(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let index = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            wishlist.remove(at: index)
+        } else {
+            wishlist.insert(WishlistItem(query: trimmed, lastMatchCount: results.count, lastChecked: Date()), at: 0)
+        }
+        saveWishlist()
+    }
+
+    func removeWishlistItem(_ item: WishlistItem) {
+        wishlist.removeAll { $0.id == item.id }
+        saveWishlist()
+    }
+
+    /// Busca automáticamente todos los elementos de la Wishlist y cuenta cuántos resultados aparecen
+    func checkAllWishlist() {
+        guard isLoggedIn, !wishlist.isEmpty, !isCheckingWishlist else { return }
+        isCheckingWishlist = true
+        wishlistTokens.removeAll()
+
+        for index in wishlist.indices {
+            wishlist[index].lastMatchCount = 0
+            wishlist[index].lastChecked = Date()
+            let q = wishlist[index].query
+            let token = client.search(q)
+            wishlistTokens[token] = q
+        }
+        saveWishlist()
+
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            self?.isCheckingWishlist = false
+        }
+    }
+
+    func isFavoriteUser(_ user: String) -> Bool {
+        favoriteUsers.contains { $0.caseInsensitiveCompare(user) == .orderedSame }
+    }
+
+    func toggleFavoriteUser(_ user: String) {
+        if let idx = favoriteUsers.firstIndex(where: { $0.caseInsensitiveCompare(user) == .orderedSame }) {
+            favoriteUsers.remove(at: idx)
+        } else {
+            favoriteUsers.insert(user, at: 0)
+        }
+        UserDefaults.standard.set(favoriteUsers, forKey: favoriteUsersKey)
+        rebuildResults()
+    }
+
+    func isBlockedUser(_ user: String) -> Bool {
+        blockedUsers.contains { $0.caseInsensitiveCompare(user) == .orderedSame }
+    }
+
+    func toggleBlockedUser(_ user: String) {
+        if let idx = blockedUsers.firstIndex(where: { $0.caseInsensitiveCompare(user) == .orderedSame }) {
+            blockedUsers.remove(at: idx)
+        } else {
+            blockedUsers.insert(user, at: 0)
+            favoriteUsers.removeAll { $0.caseInsensitiveCompare(user) == .orderedSame }
+            UserDefaults.standard.set(favoriteUsers, forKey: favoriteUsersKey)
+        }
+        UserDefaults.standard.set(blockedUsers, forKey: blockedUsersKey)
+        rebuildResults()
+    }
+
+    // MARK: - Historial de Búsqueda Persistente
 
     private func loadSearchHistory() {
         if let saved = UserDefaults.standard.stringArray(forKey: searchHistoryKey) {
@@ -263,7 +355,7 @@ final class SoulseekModel: ObservableObject {
         saveSearchHistory()
     }
 
-    // MARK: Persistencia del Historial de Descargas
+    // MARK: - Persistencia del Historial de Descargas
 
     private func saveHistory() {
         let history = downloads.compactMap { item -> SavedHistoryItem? in
@@ -292,7 +384,7 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    // MARK: Search
+    // MARK: - Search
 
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -307,7 +399,6 @@ final class SoulseekModel: ObservableObject {
         searchToken = client.search(trimmed)
     }
 
-    /// Explora todos los archivos compartidos por un usuario o dentro de una carpeta contenedora/raíz
     func browseUserFolder(username: String, folder: String, forceRefresh: Bool = false, completion: @escaping ([SharedFile]?) -> Void) {
         if !forceRefresh, let cached = browseCache[username], !cached.isEmpty {
             completion(cached)
@@ -323,7 +414,6 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    /// Todos los archivos ya conocidos de ese usuario en las respuestas de búsqueda actuales (respaldo instantáneo)
     func knownFiles(for username: String) -> [SharedFile] {
         var seen = Set<String>()
         var output: [SharedFile] = []
@@ -389,9 +479,15 @@ final class SoulseekModel: ObservableObject {
     }
 
     private func rebuildResults() {
+        let blockedSet = Set(blockedUsers.map { $0.lowercased() })
+        let favSet = Set(favoriteUsers.map { $0.lowercased() })
+
         var folders: [String: FolderResult] = [:]
         var images: [String: [SharedFile]] = [:]
         for response in responses {
+            // Oculta automáticamente usuarios bloqueados
+            if blockedSet.contains(response.username.lowercased()) { continue }
+
             for file in response.files where LibraryStore.imageExtensions.contains(file.fileExtension) {
                 images[response.username + "|" + file.folder, default: []].append(file)
             }
@@ -416,10 +512,25 @@ final class SoulseekModel: ObservableObject {
         }
         let kept = all.filter { filters.accepts($0) }
         hiddenCount = all.count - kept.count
-        results = filters.ordered(kept, query: currentQuery)
+        let ordered = filters.ordered(kept, query: currentQuery)
+
+        // Prioriza a los Usuarios Favoritos arriba del todo
+        results = ordered.sorted { lhs, rhs in
+            let lFav = favSet.contains(lhs.username.lowercased())
+            let rFav = favSet.contains(rhs.username.lowercased())
+            if lFav != rFav { return lFav }
+            return false
+        }
+
+        // Actualiza el conteo si la búsqueda actual está en la Wishlist
+        if let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(currentQuery) == .orderedSame }) {
+            wishlist[idx].lastMatchCount = results.count
+            wishlist[idx].lastChecked = Date()
+            saveWishlist()
+        }
     }
 
-    // MARK: Downloads
+    // MARK: - Downloads
 
     func download(_ file: SharedFile, from username: String, knownImages: [SharedFile] = []) {
         client.download(username: username, file: file)
@@ -574,7 +685,7 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    // MARK: Events
+    // MARK: - Events
 
     private func handle(_ event: ClientEvent) {
         switch event {
@@ -586,6 +697,16 @@ final class SoulseekModel: ObservableObject {
             if response.token == trackSearchToken {
                 addTrackCandidates(from: response)
                 return
+            }
+            if let wishQuery = wishlistTokens[response.token] {
+                if !isBlockedUser(response.username) && !response.files.isEmpty {
+                    if let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(wishQuery) == .orderedSame }) {
+                        wishlist[idx].lastMatchCount += 1
+                        wishlist[idx].lastChecked = Date()
+                        saveWishlist()
+                    }
+                }
+                if response.token != searchToken { return }
             }
             guard response.token == searchToken else { return }
             pendingResponses.append(response)
