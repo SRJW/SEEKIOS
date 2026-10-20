@@ -4,29 +4,23 @@ import Foundation
 import SoulseekKit
 import UserNotifications
 
-/// Mantiene las transferencias activas en segundo plano y envía una notificación únicamente cuando finalizan.
+/// Mantiene descargas en segundo plano, envía notificaciones al terminar y gestiona el Auto-Retry
 @MainActor
 final class TransferMonitor {
     private let soulseek: SoulseekModel
     private let player: Player
     private weak var stats: StatsStore?
     private let keeper = BackgroundKeeper()
-    private var activity: Activity<TransferActivityAttributes>?
     private var subscriptions = Set<AnyCancellable>()
     private var heartbeat: Timer?
     private var lastReconnect = Date.distantPast
 
-    private var lastBytes: UInt64 = 0
-    private var lastSample = Date()
-    private var speed: Double = 0
-
-    /// Registro de descargas ya notificadas para avisar solo cuando cada archivo finaliza
     private var notifiedCompletedIDs = Set<DownloadID>()
     private var initializedCompleted = false
 
-    private struct Progress { var done: UInt64; var size: UInt64 }
-    private var downloadBatch: [DownloadID: Progress] = [:]
-    private var uploadBatch: [DownloadID: Progress] = [:]
+    /// Control de Reintentos Automáticos (Auto-Retry)
+    private var retryCounts: [DownloadID: Int] = [:]
+    private var pendingRetryTimers: [DownloadID: Task<Void, Never>] = [:]
 
     init(soulseek: SoulseekModel, player: Player, stats: StatsStore) {
         self.soulseek = soulseek
@@ -35,13 +29,11 @@ final class TransferMonitor {
 
         requestNotificationPermission()
 
-        // Limpia cualquier notificación de progreso vieja o Live Activity previa
         UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["seekios.transfer.progress"])
         for stale in Activity<TransferActivityAttributes>.activities {
             Task { await stale.end(nil, dismissalPolicy: .immediate) }
         }
 
-        // Registra las que ya estaban completadas en el historial al abrir la app para no re-notificarlas
         for item in soulseek.downloads {
             if case .completed = item.state {
                 notifiedCompletedIDs.insert(item.id)
@@ -97,8 +89,34 @@ final class TransferMonitor {
             keeper.stop()
         }
 
-        // Verifica si alguna descarga acaba de finalizar y envía la notificación
         notifyNewlyCompletedDownloads(downloads)
+        handleAutoRetry(downloads)
+    }
+
+    private func handleAutoRetry(_ downloads: [DownloadItem]) {
+        for item in downloads where !item.isArtwork {
+            switch item.state {
+            case .failed:
+                let id = item.id
+                let attempts = retryCounts[id, default: 0]
+                if attempts < 3 && pendingRetryTimers[id] == nil {
+                    // Programa reintento automático tras 2 minutos (120 segundos)
+                    pendingRetryTimers[id] = Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 120_000_000_000)
+                        guard let self = self else { return }
+                        self.retryCounts[id] = attempts + 1
+                        self.pendingRetryTimers.removeValue(forKey: id)
+                        self.soulseek.retry(item)
+                    }
+                }
+            case .completed:
+                retryCounts.removeValue(forKey: item.id)
+                pendingRetryTimers[id]?.cancel()
+                pendingRetryTimers.removeValue(forKey: item.id)
+            default:
+                break
+            }
+        }
     }
 
     private func notifyNewlyCompletedDownloads(_ downloads: [DownloadItem]) {
@@ -112,7 +130,6 @@ final class TransferMonitor {
                     newlyFinished.append(item)
                 }
             } else {
-                // Si se reintenta una descarga, permite volver a notificar cuando termine
                 notifiedCompletedIDs.remove(item.id)
             }
         }
