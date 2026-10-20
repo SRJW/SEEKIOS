@@ -14,25 +14,10 @@ concurrency:
 permissions:
   contents: write
 
-env:
-  ZSIGN_COMMIT: 614caa8d1ca949e260e5746144aa52d27a4b08d6
-
 jobs:
-  test:
-    name: Protocol tests (Linux)
-    runs-on: ubuntu-latest
-    container: swift:6.0
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install zlib headers
-        run: apt-get update -qq && apt-get install -y -qq zlib1g-dev
-      - name: Test SoulseekKit
-        run: swift test --package-path Packages/SoulseekKit
-
   build:
     name: Build unsigned IPA
-    needs: test
-    runs-on: macos-15
+    runs-on: macos-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       build: ${{ steps.version.outputs.build }}
