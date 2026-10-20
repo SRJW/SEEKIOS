@@ -95,24 +95,23 @@ final class TransferMonitor {
 
     private func handleAutoRetry(_ downloads: [DownloadItem]) {
         for item in downloads where !item.isArtwork {
+            let itemID = item.id
             switch item.state {
             case .failed:
-                let id = item.id
-                let attempts = retryCounts[id, default: 0]
-                if attempts < 3 && pendingRetryTimers[id] == nil {
-                    // Programa reintento automático tras 2 minutos (120 segundos)
-                    pendingRetryTimers[id] = Task { [weak self] in
+                let attempts = retryCounts[itemID, default: 0]
+                if attempts < 3 && pendingRetryTimers[itemID] == nil {
+                    pendingRetryTimers[itemID] = Task { [weak self] in
                         try? await Task.sleep(nanoseconds: 120_000_000_000)
                         guard let self = self else { return }
-                        self.retryCounts[id] = attempts + 1
-                        self.pendingRetryTimers.removeValue(forKey: id)
+                        self.retryCounts[itemID] = attempts + 1
+                        self.pendingRetryTimers.removeValue(forKey: itemID)
                         self.soulseek.retry(item)
                     }
                 }
             case .completed:
-                retryCounts.removeValue(forKey: item.id)
-                pendingRetryTimers[id]?.cancel()
-                pendingRetryTimers.removeValue(forKey: item.id)
+                retryCounts.removeValue(forKey: itemID)
+                pendingRetryTimers[itemID]?.cancel()
+                pendingRetryTimers.removeValue(forKey: itemID)
             default:
                 break
             }
