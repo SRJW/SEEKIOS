@@ -76,10 +76,115 @@ jobs:
             exit 1
           fi
 
-      - name: Package IPA
+      - name: Generate Dynamic Color App Icons & Package IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
+
+          # Genera un icono para cada color hexadecimal de AccentPalette y lo registra en Info.plist
+          cat << 'EOF' > generate_icons.swift
+          import AppKit
+          import CoreGraphics
+          import Foundation
+
+          let fm = FileManager.default
+          var hexColors = Set<String>()
+
+          if let enumerator = fm.enumerator(atPath: "App") {
+              while let file = enumerator.nextObject() as? String {
+                  guard file.hasSuffix(".swift"),
+                        let content = try? String(contentsOfFile: "App/\(file)", encoding: .utf8) else { continue }
+                  let pattern = "#?([0-9A-Fa-f]{6})\\b"
+                  if let regex = try? NSRegularExpression(pattern: pattern) {
+                      let nsRange = NSRange(content.startIndex..<content.endIndex, in: content)
+                      for match in regex.matches(in: content, range: nsRange) {
+                          if let r = Range(match.range(at: 1), in: content) {
+                              hexColors.insert(String(content[r]).uppercased())
+                          }
+                      }
+                  }
+              }
+          }
+
+          func drawIcon(hex: String, size: Int, outputPath: String) {
+              guard let val = UInt32(hex, radix: 16) else { return }
+              let r = CGFloat((val >> 16) & 0xFF) / 255.0
+              let g = CGFloat((val >> 8) & 0xFF) / 255.0
+              let b = CGFloat(val & 0xFF) / 255.0
+
+              let rep = NSBitmapImageRep(
+                  bitmapDataPlanes: nil,
+                  pixelsWide: size,
+                  pixelsHigh: size,
+                  bitsPerSample: 8,
+                  samplesPerPixel: 4,
+                  hasAlpha: true,
+                  isPlanar: false,
+                  colorSpaceName: .deviceRGB,
+                  bytesPerRow: 0,
+                  bitsPerPixel: 0
+              )!
+
+              NSGraphicsContext.saveGraphicsState()
+              NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+
+              // Fondo del color elegido
+              NSColor(deviceRed: r, green: g, blue: b, alpha: 1.0).setFill()
+              NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+
+              // Letra "S" blanca centrada
+              let fontSize = CGFloat(size) * 0.62
+              let font = NSFont.systemFont(ofSize: fontSize, weight: .heavy)
+              let attrs: [NSAttributedString.Key: Any] = [
+                  .font: font,
+                  .foregroundColor: NSColor.white
+              ]
+              let text = "S" as NSString
+              let textSize = text.size(withAttributes: attrs)
+              let textRect = NSRect(
+                  x: (CGFloat(size) - textSize.width) / 2.0,
+                  y: (CGFloat(size) - textSize.height) / 2.0,
+                  width: textSize.width,
+                  height: textSize.height
+              )
+              text.draw(in: textRect, withAttributes: attrs)
+
+              NSGraphicsContext.restoreGraphicsState()
+
+              if let pngData = rep.representation(using: .png, properties: [:]) {
+                  try? pngData.write(to: URL(fileURLWithPath: outputPath))
+              }
+          }
+
+          let appPath = "Payload/colon3.app"
+          let plistPath = "\(appPath)/Info.plist"
+          var alternateIcons: [String: Any] = [:]
+
+          for hex in hexColors {
+              let iconName = "AppIcon_\(hex)"
+              drawIcon(hex: hex, size: 180, outputPath: "\(appPath)/\(iconName)@3x.png")
+              drawIcon(hex: hex, size: 120, outputPath: "\(appPath)/\(iconName)@2x.png")
+              alternateIcons[iconName] = [
+                  "CFBundleIconFiles": [iconName],
+                  "UIPrerenderedIcon": false
+              ]
+          }
+
+          if let plist = NSMutableDictionary(contentsOfFile: plistPath) {
+              var bundleIcons = (plist["CFBundleIcons"] as? [String: Any]) ?? [:]
+              bundleIcons["CFBundleAlternateIcons"] = alternateIcons
+              plist["CFBundleIcons"] = bundleIcons
+
+              var ipadIcons = (plist["CFBundleIcons~ipad"] as? [String: Any]) ?? [:]
+              ipadIcons["CFBundleAlternateIcons"] = alternateIcons
+              plist["CFBundleIcons~ipad"] = ipadIcons
+
+              plist.write(toFile: plistPath, atomically: true)
+          }
+          print("Generated \(hexColors.count) dynamic color icons.")
+          EOF
+
+          swift generate_icons.swift
           zip -qry Seekios.ipa Payload
           ls -lh Seekios.ipa
 
