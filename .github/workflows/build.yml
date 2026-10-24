@@ -81,26 +81,48 @@ jobs:
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
 
-          # Genera un icono para cada color hexadecimal de AccentPalette y lo registra en Info.plist
           cat << 'EOF' > generate_icons.swift
           import AppKit
           import CoreGraphics
+          import CoreText
           import Foundation
 
           let fm = FileManager.default
           var hexColors = Set<String>()
 
-          if let enumerator = fm.enumerator(atPath: "App") {
+          // 1. Registra cualquier archivo de fuente .otf / .ttf presente en el repositorio (ej. YWFTClarify-Black.otf)
+          if let enumerator = fm.enumerator(atPath: ".") {
               while let file = enumerator.nextObject() as? String {
-                  guard file.hasSuffix(".swift"),
-                        let content = try? String(contentsOfFile: "App/\(file)", encoding: .utf8) else { continue }
-                  let pattern = "#?([0-9A-Fa-f]{6})\\b"
-                  if let regex = try? NSRegularExpression(pattern: pattern) {
-                      let nsRange = NSRange(content.startIndex..<content.endIndex, in: content)
-                      for match in regex.matches(in: content, range: nsRange) {
-                          if let r = Range(match.range(at: 1), in: content) {
-                              hexColors.insert(String(content[r]).uppercased())
+                  let lower = file.lowercased()
+                  if lower.hasSuffix(".otf") || lower.hasSuffix(".ttf") {
+                      let url = URL(fileURLWithPath: file) as CFURL
+                      CTFontManagerRegisterFontsForURL(url, .process, nil)
+                  }
+                  if file.hasPrefix("App/") && file.hasSuffix(".swift"),
+                     let content = try? String(contentsOfFile: file, encoding: .utf8) {
+                      let pattern = "#?([0-9A-Fa-f]{6})\\b"
+                      if let regex = try? NSRegularExpression(pattern: pattern) {
+                          let nsRange = NSRange(content.startIndex..<content.endIndex, in: content)
+                          for match in regex.matches(in: content, range: nsRange) {
+                              if let r = Range(match.range(at: 1), in: content) {
+                                  hexColors.insert(String(content[r]).uppercased())
+                              }
                           }
+                      }
+                  }
+              }
+          }
+
+          // 2. Busca el icono original del proyecto para conservar exactamente la misma "S"
+          var baseIconRep: NSBitmapImageRep? = nil
+          if let enumerator = fm.enumerator(atPath: ".") {
+              while let file = enumerator.nextObject() as? String {
+                  if file.contains("AppIcon.appiconset") && file.lowercased().hasSuffix(".png") {
+                      if let data = try? Data(contentsOf: URL(fileURLWithPath: file)),
+                         let rep = NSBitmapImageRep(data: data),
+                         rep.pixelsWide >= 120 {
+                          baseIconRep = rep
+                          break
                       }
                   }
               }
@@ -108,9 +130,9 @@ jobs:
 
           func drawIcon(hex: String, size: Int, outputPath: String) {
               guard let val = UInt32(hex, radix: 16) else { return }
-              let r = CGFloat((val >> 16) & 0xFF) / 255.0
-              let g = CGFloat((val >> 8) & 0xFF) / 255.0
-              let b = CGFloat(val & 0xFF) / 255.0
+              let rCol = CGFloat((val >> 16) & 0xFF) / 255.0
+              let gCol = CGFloat((val >> 8) & 0xFF) / 255.0
+              let bCol = CGFloat(val & 0xFF) / 255.0
 
               let rep = NSBitmapImageRep(
                   bitmapDataPlanes: nil,
@@ -125,31 +147,54 @@ jobs:
                   bitsPerPixel: 0
               )!
 
-              NSGraphicsContext.saveGraphicsState()
-              NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+              // Si se subió YWFTClarify-Black.otf al repo, usa directamente la fuente oficial
+              let fontSize = CGFloat(size) * 0.65
+              if let customFont = NSFont(name: "YWFTClarify-Black", size: fontSize) {
+                  NSGraphicsContext.saveGraphicsState()
+                  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
 
-              // Fondo del color elegido
-              NSColor(deviceRed: r, green: g, blue: b, alpha: 1.0).setFill()
-              NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+                  NSColor(deviceRed: rCol, green: gCol, blue: bCol, alpha: 1.0).setFill()
+                  NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
 
-              // Letra "S" blanca centrada
-              let fontSize = CGFloat(size) * 0.62
-              let font = NSFont.systemFont(ofSize: fontSize, weight: .heavy)
-              let attrs: [NSAttributedString.Key: Any] = [
-                  .font: font,
-                  .foregroundColor: NSColor.white
-              ]
-              let text = "S" as NSString
-              let textSize = text.size(withAttributes: attrs)
-              let textRect = NSRect(
-                  x: (CGFloat(size) - textSize.width) / 2.0,
-                  y: (CGFloat(size) - textSize.height) / 2.0,
-                  width: textSize.width,
-                  height: textSize.height
-              )
-              text.draw(in: textRect, withAttributes: attrs)
+                  let attrs: [NSAttributedString.Key: Any] = [
+                      .font: customFont,
+                      .foregroundColor: NSColor.white
+                  ]
+                  let text = "S" as NSString
+                  let textSize = text.size(withAttributes: attrs)
+                  let textRect = NSRect(
+                      x: (CGFloat(size) - textSize.width) / 2.0,
+                      y: (CGFloat(size) - textSize.height) / 2.0,
+                      width: textSize.width,
+                      height: textSize.height
+                  )
+                  text.draw(in: textRect, withAttributes: attrs)
+                  NSGraphicsContext.restoreGraphicsState()
+              } else if let src = baseIconRep {
+                  // Si no está el archivo .otf pero sí el AppIcon.png original, conserva la "S" blanca original píxel por píxel y cambia solo el fondo
+                  let srcW = src.pixelsWide
+                  let srcH = src.pixelsHigh
+                  for y in 0..<size {
+                      let sy = min(srcH - 1, (y * srcH) / size)
+                      for x in 0..<size {
+                          let sx = min(srcW - 1, (x * srcW) / size)
+                          let c = src.colorAt(x: sx, y: sy)?.usingColorSpace(.deviceRGB)
+                          let cr = c?.redComponent ?? 0
+                          let cg = c?.greenComponent ?? 0
+                          let cb = c?.blueComponent ?? 0
+                          // Calcula qué tan blanco es el píxel en el icono original (la letra "S")
+                          let minChannel = min(cr, min(cg, cb))
+                          let maxChannel = max(cr, max(cg, cb))
+                          let saturation = maxChannel > 0 ? (maxChannel - minChannel) / maxChannel : 0
+                          let whiteness = max(0, min(1, (minChannel - 0.35) / 0.60)) * (1.0 - saturation * 0.5)
 
-              NSGraphicsContext.restoreGraphicsState()
+                          let finalR = rCol * (1.0 - whiteness) + 1.0 * whiteness
+                          let finalG = gCol * (1.0 - whiteness) + 1.0 * whiteness
+                          let finalB = bCol * (1.0 - whiteness) + 1.0 * whiteness
+                          rep.setColor(NSColor(deviceRed: finalR, green: finalG, blue: finalB, alpha: 1.0), atX: x, y: y)
+                      }
+                  }
+              }
 
               if let pngData = rep.representation(using: .png, properties: [:]) {
                   try? pngData.write(to: URL(fileURLWithPath: outputPath))
@@ -181,7 +226,7 @@ jobs:
 
               plist.write(toFile: plistPath, atomically: true)
           }
-          print("Generated \(hexColors.count) dynamic color icons.")
+          print("Generated \(hexColors.count) dynamic color icons preserving original S glyph.")
           EOF
 
           swift generate_icons.swift
