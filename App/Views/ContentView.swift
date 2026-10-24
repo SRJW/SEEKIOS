@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @EnvironmentObject private var soulseek: SoulseekModel
@@ -32,11 +33,28 @@ struct ContentView: View {
                 .tint(Color(hex: accentHex))
         }
         .onChange(of: library.artworkRevision) { _, _ in player.reloadArtwork() }
+        .onChange(of: accentHex) { _, newHex in
+            syncAppIcon(with: newHex)
+        }
         .tint(Color(hex: accentHex))
     }
 
     private func openPlayer() {
         router.showPlayer = true
+    }
+
+    private func syncAppIcon(with hex: String) {
+        guard UIApplication.shared.supportsAlternateIcons else { return }
+        let cleanHex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).uppercased()
+        let iconName = "AppIcon_\(cleanHex)"
+        if UIApplication.shared.alternateIconName != iconName {
+            UIApplication.shared.setAlternateIconName(iconName) { error in
+                if error != nil {
+                    // Si el color es el predeterminado o no existe variante, vuelve al icono principal
+                    UIApplication.shared.setAlternateIconName(nil, completionHandler: nil)
+                }
+            }
+        }
     }
 }
 
