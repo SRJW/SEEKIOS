@@ -246,6 +246,9 @@ struct SearchView: View {
                                     Label("Browse Parent Folder", systemImage: "folder.badge.gearshape")
                                 }
                             }
+                            NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
+                                Label("Browse All User Files (\(folder.username))", systemImage: "externaldrive.fill.badge.person.crop")
+                            }
                             Button {
                                 soulseek.downloadFolder(folder)
                             } label: {
@@ -454,10 +457,49 @@ struct FolderDetailView: View {
     let folderID: String
     @EnvironmentObject private var soulseek: SoulseekModel
     @State private var fileFilter = ""
+    @State private var extraFiles: [SharedFile] = []
+    @State private var isLoadingFullFolder = false
+
+    private func mergedFiles(for folder: FolderResult) -> [SharedFile] {
+        var seen = Set<String>()
+        var combined: [SharedFile] = []
+        let allKnown = folder.files + extraFiles + soulseek.knownFiles(for: folder.username)
+        for f in allKnown where f.folder.caseInsensitiveCompare(folder.folder) == .orderedSame {
+            if seen.insert(f.path.lowercased()).inserted {
+                combined.append(f)
+            }
+        }
+        return combined.sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
+    }
+
+    private func childSubfolders(for folder: FolderResult) -> [(name: String, fullPath: String, count: Int)] {
+        let prefix = folder.folder + "\\"
+        let prefixLower = prefix.lowercased()
+        var counts: [String: Int] = [:]
+        var names: [String: String] = [:]
+
+        for f in (extraFiles + soulseek.knownFiles(for: folder.username)) {
+            if f.folder.lowercased().hasPrefix(prefixLower) {
+                let rem = f.folder.dropFirst(prefix.count)
+                if let next = rem.split(separator: "\\").first.map(String.init), !next.isEmpty {
+                    let key = next.lowercased()
+                    counts[key, default: 0] += 1
+                    if names[key] == nil { names[key] = next }
+                }
+            }
+        }
+        return counts.keys.compactMap { k in
+            guard let name = names[k], let c = counts[k] else { return nil }
+            return (name: name, fullPath: "\(folder.folder)\\\(name)", count: c)
+        }
+        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }
 
     var body: some View {
         if let folder = soulseek.folder(withID: folderID) {
-            let filteredFiles = folder.files.filter {
+            let allFolderFiles = mergedFiles(for: folder)
+            let subfolders = childSubfolders(for: folder)
+            let filteredFiles = allFolderFiles.filter {
                 fileFilter.trimmingCharacters(in: .whitespaces).isEmpty ||
                 $0.filename.localizedCaseInsensitiveContains(fileFilter.trimmingCharacters(in: .whitespaces))
             }
@@ -469,9 +511,17 @@ struct FolderDetailView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             Text(folder.name).font(.headline)
                             Text(folder.formatSummary).font(.subheadline).foregroundStyle(.secondary)
-                            Text("\(folder.files.count) files · \(Formatting.bytes(folder.totalSize))")
+                            Text("\(allFolderFiles.count) files · \(Formatting.bytes(allFolderFiles.reduce(0) { $0 + $1.size }))")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+                            if isLoadingFullFolder {
+                                HStack(spacing: 6) {
+                                    ProgressView().controlSize(.mini)
+                                    Text("Loading all peer files…")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
                         }
                     }
                     .listRowBackground(Color.clear)
@@ -480,14 +530,21 @@ struct FolderDetailView: View {
                 Section("Container & Root Folders (Tap to Browse)") {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            ForEach(Array(folder.pathLevels.enumerated()), id: \.offset) { index, level in
-                                if index > 0 {
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
+                            NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
+                                Label(folder.username, systemImage: "person.crop.square.fill")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                            }
+                            .buttonStyle(.plain)
+
+                            ForEach(Array(folder.pathLevels.enumerated()), id: \.offset) { _, level in
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                                 NavigationLink(value: BrowseTarget(username: folder.username, folder: level.fullPath)) {
-                                    Label(level.name, systemImage: index == 0 ? "externaldrive.fill" : "folder.fill")
+                                    Label(level.name, systemImage: "folder.fill")
                                         .font(.caption.weight(.medium))
                                         .padding(.horizontal, 10)
                                         .padding(.vertical, 6)
@@ -508,13 +565,36 @@ struct FolderDetailView: View {
                     NavigationLink(value: BrowseTarget(username: folder.username, folder: folder.folder)) {
                         Label("Explore Full Container Folder from Peer", systemImage: "folder.badge.magnifyingglass")
                     }
+
+                    NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
+                        Label("Browse All Shared Folders of \(folder.username)", systemImage: "externaldrive.fill.badge.person.crop")
+                    }
+                }
+
+                if !subfolders.isEmpty {
+                    Section("Subfolders Inside (\(subfolders.count))") {
+                        ForEach(subfolders, id: \.fullPath) { sub in
+                            NavigationLink(value: BrowseTarget(username: folder.username, folder: sub.fullPath)) {
+                                HStack(spacing: 12) {
+                                    Image(systemName: "folder.fill")
+                                        .foregroundStyle(.tint)
+                                    Text(sub.name)
+                                        .font(.subheadline.weight(.medium))
+                                    Spacer()
+                                    Text("\(sub.count) files")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Section {
                     Button {
-                        soulseek.downloadFolder(folder)
+                        soulseek.downloadFiles(allFolderFiles, from: folder.username)
                     } label: {
-                        Label("Download All (\(folder.files.count) files)", systemImage: "arrow.down.circle.fill")
+                        Label("Download All (\(allFolderFiles.count) files)", systemImage: "arrow.down.circle.fill")
                     }
                     .disabled(!soulseek.isLoggedIn)
 
@@ -528,8 +608,8 @@ struct FolderDetailView: View {
                     Text("From \(folder.username) · \(folder.folder). Tap any folder badge above to navigate through its root/parent directories.")
                 }
 
-                Section {
-                    if folder.files.count > 5 {
+                Section("Files in Folder (\(filteredFiles.count))") {
+                    if allFolderFiles.count > 5 {
                         HStack(spacing: 8) {
                             Image(systemName: "magnifyingglass")
                                 .foregroundStyle(.secondary)
@@ -555,6 +635,15 @@ struct FolderDetailView: View {
             }
             .navigationTitle(folder.name)
             .navigationBarTitleDisplayMode(.inline)
+            .task(id: folder.id) {
+                isLoadingFullFolder = true
+                soulseek.browseUserFolder(username: folder.username, folder: folder.folder) { files in
+                    if let files {
+                        extraFiles = files
+                    }
+                    isLoadingFullFolder = false
+                }
+            }
         } else {
             Text("This result is no longer available.")
                 .foregroundStyle(.secondary)
