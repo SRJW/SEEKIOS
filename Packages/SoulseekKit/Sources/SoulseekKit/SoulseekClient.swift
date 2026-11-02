@@ -74,21 +74,11 @@ public enum ClientEvent: Sendable {
     case log(String)
 }
 
-/// Soulseek client built on Network.framework.
-///
-/// It never listens for connections (iOS can't usefully do that behind NAT). Instead it relies on
-/// indirect connections: when a peer can't reach us, the server sends us ConnectToPeer and we dial
-/// out with PierceFireWall. Outgoing requests use direct connections, so they only work with peers
-/// that have an open port, which is true of anyone who managed to send us search results.
-///
-/// All state lives on a private serial queue. `onEvent` is always called on the main queue;
-/// set it before calling `connect`.
 public final class SoulseekClient: @unchecked Sendable {
     public var onEvent: ((ClientEvent) -> Void)?
 
     public var serverHost = "server.slsknet.org"
     public var serverPort: UInt16 = 2242
-    /// Reported to the server so peers try us directly first; nothing listens on it.
     public var advertisedPort: UInt32 = 2234
 
     public let downloadDirectory: URL
@@ -129,7 +119,6 @@ public final class SoulseekClient: @unchecked Sendable {
         queue.async { self.tearDown(.disconnected) }
     }
 
-    /// Starts a search and returns its token. Results arrive as `.searchResponse` events.
     @discardableResult
     public func search(_ query: String) -> UInt32 {
         let token = UInt32.random(in: 1..<UInt32.max)
@@ -141,15 +130,13 @@ public final class SoulseekClient: @unchecked Sendable {
         return token
     }
 
-    /// `folderName` overrides the library folder the file lands in (default: the peer's folder
-    /// name), e.g. to drop a missing track into an existing album's folder.
     public func download(username: String, file: SharedFile, folderName: String? = nil) {
         queue.async {
             let id = DownloadID(username: username, path: file.path)
             if let existing = self.downloads[id] {
                 switch existing.state {
                 case .failed: break
-                default: return  // Already in progress or done
+                default: return
                 }
             }
             self.downloads[id] = DownloadRecord(id: id, state: .requesting, size: file.size, folderName: folderName)
@@ -181,8 +168,7 @@ public final class SoulseekClient: @unchecked Sendable {
         }
     }
 
-    /// Lists a peer's folder (and its subfolders). `completion` runs on the main queue with full
-    /// virtual paths, or nil if the peer can't be reached or doesn't answer within 30 seconds.
+    /// Solicita los archivos de una carpeta y el árbol completo compartido del usuario
     public func browseFolder(username: String, folder: String, completion: @escaping ([SharedFile]?) -> Void) {
         queue.async {
             guard self.isLoggedIn else {
@@ -191,7 +177,13 @@ public final class SoulseekClient: @unchecked Sendable {
             }
             let token = UInt32.random(in: 1..<UInt32.max)
             self.folderBrowses[token] = FolderBrowse(username: username, folder: folder, completion: completion)
-            self.sendToPeer(username, [.folderContentsRequest(token: token, folder: folder)],
+
+            var requests: [PeerMessage] = [.sharedFileListRequest]
+            if !folder.isEmpty {
+                requests.insert(.folderContentsRequest(token: token, folder: folder), at: 0)
+            }
+
+            self.sendToPeer(username, requests,
                             onFailure: { [weak self] in self?.finishBrowse(token: token, files: nil) })
             self.queue.asyncAfter(deadline: .now() + 30) { [weak self] in
                 self?.finishBrowse(token: token, files: nil)
@@ -307,7 +299,6 @@ public final class SoulseekClient: @unchecked Sendable {
             log("Logged in (public IP \(ownIP)). \(greeting)")
             sendServer(.setWaitPort(advertisedPort))
             sendServer(.setStatus(2))
-            // We don't take part in the distributed search tree.
             sendServer(.haveNoParent(true))
             sendServer(.branchRoot(username))
             sendServer(.branchLevel(0))
@@ -375,7 +366,6 @@ public final class SoulseekClient: @unchecked Sendable {
 
     // MARK: - Peer (P) connections
 
-    /// Sends messages to a peer, opening a direct connection if there isn't one yet.
     private func sendToPeer(_ username: String, _ messages: [PeerMessage],
                             onSent: (() -> Void)? = nil, onFailure: (() -> Void)? = nil) {
         var frames: [Data] = []
@@ -418,7 +408,6 @@ public final class SoulseekClient: @unchecked Sendable {
     private func openPiercedPeer(username: String, ip: String, port: UInt32, token: UInt32) {
         let link = PeerLink(username: username)
         if let existing = peers[username], !existing.isReady {
-            // Hand queued messages over to the connection that is actually coming up.
             link.outbox = existing.outbox
             link.sentHandlers = existing.sentHandlers
             link.failureHandlers = existing.failureHandlers
@@ -516,7 +505,6 @@ public final class SoulseekClient: @unchecked Sendable {
             if direction == .upload {
                 acceptIncomingTransfer(from: username, token: token, filename: filename, size: size)
             } else {
-                // Legacy download request (slskd, Seeker). Nicotine+ answers "Queued" and queues it.
                 sendToPeer(username, [.transferResponse(token: token, allowed: false, reason: "Queued", size: nil)])
                 enqueueUpload(for: username, path: filename)
             }
@@ -562,7 +550,7 @@ public final class SoulseekClient: @unchecked Sendable {
             sendToPeer(username, [.sharedFileListResponse(folders: sharedFolders())])
 
         case .userInfoRequest:
-            sendToPeer(username, [.userInfoResponse(description: "colon3 (iOS)",
+            sendToPeer(username, [.userInfoResponse(description: "Seekios (iOS)",
                                                     totalUploads: completedUploads,
                                                     queueSize: UInt32(uploadQueue.count),
                                                     slotsFree: activeUpload == nil)])
@@ -577,18 +565,35 @@ public final class SoulseekClient: @unchecked Sendable {
             sendToPeer(username, [.folderContentsResponse(token: token, folder: folder, folders: folders)])
 
         case let .folderContentsResponse(token, _, folders):
-            guard let browse = folderBrowses[token], browse.username == username else { return }
-            let files = folders.flatMap { entry in
-                entry.files.map { file in
-                    var full = file
-                    full.path = entry.name.isEmpty ? file.path : entry.name + "\\" + file.path
-                    return full
+            let files = Self.flattenSharedFolders(folders)
+            if let browse = folderBrowses[token], browse.username == username {
+                if !files.isEmpty {
+                    let callback = browse.completion
+                    DispatchQueue.main.async { callback(files) }
                 }
             }
-            finishBrowse(token: token, files: files)
 
-        case .sharedFileListResponse, .userInfoResponse, .unknown:
+        case let .sharedFileListResponse(folders):
+            let files = Self.flattenSharedFolders(folders)
+            let matchingTokens = folderBrowses.filter { $0.value.username.caseInsensitiveCompare(username) == .orderedSame }.map(\.key)
+            for token in matchingTokens {
+                finishBrowse(token: token, files: files)
+            }
+
+        case .userInfoResponse, .unknown:
             break
+        }
+    }
+
+    private static func flattenSharedFolders(_ folders: [SharedFolder]) -> [SharedFile] {
+        folders.flatMap { entry in
+            entry.files.map { file in
+                var full = file
+                if !entry.name.isEmpty && !file.path.contains("\\") {
+                    full.path = entry.name + "\\" + file.path
+                }
+                return full
+            }
         }
     }
 
@@ -759,7 +764,6 @@ public final class SoulseekClient: @unchecked Sendable {
     private func finishDownload(_ link: FileLink, id: DownloadID) {
         try? link.handle?.close()
         link.handle = nil
-        // The downloader closes the connection to signal completion.
         link.isClosed = true
         link.connection.stateUpdateHandler = nil
         link.connection.cancel()
@@ -823,7 +827,6 @@ public final class SoulseekClient: @unchecked Sendable {
         return destination
     }
 
-    /// The library folder a download from this remote folder lands in.
     public static func libraryFolderName(forRemoteFolder name: String) -> String {
         sanitize(name)
     }
@@ -834,7 +837,7 @@ public final class SoulseekClient: @unchecked Sendable {
         return result.isEmpty || result.hasPrefix(".") ? "_" + result : result
     }
 
-    // MARK: - Uploads (so we're not a pure leecher)
+    // MARK: - Uploads
 
     private func enqueueUpload(for username: String, path: String) {
         guard let share = shares[path] else {
@@ -889,7 +892,7 @@ public final class SoulseekClient: @unchecked Sendable {
                 case .ready:
                     var writer = ByteWriter()
                     writer.raw(PeerInitMessage.peerInit(username: self.username, type: "F").frame)
-                    writer.u32(token)  // FileTransferInit
+                    writer.u32(token)
                     connection.send(content: writer.data, completion: .contentProcessed { _ in })
                     self.receive(on: connection, onData: { [weak self, weak link] data in
                         guard let self, let link else { return }
@@ -940,7 +943,6 @@ public final class SoulseekClient: @unchecked Sendable {
             return
         }
         if chunk.isEmpty {
-            // Everything sent. The downloader closes the connection when it has it all.
             link.uploadDone = true
             try? handle.close()
             link.handle = nil
@@ -1030,8 +1032,6 @@ public final class SoulseekClient: @unchecked Sendable {
         DispatchQueue.main.async { handler?(event) }
     }
 }
-
-// MARK: - Internal state
 
 private struct PeerAddress {
     let ip: String
