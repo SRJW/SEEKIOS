@@ -168,7 +168,10 @@ final class SoulseekModel: ObservableObject {
     private var flushScheduled = false
     private var started = false
     private var coverRequested = Set<String>()
+
+    /// Almacena todos los archivos descubiertos de cada usuario y registra si ya se descargó el árbol completo
     private var browseCache: [String: [SharedFile]] = [:]
+    private var fullBrowseLoadedUsers = Set<String>()
 
     private let searchHistoryKey = "search_history_v1"
     private let wishlistKey = "wishlist_items_v1"
@@ -271,7 +274,6 @@ final class SoulseekModel: ObservableObject {
         saveWishlist()
     }
 
-    /// Busca automáticamente todos los elementos de la Wishlist y cuenta cuántos resultados aparecen
     func checkAllWishlist() {
         guard isLoggedIn, !wishlist.isEmpty, !isCheckingWishlist else { return }
         isCheckingWishlist = true
@@ -384,7 +386,7 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    // MARK: - Search
+    // MARK: - Search & Full User Directory Browsing
 
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -399,17 +401,48 @@ final class SoulseekModel: ObservableObject {
         searchToken = client.search(trimmed)
     }
 
+    /// Fusiona nuevos archivos descubiertos con los que ya teníamos del usuario sin perder ninguno
+    private func mergeIntoCache(username: String, newFiles: [SharedFile]) {
+        guard !newFiles.isEmpty else { return }
+        var existing = browseCache[username] ?? []
+        var seen = Set(existing.map { $0.path.lowercased() })
+        for file in newFiles {
+            if seen.insert(file.path.lowercased()).inserted {
+                existing.append(file)
+            }
+        }
+        browseCache[username] = existing
+    }
+
+    /// Solicita el listado completo de archivos y carpetas del usuario al peer de Soulseek
     func browseUserFolder(username: String, folder: String, forceRefresh: Bool = false, completion: @escaping ([SharedFile]?) -> Void) {
-        if !forceRefresh, let cached = browseCache[username], !cached.isEmpty {
-            completion(cached)
+        if !forceRefresh, fullBrowseLoadedUsers.contains(username), let cached = browseCache[username], !cached.isEmpty {
+            completion(knownFiles(for: username))
             return
         }
-        client.browseFolder(username: username, folder: folder) { [weak self] files in
+
+        // Primero pide con folder: "" para que SoulseekKit no filtre subcarpetas y devuelva todo el árbol del usuario
+        client.browseFolder(username: username, folder: "") { [weak self] rootFiles in
             Task { @MainActor in
-                if let files, !files.isEmpty {
-                    self?.browseCache[username] = files
+                guard let self else { return }
+                if let rootFiles, !rootFiles.isEmpty {
+                    self.mergeIntoCache(username: username, newFiles: rootFiles)
+                    self.fullBrowseLoadedUsers.insert(username)
+                    completion(self.knownFiles(for: username))
+                } else if !folder.isEmpty {
+                    // Si SoulseekKit requiere el nombre de carpeta explícito, lo solicita también y fusiona todo
+                    self.client.browseFolder(username: username, folder: folder) { [weak self] folderFiles in
+                        Task { @MainActor in
+                            guard let self else { return }
+                            if let folderFiles, !folderFiles.isEmpty {
+                                self.mergeIntoCache(username: username, newFiles: folderFiles)
+                            }
+                            completion(self.knownFiles(for: username))
+                        }
+                    }
+                } else {
+                    completion(self.knownFiles(for: username))
                 }
-                completion(files)
             }
         }
     }
@@ -418,12 +451,12 @@ final class SoulseekModel: ObservableObject {
         var seen = Set<String>()
         var output: [SharedFile] = []
         if let cached = browseCache[username] {
-            for f in cached where seen.insert(f.path).inserted {
+            for f in cached where seen.insert(f.path.lowercased()).inserted {
                 output.append(f)
             }
         }
-        for resp in responses where resp.username == username {
-            for f in resp.files where seen.insert(f.path).inserted {
+        for resp in responses where resp.username.caseInsensitiveCompare(username) == .orderedSame {
+            for f in resp.files where seen.insert(f.path.lowercased()).inserted {
                 output.append(f)
             }
         }
@@ -472,6 +505,9 @@ final class SoulseekModel: ObservableObject {
     private func flushResponses() {
         flushScheduled = false
         guard !pendingResponses.isEmpty else { return }
+        for resp in pendingResponses {
+            mergeIntoCache(username: resp.username, newFiles: resp.files)
+        }
         responses += pendingResponses
         responseCount = responses.count
         pendingResponses.removeAll()
@@ -485,7 +521,6 @@ final class SoulseekModel: ObservableObject {
         var folders: [String: FolderResult] = [:]
         var images: [String: [SharedFile]] = [:]
         for response in responses {
-            // Oculta automáticamente usuarios bloqueados
             if blockedSet.contains(response.username.lowercased()) { continue }
 
             for file in response.files where LibraryStore.imageExtensions.contains(file.fileExtension) {
@@ -514,7 +549,6 @@ final class SoulseekModel: ObservableObject {
         hiddenCount = all.count - kept.count
         let ordered = filters.ordered(kept, query: currentQuery)
 
-        // Prioriza a los Usuarios Favoritos arriba del todo
         results = ordered.sorted { lhs, rhs in
             let lFav = favSet.contains(lhs.username.lowercased())
             let rFav = favSet.contains(rhs.username.lowercased())
@@ -522,7 +556,6 @@ final class SoulseekModel: ObservableObject {
             return false
         }
 
-        // Actualiza el conteo si la búsqueda actual está en la Wishlist
         if let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(currentQuery) == .orderedSame }) {
             wishlist[idx].lastMatchCount = results.count
             wishlist[idx].lastChecked = Date()
@@ -559,7 +592,7 @@ final class SoulseekModel: ObservableObject {
             guard let self else { return }
             if let files {
                 if !files.isEmpty {
-                    self.browseCache[username] = files
+                    self.mergeIntoCache(username: username, newFiles: files)
                 }
                 self.completeness?.recordListing(username: username, remoteFolder: folder, files: files)
             }
