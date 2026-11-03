@@ -4,13 +4,11 @@ struct SettingsView: View {
     @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
-    @EnvironmentObject private var lastfm: LastFM
     @EnvironmentObject private var router: AppRouter
     @EnvironmentObject private var server: WiFiTransferServer
 
     @AppStorage(AppSettings.artworkLookupKey) private var artworkLookup = true
     @AppStorage(AppSettings.lyricsLookupKey) private var lyricsLookup = true
-    @AppStorage(AppSettings.scrobblingKey) private var scrobbling = true
     @AppStorage(AppSettings.backgroundTransfersKey) private var backgroundTransfers = true
     @AppStorage(AppSettings.transferActivityKey) private var transferActivity = true
     @AppStorage(AppSettings.showMissingKey) private var showMissing = true
@@ -20,15 +18,21 @@ struct SettingsView: View {
     @State private var username = ""
     @State private var password = ""
 
+    /// Lee dinámicamente la versión real compilada por GitHub Actions desde Info.plist
+    private var appVersionText: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "v\(version) (\(build))"
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                // Apartado limpio de Versión y redirección a GitHub
                 Section("Version") {
                     HStack {
                         Label("Seekios", systemImage: "info.circle")
                         Spacer()
-                        Text("v1.0.0")
+                        Text(appVersionText)
                             .foregroundStyle(.secondary)
                     }
                     Link(destination: URL(string: "https://github.com/SRJW/SEEKIOS/releases")!) {
@@ -108,10 +112,6 @@ struct SettingsView: View {
                     Text("When nothing is playing, Seekios plays silence (mixed under other audio) so iOS doesn't freeze transfers in the background, like iTorrent does. It costs some battery and stops when transfers finish. Seeding Mode keeps it running all the time so people can keep downloading from you, and reconnects if Soulseek drops.")
                 }
 
-                LastFMSection(scrobbling: $scrobbling)
-
-                DiscordSection()
-
                 Section {
                     LabeledContent("Songs", value: "\(library.tracks.count)")
                     LabeledContent("Albums", value: "\(library.albums.count)")
@@ -167,78 +167,6 @@ struct SettingsView: View {
     }
 }
 
-struct LastFMSection: View {
-    @Binding var scrobbling: Bool
-    @EnvironmentObject private var lastfm: LastFM
-    @EnvironmentObject private var router: AppRouter
-    @EnvironmentObject private var server: WiFiTransferServer
-
-    @State private var apiKey = ""
-    @State private var apiSecret = ""
-    @State private var username = ""
-    @State private var password = ""
-    @State private var connecting = false
-    @State private var error: String?
-
-    var body: some View {
-        Section {
-            if lastfm.isConnected {
-                Label("Connected as \(lastfm.username ?? "?")", systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-                Toggle("Scrobble", isOn: $scrobbling)
-                if lastfm.pendingCount > 0 {
-                    LabeledContent("Waiting to Send", value: "\(lastfm.pendingCount)")
-                    Button("Send Now") { lastfm.flush() }
-                }
-                if let lastError = lastfm.lastError {
-                    Text(lastError).font(.footnote).foregroundStyle(.orange)
-                }
-                Button("Disconnect", role: .destructive) { lastfm.disconnect() }
-            } else {
-                TextField("API Key", text: $apiKey)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .font(.body.monospaced())
-                SecureField("Shared Secret", text: $apiSecret)
-                TextField("Last.fm Username", text: $username)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                SecureField("Password", text: $password)
-                Button {
-                    connect()
-                } label: {
-                    if connecting { ProgressView() } else { Text("Connect") }
-                }
-                .disabled(connecting || [apiKey, apiSecret, username, password].contains { $0.trimmingCharacters(in: .whitespaces).isEmpty })
-                if let error {
-                    Text(error).font(.footnote).foregroundStyle(.red)
-                }
-                Link("Create an API account", destination: URL(string: "https://www.last.fm/api/account/create")!)
-            }
-        } header: {
-            Text("Last.fm")
-        } footer: {
-            Text(lastfm.isConnected
-                 ? "Tracks scrobble after half their length or 4 minutes. Offline scrobbles are sent later."
-                 : "Last.fm needs your own API key and shared secret. Create an API account (any name and description), then paste both here. Your password is only used once to get a session.")
-        }
-    }
-
-    private func connect() {
-        connecting = true
-        error = nil
-        Task {
-            do {
-                try await lastfm.connect(apiKey: apiKey, apiSecret: apiSecret, username: username, password: password)
-                password = ""
-            } catch {
-                self.error = error.localizedDescription
-            }
-            connecting = false
-        }
-    }
-}
-
 /// Live output details while bit-perfect mode is on.
 struct BitPerfectStatus: View {
     @EnvironmentObject private var player: Player
@@ -261,76 +189,6 @@ struct BitPerfectStatus: View {
         }
         .font(.subheadline)
         .onAppear { player.refreshOutputInfo() }
-    }
-}
-
-struct DiscordSection: View {
-    @EnvironmentObject private var discord: DiscordPresence
-    @State private var token = ""
-    @State private var showWarning = false
-    @State private var showPaste = false
-    @State private var showLogin = false
-
-    var body: some View {
-        Section {
-            if discord.hasToken {
-                Toggle("Show What I'm Listening To", isOn: $discord.enabled)
-                statusRow
-                Picker("Status", selection: $discord.onlineStatus) {
-                    ForEach(DiscordPresence.OnlineStatus.allCases) { Text($0.label).tag($0) }
-                }
-                TextField("Application ID (for cover art)", text: $discord.applicationID)
-                    .keyboardType(.numberPad)
-                    .font(.body.monospacedDigit())
-                Button("Remove Token", role: .destructive) { discord.forgetToken() }
-            } else {
-                Button {
-                    showWarning = true
-                } label: {
-                    Label("Log in to Discord", systemImage: "person.crop.circle.badge.checkmark")
-                }
-                Button("Paste Token Instead") { showPaste = true }
-                    .font(.subheadline)
-                if showPaste {
-                    SecureField("Discord Token", text: $token)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    Button("Save Token") { showWarning = true }
-                        .disabled(token.trimmingCharacters(in: .whitespaces).isEmpty)
-                }
-            }
-        } header: {
-            Text("Discord")
-        } footer: {
-            Text(discord.hasToken
-                 ? "Shows “Listening to Seekios” with the song and artist while music plays. For cover art, create an application at discord.com/developers (name it Seekios) and paste its Application ID."
-                 : "Discord has no official way for iPhone apps to set your status, so Seekios logs into Discord in a web view and reads your account token once. Pasting it yourself works too (Discord in a browser › Developer Tools › Network › any request › Authorization header). It's stored in the Keychain and only sent to Discord.")
-        }
-        .sheet(isPresented: $showLogin) {
-            DiscordLoginView { token in discord.saveToken(token) }
-        }
-        .alert("Use your Discord account?", isPresented: $showWarning) {
-            Button("Cancel", role: .cancel) {}
-            Button("I Understand") {
-                if showPaste { discord.saveToken(token); token = "" } else { showLogin = true }
-            }
-        } message: {
-            Text("Using a token from a third-party app breaks Discord's Terms of Service and could get your account flagged. Anyone with the token has full access to your account, so never share it.")
-        }
-    }
-
-    @ViewBuilder
-    private var statusRow: some View {
-        switch discord.status {
-        case .off:
-            Label("Off", systemImage: "circle").foregroundStyle(.secondary)
-        case .connecting:
-            Label("Connecting…", systemImage: "antenna.radiowaves.left.and.right").foregroundStyle(.secondary)
-        case let .connected(name):
-            Label("Connected as \(name)", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-        case let .failed(message):
-            Label(message, systemImage: "exclamationmark.triangle").foregroundStyle(.orange)
-        }
     }
 }
 
