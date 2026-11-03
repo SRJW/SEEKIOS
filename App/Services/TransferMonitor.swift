@@ -110,7 +110,7 @@ final class TransferMonitor {
         handleAutoRetry(downloads)
     }
 
-    // MARK: - Barra de progreso en Live Activity (Pantalla de Bloqueo / Dynamic Island) y Centro de Notificaciones
+    // MARK: - Barra de progreso en Live Activity y Centro de Notificaciones
 
     private func updateLiveActivityAndProgressNotification(
         visibleDownloads: [DownloadItem],
@@ -161,10 +161,11 @@ final class TransferMonitor {
             lastSampleTime = now
         }
 
+        // Orden estricto según la firma en Shared/TransferActivity.swift (uploading antes de queued)
         let state = TransferActivityAttributes.ContentState(
             downloading: max(transferringCount, activeDownloads.isEmpty ? 0 : 1),
-            queued: queuedCount,
             uploading: sending.count,
+            queued: queuedCount,
             fraction: fraction,
             bytesPerSecond: currentSpeedBytesPerSec,
             currentFile: activeDownloads.first?.filename ?? sending.first?.filename ?? "Transferring…",
@@ -172,7 +173,6 @@ final class TransferMonitor {
             seeding: seeding
         )
 
-        // 1. Inicia o actualiza el widget Live Activity en Pantalla de Bloqueo y Dynamic Island
         if showActivitySetting && ActivityAuthorizationInfo().areActivitiesEnabled {
             if let currentActivity = activity {
                 Task {
@@ -186,16 +186,13 @@ final class TransferMonitor {
                         content: ActivityContent(state: state, staleDate: nil),
                         pushType: nil
                     )
-                } catch {
-                    // Continúa con la notificación de progreso si Live Activities no está disponible
-                }
+                } catch {}
             }
         } else if let currentActivity = activity {
             self.activity = nil
             Task { await currentActivity.end(nil, dismissalPolicy: .immediate) }
         }
 
-        // 2. Actualiza la notificación con barra de progreso en el Centro de Notificaciones
         updateProgressBannerNotification(
             activeDownloads: activeDownloads,
             sending: sending,
@@ -279,7 +276,7 @@ final class TransferMonitor {
         }
     }
 
-    // MARK: - Aviso Final al Completar Descarga
+    // MARK: - Aviso Final
 
     private func notifyNewlyCompletedDownloads(_ downloads: [DownloadItem]) {
         guard initializedCompleted else { return }
