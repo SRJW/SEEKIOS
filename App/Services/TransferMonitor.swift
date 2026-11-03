@@ -19,7 +19,7 @@ final class TransferMonitor {
     private var activity: Activity<TransferActivityAttributes>?
     private var lastSampleReceived: UInt64 = 0
     private var lastSampleTime = Date()
-    private var currentSpeedBytesPerSec: Int = 0
+    private var currentSpeedBytesPerSec: Double = 0
     private var lastProgressNotificationText: String = ""
     private var lastProgressNotificationDate = Date.distantPast
 
@@ -103,7 +103,8 @@ final class TransferMonitor {
         updateLiveActivityAndProgressNotification(
             visibleDownloads: visible,
             activeDownloads: activeDownloads,
-            sending: sending
+            sending: sending,
+            seeding: seeding
         )
         notifyNewlyCompletedDownloads(downloads)
         handleAutoRetry(downloads)
@@ -114,7 +115,8 @@ final class TransferMonitor {
     private func updateLiveActivityAndProgressNotification(
         visibleDownloads: [DownloadItem],
         activeDownloads: [DownloadItem],
-        sending: [UploadItem]
+        sending: [UploadItem],
+        seeding: Bool
     ) {
         let showActivitySetting = AppSettings.flag(AppSettings.transferActivityKey)
         let hasActiveTransfers = !activeDownloads.isEmpty || !sending.isEmpty
@@ -140,10 +142,6 @@ final class TransferMonitor {
             }
         }.count
         let queuedCount = max(0, activeDownloads.count - transferringCount)
-        let finishedCount = visibleDownloads.filter {
-            if case .completed = $0.state { return true }
-            return false
-        }.count
 
         let totalSize = activeDownloads.reduce(UInt64(0)) { $0 + $1.size }
         let totalReceived = activeDownloads.reduce(UInt64(0)) { $0 + min($1.received, $1.size) }
@@ -155,7 +153,7 @@ final class TransferMonitor {
         if elapsed >= 0.8 {
             if totalReceived >= lastSampleReceived && lastSampleReceived > 0 {
                 let delta = Double(totalReceived - lastSampleReceived)
-                currentSpeedBytesPerSec = max(0, Int(delta / elapsed))
+                currentSpeedBytesPerSec = max(0, delta / elapsed)
             } else {
                 currentSpeedBytesPerSec = 0
             }
@@ -166,11 +164,12 @@ final class TransferMonitor {
         let state = TransferActivityAttributes.ContentState(
             downloading: max(transferringCount, activeDownloads.isEmpty ? 0 : 1),
             queued: queuedCount,
+            uploading: sending.count,
             fraction: fraction,
             bytesPerSecond: currentSpeedBytesPerSec,
-            currentTitle: activeDownloads.first?.filename ?? sending.first?.filename ?? "Transferring…",
-            finished: finishedCount,
-            seeding: sending.count
+            currentFile: activeDownloads.first?.filename ?? sending.first?.filename ?? "Transferring…",
+            finished: false,
+            seeding: seeding
         )
 
         // 1. Inicia o actualiza el widget Live Activity en Pantalla de Bloqueo y Dynamic Island
