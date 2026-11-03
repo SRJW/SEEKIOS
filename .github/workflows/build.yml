@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     name: Build unsigned IPA
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     outputs:
       version: ${{ steps.version.outputs.version }}
       build: ${{ steps.version.outputs.build }}
@@ -88,9 +88,22 @@ jobs:
           import Foundation
 
           let fm = FileManager.default
-          var hexColors = Set<String>()
 
-          // 1. Registra cualquier archivo de fuente .otf / .ttf presente en el repositorio (ej. YWFTClarify-Black.otf)
+          var hexColors: Set<String> = [
+              "FF3B30", "D70015", "FF6B6B", "A30000",
+              "FF9500", "FF6D00", "E65100", "FFCC00",
+              "F59E0B", "84CC16", "34C759", "10B981",
+              "00C853", "059669", "047857", "00E676",
+              "14B8A6", "00BFA5", "00BCD4", "06B6D4",
+              "00C7BE", "32ADE6", "0EA5E9", "007AFF",
+              "2563EB", "1D4ED8", "3B82F6", "5856D6",
+              "6366F1", "4F46E5", "7C3AED", "AF52DE",
+              "9333EA", "A855F7", "C026D3", "D946EF",
+              "FF2D55", "EC4899", "F43F5E", "E11D48",
+              "8E8E93", "64748B", "475569", "334155",
+              "1E293B", "1C1C1E", "A2845E", "78716C"
+          ]
+
           if let enumerator = fm.enumerator(atPath: ".") {
               while let file = enumerator.nextObject() as? String {
                   let lower = file.lowercased()
@@ -113,7 +126,6 @@ jobs:
               }
           }
 
-          // 2. Busca el icono original del proyecto para conservar exactamente la misma "S"
           var baseIconRep: NSBitmapImageRep? = nil
           if let enumerator = fm.enumerator(atPath: ".") {
               while let file = enumerator.nextObject() as? String {
@@ -147,31 +159,7 @@ jobs:
                   bitsPerPixel: 0
               )!
 
-              // Si se subió YWFTClarify-Black.otf al repo, usa directamente la fuente oficial
-              let fontSize = CGFloat(size) * 0.65
-              if let customFont = NSFont(name: "YWFTClarify-Black", size: fontSize) {
-                  NSGraphicsContext.saveGraphicsState()
-                  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-
-                  NSColor(deviceRed: rCol, green: gCol, blue: bCol, alpha: 1.0).setFill()
-                  NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
-
-                  let attrs: [NSAttributedString.Key: Any] = [
-                      .font: customFont,
-                      .foregroundColor: NSColor.white
-                  ]
-                  let text = "S" as NSString
-                  let textSize = text.size(withAttributes: attrs)
-                  let textRect = NSRect(
-                      x: (CGFloat(size) - textSize.width) / 2.0,
-                      y: (CGFloat(size) - textSize.height) / 2.0,
-                      width: textSize.width,
-                      height: textSize.height
-                  )
-                  text.draw(in: textRect, withAttributes: attrs)
-                  NSGraphicsContext.restoreGraphicsState()
-              } else if let src = baseIconRep {
-                  // Si no está el archivo .otf pero sí el AppIcon.png original, conserva la "S" blanca original píxel por píxel y cambia solo el fondo
+              if let src = baseIconRep {
                   let srcW = src.pixelsWide
                   let srcH = src.pixelsHigh
                   for y in 0..<size {
@@ -182,7 +170,6 @@ jobs:
                           let cr = c?.redComponent ?? 0
                           let cg = c?.greenComponent ?? 0
                           let cb = c?.blueComponent ?? 0
-                          // Calcula qué tan blanco es el píxel en el icono original (la letra "S")
                           let minChannel = min(cr, min(cg, cb))
                           let maxChannel = max(cr, max(cg, cb))
                           let saturation = maxChannel > 0 ? (maxChannel - minChannel) / maxChannel : 0
@@ -194,6 +181,22 @@ jobs:
                           rep.setColor(NSColor(deviceRed: finalR, green: finalG, blue: finalB, alpha: 1.0), atX: x, y: y)
                       }
                   }
+              } else if let customFont = NSFont(name: "YWFTClarify-Black", size: CGFloat(size) * 0.65) {
+                  NSGraphicsContext.saveGraphicsState()
+                  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                  NSColor(deviceRed: rCol, green: gCol, blue: bCol, alpha: 1.0).setFill()
+                  NSBezierPath(rect: NSRect(x: 0, y: 0, width: size, height: size)).fill()
+                  let attrs: [NSAttributedString.Key: Any] = [.font: customFont, .foregroundColor: NSColor.white]
+                  let text = "S" as NSString
+                  let textSize = text.size(withAttributes: attrs)
+                  let textRect = NSRect(
+                      x: (CGFloat(size) - textSize.width) / 2.0,
+                      y: (CGFloat(size) - textSize.height) / 2.0,
+                      width: textSize.width,
+                      height: textSize.height
+                  )
+                  text.draw(in: textRect, withAttributes: attrs)
+                  NSGraphicsContext.restoreGraphicsState()
               }
 
               if let pngData = rep.representation(using: .png, properties: [:]) {
@@ -226,7 +229,7 @@ jobs:
 
               plist.write(toFile: plistPath, atomically: true)
           }
-          print("Generated \(hexColors.count) dynamic color icons preserving original S glyph.")
+          print("Generated \(hexColors.count) spectrum + palette icons.")
           EOF
 
           swift generate_icons.swift
@@ -275,6 +278,5 @@ jobs:
 
           gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes 2>/dev/null || true
           gh release create "$TAG" "$file" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Seekios v${VERSION}" \
+            --repo "$GITHUB_REPOSITORY" --title "Seekios v${VERSION}" \
             --generate-notes
