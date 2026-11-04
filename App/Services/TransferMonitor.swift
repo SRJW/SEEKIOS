@@ -161,7 +161,6 @@ final class TransferMonitor {
             lastSampleTime = now
         }
 
-        // Orden estricto según la firma en Shared/TransferActivity.swift (uploading antes de queued)
         let state = TransferActivityAttributes.ContentState(
             downloading: max(transferringCount, activeDownloads.isEmpty ? 0 : 1),
             uploading: sending.count,
@@ -170,7 +169,7 @@ final class TransferMonitor {
             bytesPerSecond: currentSpeedBytesPerSec,
             currentFile: activeDownloads.first?.filename ?? sending.first?.filename ?? "Transferring…",
             finished: false,
-            seeding: seeding
+            seeding: seeding ? 1 : 0
         )
 
         if showActivitySetting && ActivityAuthorizationInfo().areActivitiesEnabled {
