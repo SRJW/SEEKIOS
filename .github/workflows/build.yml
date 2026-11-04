@@ -68,7 +68,7 @@ jobs:
             COLON3_CHANNEL="${{ steps.version.outputs.channel }}" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_IDENTITY="" \
             2>&1 | tee xcodebuild.log | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
           if [ ! -f build/Build/Products/Release-iphoneos/colon3.app/colon3 ]; then
             echo "=== ERROR DE COMPILACION EN XCODE ==="
@@ -76,10 +76,14 @@ jobs:
             exit 1
           fi
 
-      - name: Generate Dynamic Color App Icons & Package IPA
+      - name: Inject Version, Generate Dynamic Color App Icons & Package IPA
         run: |
           mkdir -p Payload
           cp -R build/Build/Products/Release-iphoneos/colon3.app Payload/
+
+          # Inyecta de forma garantizada la versión exacta (ej. 1.0.51) y el build en el Info.plist final
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${{ steps.version.outputs.version }}" Payload/colon3.app/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${{ steps.version.outputs.build }}" Payload/colon3.app/Info.plist
 
           cat << 'EOF' > generate_icons.swift
           import AppKit
