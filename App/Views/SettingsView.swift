@@ -18,11 +18,13 @@ struct SettingsView: View {
     @State private var username = ""
     @State private var password = ""
 
-    /// Lee dinámicamente la versión real compilada por GitHub Actions desde Info.plist
     private var appVersionText: String {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.0"
-        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
-        return "v\(version) (\(build))"
+        let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let buildNumber = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? ""
+        if !buildNumber.isEmpty && !shortVersion.hasSuffix(".\(buildNumber)") {
+            return "v\(shortVersion) (\(buildNumber))"
+        }
+        return "v\(shortVersion)"
     }
 
     var body: some View {
@@ -167,7 +169,6 @@ struct SettingsView: View {
     }
 }
 
-/// Live output details while bit-perfect mode is on.
 struct BitPerfectStatus: View {
     @EnvironmentObject private var player: Player
 
