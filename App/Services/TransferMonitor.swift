@@ -4,7 +4,7 @@ import Foundation
 import SoulseekKit
 import UserNotifications
 
-/// Mantiene descargas en segundo plano, muestra la barra de progreso en Live Activity / Notificaciones y gestiona el Auto-Retry
+/// Mantiene descargas en segundo plano, muestra únicamente el widget Live Activity y gestiona el Auto-Retry
 @MainActor
 final class TransferMonitor {
     private let soulseek: SoulseekModel
@@ -15,13 +15,11 @@ final class TransferMonitor {
     private var heartbeat: Timer?
     private var lastReconnect = Date.distantPast
 
-    /// Estado de la barra de progreso en Pantalla de Bloqueo / Dynamic Island y Notificaciones
+    /// Estado del widget Live Activity en Pantalla de Bloqueo / Dynamic Island
     private var activity: Activity<TransferActivityAttributes>?
     private var lastSampleReceived: UInt64 = 0
     private var lastSampleTime = Date()
     private var currentSpeedBytesPerSec: Double = 0
-    private var lastProgressNotificationText: String = ""
-    private var lastProgressNotificationDate = Date.distantPast
 
     private var notifiedCompletedIDs = Set<DownloadID>()
     private var initializedCompleted = false
@@ -30,8 +28,6 @@ final class TransferMonitor {
     private var retryCounts: [DownloadID: Int] = [:]
     private var pendingRetryTimers: [DownloadID: Task<Void, Never>] = [:]
 
-    private let progressNotificationID = "seekios.transfer.progress"
-
     init(soulseek: SoulseekModel, player: Player, stats: StatsStore) {
         self.soulseek = soulseek
         self.player = player
@@ -39,7 +35,8 @@ final class TransferMonitor {
 
         requestNotificationPermission()
 
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [progressNotificationID])
+        // Limpia cualquier notificación antigua y actividades huérfanas al iniciar
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: ["seekios.transfer.progress"])
         for stale in Activity<TransferActivityAttributes>.activities {
             Task { await stale.end(nil, dismissalPolicy: .immediate) }
         }
@@ -100,8 +97,7 @@ final class TransferMonitor {
             keeper.stop()
         }
 
-        updateLiveActivityAndProgressNotification(
-            visibleDownloads: visible,
+        updateLiveActivity(
             activeDownloads: activeDownloads,
             sending: sending,
             seeding: seeding
@@ -110,10 +106,9 @@ final class TransferMonitor {
         handleAutoRetry(downloads)
     }
 
-    // MARK: - Barra de progreso en Live Activity y Centro de Notificaciones
+    // MARK: - Widget Live Activity (Único cartel en Pantalla de Bloqueo y Dynamic Island)
 
-    private func updateLiveActivityAndProgressNotification(
-        visibleDownloads: [DownloadItem],
+    private func updateLiveActivity(
         activeDownloads: [DownloadItem],
         sending: [UploadItem],
         seeding: Bool
@@ -121,16 +116,12 @@ final class TransferMonitor {
         let showActivitySetting = AppSettings.flag(AppSettings.transferActivityKey)
         let hasActiveTransfers = !activeDownloads.isEmpty || !sending.isEmpty
 
-        guard hasActiveTransfers else {
+        guard hasActiveTransfers && showActivitySetting && ActivityAuthorizationInfo().areActivitiesEnabled else {
             lastSampleReceived = 0
             currentSpeedBytesPerSec = 0
             if let currentActivity = activity {
                 self.activity = nil
                 Task { await currentActivity.end(nil, dismissalPolicy: .immediate) }
-            }
-            if !lastProgressNotificationText.isEmpty {
-                lastProgressNotificationText = ""
-                UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: [progressNotificationID])
             }
             return
         }
@@ -146,7 +137,6 @@ final class TransferMonitor {
         let totalSize = activeDownloads.reduce(UInt64(0)) { $0 + $1.size }
         let totalReceived = activeDownloads.reduce(UInt64(0)) { $0 + min($1.received, $1.size) }
         let fraction = totalSize > 0 ? min(1.0, Double(totalReceived) / Double(totalSize)) : 0.0
-        let percent = Int((fraction * 100).rounded())
 
         let now = Date()
         let elapsed = now.timeIntervalSince(lastSampleTime)
@@ -172,80 +162,20 @@ final class TransferMonitor {
             seeding: seeding ? 1 : 0
         )
 
-        if showActivitySetting && ActivityAuthorizationInfo().areActivitiesEnabled {
-            if let currentActivity = activity {
-                Task {
-                    await currentActivity.update(ActivityContent(state: state, staleDate: nil))
-                }
-            } else {
-                let accentHex = UserDefaults.standard.string(forKey: AccentPalette.storageKey) ?? AccentPalette.defaultHex
-                do {
-                    activity = try Activity.request(
-                        attributes: TransferActivityAttributes(accentHex: accentHex),
-                        content: ActivityContent(state: state, staleDate: nil),
-                        pushType: nil
-                    )
-                } catch {}
-            }
-        } else if let currentActivity = activity {
-            self.activity = nil
-            Task { await currentActivity.end(nil, dismissalPolicy: .immediate) }
-        }
-
-        updateProgressBannerNotification(
-            activeDownloads: activeDownloads,
-            sending: sending,
-            percent: percent,
-            received: totalReceived,
-            total: totalSize
-        )
-    }
-
-    private func updateProgressBannerNotification(
-        activeDownloads: [DownloadItem],
-        sending: [UploadItem],
-        percent: Int,
-        received: UInt64,
-        total: UInt64
-    ) {
-        guard Date().timeIntervalSince(lastProgressNotificationDate) >= 2.0 else { return }
-
-        let filledBlocks = min(10, max(0, percent / 10))
-        let bar = String(repeating: "━", count: filledBlocks) + String(repeating: "─", count: 10 - filledBlocks)
-
-        let title: String
-        let body: String
-
-        if !activeDownloads.isEmpty {
-            if activeDownloads.count == 1, let first = activeDownloads.first {
-                title = "Downloading · \(percent)%"
-                body = "\(bar)  \(Formatting.bytes(received)) / \(Formatting.bytes(total))\n\(first.filename)"
-            } else {
-                title = "Downloading \(activeDownloads.count) files · \(percent)%"
-                body = "\(bar)  \(Formatting.bytes(received)) / \(Formatting.bytes(total))"
+        if let currentActivity = activity {
+            Task {
+                await currentActivity.update(ActivityContent(state: state, staleDate: nil))
             }
         } else {
-            title = "Uploading \(sending.count) file\(sending.count == 1 ? "" : "s")"
-            body = sending.first?.filename ?? ""
+            let accentHex = UserDefaults.standard.string(forKey: AccentPalette.storageKey) ?? AccentPalette.defaultHex
+            do {
+                activity = try Activity.request(
+                    attributes: TransferActivityAttributes(accentHex: accentHex),
+                    content: ActivityContent(state: state, staleDate: nil),
+                    pushType: nil
+                )
+            } catch {}
         }
-
-        let summaryKey = "\(title)|\(percent)"
-        guard summaryKey != lastProgressNotificationText else { return }
-        lastProgressNotificationText = summaryKey
-        lastProgressNotificationDate = Date()
-
-        let content = UNMutableNotificationContent()
-        content.title = title
-        content.body = body
-        content.sound = nil
-        content.interruptionLevel = .passive
-
-        let request = UNNotificationRequest(
-            identifier: progressNotificationID,
-            content: content,
-            trigger: nil
-        )
-        UNUserNotificationCenter.current().add(request)
     }
 
     // MARK: - Auto-Retry Inteligente
@@ -275,7 +205,7 @@ final class TransferMonitor {
         }
     }
 
-    // MARK: - Aviso Final
+    // MARK: - Aviso Final al Completar Descarga
 
     private func notifyNewlyCompletedDownloads(_ downloads: [DownloadItem]) {
         guard initializedCompleted else { return }
