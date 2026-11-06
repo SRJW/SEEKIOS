@@ -117,7 +117,7 @@ struct TrackCandidate: Identifiable {
 
 struct UploadItem: Identifiable {
     let id: DownloadID
-    let state: UploadState
+    var state: UploadState
     var sent: UInt64
     var size: UInt64
 
@@ -188,7 +188,6 @@ final class SoulseekModel: ObservableObject {
     private let customDownloadBookmarkKey = "custom_download_folder_bookmark_v1"
     private let customDownloadPathKey = "custom_download_folder_path_v1"
 
-    /// Carpeta activa donde se guardan las descargas (personalizada o predeterminada en Documents/Downloads)
     var otherDownloadsDirectory: URL {
         customDownloadDirectory ?? defaultDownloadsDirectory
     }
@@ -461,7 +460,6 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
-    /// Reanuda automáticamente todas las descargas que quedaron a medias antes de cerrarse la app
     private func resumeInterruptedDownloadsOnLogin() {
         guard !didAutoResumeOnLaunch else { return }
         didAutoResumeOnLaunch = true
@@ -776,9 +774,7 @@ final class SoulseekModel: ObservableObject {
         downloads.first { $0.id == DownloadID(username: username, path: file.path) }?.state
     }
 
-    /// Mueve los archivos descargados a la carpeta contenedora elegida por el usuario
     private func relocateToTargetDownloadsFolder(fileURL: URL, remotePath: String, isAudioOrSidecar: Bool) -> URL {
-        // Si es música y el usuario no activó "Guardar todo en carpeta personalizada", se queda en la biblioteca musical
         if isAudioOrSidecar && (!saveAllToCustomFolder || customDownloadDirectory == nil) {
             return fileURL
         }
@@ -796,7 +792,6 @@ final class SoulseekModel: ObservableObject {
         try? fm.removeItem(at: destinationURL)
         do {
             if isAudioOrSidecar {
-                // Para música, copia una versión también a la carpeta personalizada para no romper el reproductor interno
                 try fm.copyItem(at: fileURL, to: destinationURL)
                 return destinationURL
             } else {
