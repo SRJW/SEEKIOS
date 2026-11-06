@@ -81,7 +81,7 @@ public final class SoulseekClient: @unchecked Sendable {
     public var serverPort: UInt16 = 2242
     public var advertisedPort: UInt32 = 2234
 
-    public let downloadDirectory: URL
+    public var downloadDirectory: URL
     public let incompleteDirectory: URL
 
     private let queue = DispatchQueue(label: "colon3.soulseek-client")
@@ -111,6 +111,12 @@ public final class SoulseekClient: @unchecked Sendable {
 
     // MARK: - Public API
 
+    public func setDownloadDirectory(_ url: URL) {
+        queue.async {
+            self.downloadDirectory = url
+        }
+    }
+
     public func connect(username: String, password: String) {
         queue.async { self.openServer(username: username, password: password) }
     }
@@ -130,6 +136,34 @@ public final class SoulseekClient: @unchecked Sendable {
         return token
     }
 
+    /// Registra una descarga incompleta previa en el motor para poder reanudarla desde el byte donde quedó
+    public func restoreInterruptedDownload(username: String, path: String, size: UInt64) {
+        queue.async {
+            let id = DownloadID(username: username, path: path)
+            guard self.downloads[id] == nil else { return }
+            let partURL = self.partialURL(for: id)
+            let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
+            let validReceived = min(savedBytes, size)
+            self.downloads[id] = DownloadRecord(
+                id: id,
+                state: .failed(validReceived > 0 ? "Paused (\(Int(Double(validReceived) / Double(max(1, size)) * 100))%)" : "Paused"),
+                size: size,
+                received: validReceived,
+                token: nil,
+                retries: 0,
+                folderName: nil
+            )
+            self.emitDownload(id)
+        }
+    }
+
+    /// Devuelve cuántos bytes hay guardados en el archivo .part en disco para mostrar el progreso real al abrir la app
+    public func partialBytesOnDisk(username: String, path: String) -> UInt64 {
+        let id = DownloadID(username: username, path: path)
+        let partURL = partialURL(for: id)
+        return (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
+    }
+
     public func download(username: String, file: SharedFile, folderName: String? = nil) {
         queue.async {
             let id = DownloadID(username: username, path: file.path)
@@ -139,24 +173,47 @@ public final class SoulseekClient: @unchecked Sendable {
                 default: return
                 }
             }
-            self.downloads[id] = DownloadRecord(id: id, state: .requesting, size: file.size, folderName: folderName)
+            let partURL = self.partialURL(for: id)
+            let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
+            self.downloads[id] = DownloadRecord(
+                id: id,
+                state: .requesting,
+                size: file.size,
+                received: min(savedBytes, file.size),
+                folderName: folderName
+            )
             self.emitDownload(id)
             self.requestQueuePlace(id)
         }
     }
 
-    public func retry(_ id: DownloadID) {
+    public func retry(_ id: DownloadID, size: UInt64 = 0) {
         queue.async {
-            guard var record = self.downloads[id] else { return }
-            record.state = .requesting
-            record.retries = 0
-            self.downloads[id] = record
+            let partURL = self.partialURL(for: id)
+            let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
+            if var record = self.downloads[id] {
+                record.state = .requesting
+                record.retries = 0
+                if size > 0 && record.size == 0 { record.size = size }
+                record.received = min(savedBytes, record.size)
+                self.downloads[id] = record
+            } else {
+                self.downloads[id] = DownloadRecord(
+                    id: id,
+                    state: .requesting,
+                    size: size,
+                    received: min(savedBytes, size),
+                    token: nil,
+                    retries: 0,
+                    folderName: nil
+                )
+            }
             self.emitDownload(id)
             self.requestQueuePlace(id)
         }
     }
 
-    public func cancel(_ id: DownloadID) {
+    public func cancel(_ id: DownloadID, deletePartial: Bool = false) {
         queue.async {
             if let token = self.downloads[id]?.token {
                 self.downloadsByToken[self.tokenKey(id.username, token)] = nil
@@ -164,6 +221,9 @@ public final class SoulseekClient: @unchecked Sendable {
             self.downloads[id] = nil
             for link in self.fileLinks.values {
                 if case let .downloading(linkID) = link.role, linkID == id { self.closeFile(link, reason: nil) }
+            }
+            if deletePartial {
+                try? FileManager.default.removeItem(at: self.partialURL(for: id))
             }
         }
     }
@@ -707,7 +767,7 @@ public final class SoulseekClient: @unchecked Sendable {
             }
             let handle = try FileHandle(forWritingTo: partial)
             offset = try handle.seekToEnd()
-            if offset > record.size {
+            if record.size > 0 && offset > record.size {
                 try handle.truncate(atOffset: 0)
                 offset = 0
             }
@@ -730,7 +790,7 @@ public final class SoulseekClient: @unchecked Sendable {
         link.connection.send(content: writer.data, completion: .contentProcessed { _ in })
         emitDownload(id)
 
-        if record.received >= record.size {
+        if record.size > 0 && record.received >= record.size {
             finishDownload(link, id: id)
         } else if !leftover.isEmpty {
             writeChunk(leftover, link: link, id: id)
@@ -753,7 +813,7 @@ public final class SoulseekClient: @unchecked Sendable {
         downloads[id]?.received += UInt64(data.count)
         guard let record = downloads[id] else { return }
 
-        if record.received >= record.size {
+        if record.size > 0 && record.received >= record.size {
             finishDownload(link, id: id)
         } else if Date().timeIntervalSince(link.lastProgress) > 0.3 {
             link.lastProgress = Date()
