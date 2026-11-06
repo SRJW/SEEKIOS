@@ -19,7 +19,6 @@ struct DownloadsView: View {
     @State private var previewURL: URL?
     @State private var folderToBrowse: LocalFolderItem?
     @State private var showFolderPicker = false
-    @State private var alertMessage: String?
 
     private var activeDownloads: [DownloadItem] {
         soulseek.visibleDownloads.filter(\.isActive)
@@ -54,7 +53,6 @@ struct DownloadsView: View {
         return order.compactMap { groups[$0] }
     }
 
-    /// Devuelve la carpeta local contenedora de un grupo de descargas
     private func localContainerFolder(for group: (folderName: String, username: String, items: [DownloadItem])) -> URL {
         for item in group.items {
             if case let .completed(url) = item.state {
@@ -74,7 +72,6 @@ struct DownloadsView: View {
     var body: some View {
         NavigationStack {
             List(selection: $selection) {
-                // Sección superior para elegir dónde guardar las descargas y abrir la carpeta principal
                 Section("Download Destination") {
                     HStack(spacing: 12) {
                         Image(systemName: "folder.fill.badge.gearshape")
@@ -111,7 +108,6 @@ struct DownloadsView: View {
                     }
                 }
 
-                // Resumen rápido de acciones en lote
                 if !soulseek.visibleDownloads.isEmpty {
                     Section {
                         HStack(spacing: 12) {
@@ -145,7 +141,6 @@ struct DownloadsView: View {
                     }
                 }
 
-                // Subidas activas
                 if !soulseek.uploads.isEmpty {
                     Section("Uploads (\(soulseek.uploads.count))") {
                         ForEach(soulseek.uploads) { upload in
@@ -162,7 +157,6 @@ struct DownloadsView: View {
                     }
                 }
 
-                // Grupos de descargas por carpeta
                 ForEach(groupedByFolder, id: \.folderName) { group in
                     Section {
                         ForEach(group.items) { item in
@@ -171,9 +165,6 @@ struct DownloadsView: View {
                                 onPreview: { url in previewURL = url },
                                 onShowFolder: { folderURL in
                                     folderToBrowse = LocalFolderItem(url: folderURL)
-                                },
-                                onUnzip: { zipURL in
-                                    extractArchive(zipURL)
                                 }
                             )
                             .tag(item.id)
@@ -300,14 +291,6 @@ struct DownloadsView: View {
                         .ignoresSafeArea()
                 }
             }
-            .alert("Archive Extracted", isPresented: Binding(
-                get: { alertMessage != nil },
-                set: { if !$0 { alertMessage = nil } }
-            )) {
-                Button("OK", role: .cancel) { alertMessage = nil }
-            } message: {
-                Text(alertMessage ?? "")
-            }
             .overlay {
                 if soulseek.visibleDownloads.isEmpty && soulseek.uploads.isEmpty {
                     EmptyStateView(
@@ -319,27 +302,12 @@ struct DownloadsView: View {
             }
         }
     }
-
-    private func extractArchive(_ zipURL: URL) {
-        Task {
-            do {
-                let destination = try await Task.detached {
-                    try ArchiveManager.shared.unzip(fileURL: zipURL)
-                }.value
-                library.rescan()
-                folderToBrowse = LocalFolderItem(url: destination)
-            } catch {
-                alertMessage = "Failed to unzip: \(error.localizedDescription)"
-            }
-        }
-    }
 }
 
 struct DownloadRow: View {
     let item: DownloadItem
     let onPreview: (URL) -> Void
     let onShowFolder: (URL) -> Void
-    let onUnzip: (URL) -> Void
     @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
@@ -387,14 +355,6 @@ struct DownloadRow: View {
                     onShowFolder(url.deletingLastPathComponent())
                 } label: {
                     Label("Show Container Folder", systemImage: "folder")
-                }
-
-                if fileExtension == "zip" {
-                    Button {
-                        onUnzip(url)
-                    } label: {
-                        Label("Unzip Archive Here", systemImage: "doc.zipper")
-                    }
                 }
 
                 ShareLink(item: url) {
@@ -455,15 +415,6 @@ struct DownloadRow: View {
         switch item.state {
         case let .completed(url):
             HStack(spacing: 8) {
-                if fileExtension == "zip" {
-                    Button {
-                        onUnzip(url)
-                    } label: {
-                        Image(systemName: "doc.zipper")
-                    }
-                    .buttonStyle(.borderless)
-                }
-
                 Button {
                     onShowFolder(url.deletingLastPathComponent())
                 } label: {
@@ -473,7 +424,7 @@ struct DownloadRow: View {
 
                 Button {
                     if let track = library.track(at: url) {
-                        player.play(track, queue: [track])
+                        player.play([track])
                     } else {
                         onPreview(url)
                     }
@@ -516,7 +467,6 @@ struct DownloadRow: View {
     }
 }
 
-/// Explorador nativo de la Carpeta Contenedora Local cuando pulsas "Show Folder"
 struct LocalFolderBrowserView: View {
     let folderURL: URL
     @Environment(\.dismiss) private var dismiss
@@ -571,7 +521,7 @@ struct LocalFolderBrowserView: View {
                                 Button {
                                     let ext = itemURL.pathExtension.lowercased()
                                     if LibraryStore.audioExtensions.contains(ext), let track = library.track(at: itemURL) {
-                                        player.play(track, queue: [track])
+                                        player.play([track])
                                     } else {
                                         previewURL = itemURL
                                     }
@@ -594,16 +544,6 @@ struct LocalFolderBrowserView: View {
                                 .buttonStyle(.plain)
 
                                 Spacer()
-
-                                if itemURL.pathExtension.lowercased() == "zip" {
-                                    Button {
-                                        _ = try? ArchiveManager.shared.unzip(fileURL: itemURL)
-                                        reloadContents()
-                                    } label: {
-                                        Image(systemName: "doc.zipper")
-                                    }
-                                    .buttonStyle(.borderless)
-                                }
 
                                 ShareLink(item: itemURL) {
                                     Image(systemName: "square.and.arrow.up")
@@ -658,7 +598,6 @@ struct LocalFolderBrowserView: View {
     }
 }
 
-/// Selector nativo de carpetas de iOS (UIDocumentPickerViewController para elegir carpeta de destino)
 struct FolderDocumentPicker: UIViewControllerRepresentable {
     var onPick: (URL) -> Void
 
