@@ -17,6 +17,8 @@ struct SettingsView: View {
 
     @State private var username = ""
     @State private var password = ""
+    @State private var showFolderPicker = false
+    @State private var showDownloadsFolderSheet = false
 
     private var appVersionText: String {
         let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -89,6 +91,37 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    HStack {
+                        Label("Download Folder", systemImage: "folder.fill")
+                        Spacer()
+                        Text(soulseek.currentDownloadFolderDisplayName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    Button {
+                        showFolderPicker = true
+                    } label: {
+                        Label("Choose Where to Save Downloads…", systemImage: "folder.badge.gearshape")
+                    }
+                    Button {
+                        showDownloadsFolderSheet = true
+                    } label: {
+                        Label("Show Downloads Folder", systemImage: "folder.badge.magnifyingglass")
+                    }
+                    if soulseek.customDownloadDirectory != nil {
+                        Toggle("Also Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
+                        Button("Reset Download Folder to Default", role: .destructive) {
+                            soulseek.resetDownloadFolderToDefault()
+                        }
+                    }
+                } header: {
+                    Text("Download Location")
+                } footer: {
+                    Text("Choose any folder in On My iPhone or iCloud Drive to automatically store downloaded files.")
+                }
+
+                Section {
                     Toggle("Keep Transfers Running in Background", isOn: $backgroundTransfers)
                     Toggle("Show Transfers in Dynamic Island", isOn: $transferActivity)
                     Toggle("Seeding Mode", isOn: $seeding)
@@ -137,6 +170,16 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationDestination(isPresented: $router.showWiFiTransfer) { WiFiTransferView() }
+            .sheet(isPresented: $showFolderPicker) {
+                FolderDocumentPicker { pickedURL in
+                    soulseek.setCustomDownloadFolder(pickedURL)
+                }
+            }
+            .sheet(isPresented: $showDownloadsFolderSheet) {
+                NavigationStack {
+                    LocalFolderBrowserView(folderURL: soulseek.otherDownloadsDirectory)
+                }
+            }
             .onAppear { username = soulseek.username }
         }
     }
