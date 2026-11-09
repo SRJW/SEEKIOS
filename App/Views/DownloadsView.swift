@@ -1,6 +1,7 @@
 import QuickLook
 import SoulseekKit
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct LocalFolderItem: Identifiable {
@@ -19,6 +20,8 @@ struct DownloadsView: View {
     @State private var previewURL: URL?
     @State private var folderToBrowse: LocalFolderItem?
     @State private var showFolderPicker = false
+    @State private var showNewFolderAlert = false
+    @State private var newFolderName = ""
 
     private var activeDownloads: [DownloadItem] {
         soulseek.visibleDownloads.filter(\.isActive)
@@ -72,7 +75,7 @@ struct DownloadsView: View {
     var body: some View {
         NavigationStack {
             List(selection: $selection) {
-                Section("Download Destination") {
+                Section {
                     HStack(spacing: 12) {
                         Image(systemName: "folder.fill.badge.gearshape")
                             .font(.title3)
@@ -93,10 +96,26 @@ struct DownloadsView: View {
                         .controlSize(.small)
                     }
 
-                    Button {
-                        folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
-                    } label: {
-                        Label("Show Downloads Folder", systemImage: "folder.fill")
+                    HStack(spacing: 16) {
+                        Button {
+                            folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
+                        } label: {
+                            Label("Show Downloads Folder", systemImage: "folder.fill")
+                                .font(.subheadline)
+                        }
+                        .buttonStyle(.borderless)
+
+                        Spacer()
+
+                        Button {
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        } label: {
+                            Label("New Folder…", systemImage: "folder.badge.plus")
+                                .font(.caption.weight(.semibold))
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
 
                     if soulseek.customDownloadDirectory != nil {
@@ -106,6 +125,10 @@ struct DownloadsView: View {
                         }
                         .font(.footnote)
                     }
+                } header: {
+                    Text("Download Destination")
+                } footer: {
+                    Text("Tip: In the iOS folder picker, open any subfolder (or tap the New Folder icon at top-right) and tap Open.")
                 }
 
                 if !soulseek.visibleDownloads.isEmpty {
@@ -222,6 +245,12 @@ struct DownloadsView: View {
                         } label: {
                             Label("Change Download Location…", systemImage: "folder.badge.gearshape")
                         }
+                        Button {
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        } label: {
+                            Label("Create New Download Folder…", systemImage: "folder.badge.plus")
+                        }
                         Divider()
                         if !failedDownloads.isEmpty {
                             Button {
@@ -278,9 +307,19 @@ struct DownloadsView: View {
                 }
             }
             .sheet(isPresented: $showFolderPicker) {
-                FolderDocumentPicker { pickedURL in
+                FolderDocumentPicker(isPresented: $showFolderPicker) { pickedURL in
                     soulseek.setCustomDownloadFolder(pickedURL)
                 }
+                .ignoresSafeArea()
+            }
+            .alert("Create New Download Folder", isPresented: $showNewFolderAlert) {
+                TextField("Folder name (e.g. Peliculas, Musica)", text: $newFolderName)
+                Button("Create & Select") {
+                    soulseek.createAndSelectSubfolder(named: newFolderName)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Creates a folder inside On My iPhone › Seekios and sets it as your active download folder.")
             }
             .fullScreenCover(isPresented: Binding(
                 get: { previewURL != nil },
@@ -470,6 +509,7 @@ struct DownloadRow: View {
 struct LocalFolderBrowserView: View {
     let folderURL: URL
     @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
     @State private var contents: [URL] = []
@@ -490,6 +530,12 @@ struct LocalFolderBrowserView: View {
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                     }
+                }
+
+                Button {
+                    soulseek.setCustomDownloadFolder(folderURL)
+                } label: {
+                    Label("Use This Folder for Future Downloads", systemImage: "checkmark.folder.fill")
                 }
 
                 Button {
@@ -583,6 +629,7 @@ struct LocalFolderBrowserView: View {
     }
 
     private func reloadContents() {
+        _ = folderURL.startAccessingSecurityScopedResource()
         let items = (try? FileManager.default.contentsOfDirectory(
             at: folderURL,
             includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
@@ -598,16 +645,26 @@ struct LocalFolderBrowserView: View {
     }
 }
 
+/// Selector nativo de carpetas de iOS con cierre automático al pulsar "Open"
 struct FolderDocumentPicker: UIViewControllerRepresentable {
+    @Binding var isPresented: Bool
     var onPick: (URL) -> Void
 
+    init(isPresented: Binding<Bool> = .constant(true), onPick: @escaping (URL) -> Void) {
+        self._isPresented = isPresented
+        self.onPick = onPick
+    }
+
     func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick)
+        Coordinator(parent: self)
     }
 
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder])
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.allowsMultipleSelection = false
+        picker.shouldShowFileExtensions = true
+        // Inicia directamente en la carpeta Documents de la app para que el botón Open esté habilitado de inmediato
+        picker.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         picker.delegate = context.coordinator
         return picker
     }
@@ -615,12 +672,29 @@ struct FolderDocumentPicker: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let onPick: (URL) -> Void
-        init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
+        let parent: FolderDocumentPicker
+
+        init(parent: FolderDocumentPicker) {
+            self.parent = parent
+        }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let first = urls.first else { return }
-            onPick(first)
+            guard let first = urls.first else {
+                DispatchQueue.main.async { self.parent.isPresented = false }
+                return
+            }
+            DispatchQueue.main.async {
+                self.parent.onPick(first)
+                self.parent.isPresented = false
+                controller.dismiss(animated: true)
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            DispatchQueue.main.async {
+                self.parent.isPresented = false
+                controller.dismiss(animated: true)
+            }
         }
     }
 }
