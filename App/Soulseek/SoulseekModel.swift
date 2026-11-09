@@ -177,6 +177,7 @@ final class SoulseekModel: ObservableObject {
     private var started = false
     private var didAutoResumeOnLaunch = false
     private var coverRequested = Set<String>()
+    private var hasSecurityScopeAccess = false
 
     private var browseCache: [String: [SharedFile]] = [:]
     private var fullBrowseLoadedUsers = Set<String>()
@@ -194,7 +195,8 @@ final class SoulseekModel: ObservableObject {
 
     var currentDownloadFolderDisplayName: String {
         if let custom = customDownloadDirectory {
-            return custom.lastPathComponent.isEmpty ? custom.path : custom.lastPathComponent
+            let parts = custom.pathComponents.suffix(2).joined(separator: " › ")
+            return parts.isEmpty ? custom.lastPathComponent : parts
         }
         return "On My iPhone › Seekios › Downloads"
     }
@@ -225,7 +227,10 @@ final class SoulseekModel: ObservableObject {
         if let bookmarkData = UserDefaults.standard.data(forKey: customDownloadBookmarkKey) {
             var isStale = false
             if let url = try? URL(resolvingBookmarkData: bookmarkData, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale) {
-                _ = url.startAccessingSecurityScopedResource()
+                hasSecurityScopeAccess = url.startAccessingSecurityScopedResource()
+                if isStale, let freshData = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
+                    UserDefaults.standard.set(freshData, forKey: customDownloadBookmarkKey)
+                }
                 try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
                 customDownloadDirectory = url
                 return
@@ -234,34 +239,55 @@ final class SoulseekModel: ObservableObject {
         if let savedPath = UserDefaults.standard.string(forKey: customDownloadPathKey), !savedPath.isEmpty {
             let url = URL(fileURLWithPath: savedPath, isDirectory: true)
             if FileManager.default.fileExists(atPath: url.path) {
+                hasSecurityScopeAccess = url.startAccessingSecurityScopedResource()
                 customDownloadDirectory = url
             }
         }
     }
 
-    func setCustomDownloadFolder(_ url: URL) {
-        if let old = customDownloadDirectory {
+    @discardableResult
+    func setCustomDownloadFolder(_ url: URL) -> Bool {
+        if let old = customDownloadDirectory, hasSecurityScopeAccess {
             old.stopAccessingSecurityScopedResource()
+            hasSecurityScopeAccess = false
         }
+
         let accessed = url.startAccessingSecurityScopedResource()
+        hasSecurityScopeAccess = accessed
+
+        // Verifica o crea el directorio y guarda el marcador de seguridad persistente
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+
         if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             UserDefaults.standard.set(data, forKey: customDownloadBookmarkKey)
         }
         UserDefaults.standard.set(url.path, forKey: customDownloadPathKey)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+
         customDownloadDirectory = url
-        if !accessed {
-            _ = url.startAccessingSecurityScopedResource()
-        }
+        objectWillChange.send()
+        return true
+    }
+
+    /// Crea una subcarpeta personalizada dentro de Documents de la app y la asigna como destino automático
+    func createAndSelectSubfolder(named name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let clean = String(trimmed.map { "/:\0".contains($0) ? "_" : $0 })
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let newFolder = docs.appendingPathComponent(clean, isDirectory: true)
+        try? FileManager.default.createDirectory(at: newFolder, withIntermediateDirectories: true)
+        _ = setCustomDownloadFolder(newFolder)
     }
 
     func resetDownloadFolderToDefault() {
-        if let old = customDownloadDirectory {
+        if let old = customDownloadDirectory, hasSecurityScopeAccess {
             old.stopAccessingSecurityScopedResource()
+            hasSecurityScopeAccess = false
         }
         customDownloadDirectory = nil
         UserDefaults.standard.removeObject(forKey: customDownloadBookmarkKey)
         UserDefaults.standard.removeObject(forKey: customDownloadPathKey)
+        objectWillChange.send()
     }
 
     var hasCredentials: Bool {
@@ -779,10 +805,13 @@ final class SoulseekModel: ObservableObject {
             return fileURL
         }
         let fm = FileManager.default
+        let targetBase = otherDownloadsDirectory
+        _ = targetBase.startAccessingSecurityScopedResource()
+
         let shared = SharedFile(path: remotePath, size: 0)
         let rawFolderName = shared.folder.split(separator: "\\").last.map(String.init) ?? "Misc"
         let cleanFolderName = String(rawFolderName.map { "/:\0".contains($0) ? "_" : $0 })
-        let targetSubfolder = otherDownloadsDirectory.appendingPathComponent(cleanFolderName, isDirectory: true)
+        let targetSubfolder = targetBase.appendingPathComponent(cleanFolderName, isDirectory: true)
         try? fm.createDirectory(at: targetSubfolder, withIntermediateDirectories: true)
 
         let destinationURL = targetSubfolder.appendingPathComponent(fileURL.lastPathComponent)
