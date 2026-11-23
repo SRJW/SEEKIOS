@@ -111,12 +111,9 @@ struct DownloadsView: View {
     @State private var editMode: EditMode = .inactive
     @State private var collapsedGroups = Set<String>()
     @State private var previewItem: QuickLookPreviewItem?
+    @State private var videoItem: VideoPlaybackItem?
     @State private var folderToBrowse: LocalFolderItem?
     @State private var browsePeerTarget: BrowseTarget?
-    @State private var showFolderPicker = false
-    @State private var showFolderOptions = false
-    @State private var showNewFolderAlert = false
-    @State private var newFolderName = ""
     @State private var filter: TransferFilter = .all
     @State private var searchText = ""
 
@@ -301,14 +298,9 @@ struct DownloadsView: View {
                         Divider()
 
                         Button {
-                            showFolderOptions = true
-                        } label: {
-                            Label("Download Folder Settings…", systemImage: "folder.badge.gearshape")
-                        }
-                        Button {
                             folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
                         } label: {
-                            Label("Browse Download Folder", systemImage: "folder")
+                            Label("Browse Downloaded Files", systemImage: "folder")
                         }
 
                         Divider()
@@ -394,54 +386,8 @@ struct DownloadsView: View {
                     RemoteFolderBrowserView(target: target)
                 }
             }
-            .sheet(isPresented: $showFolderPicker) {
-                FolderDocumentPicker { pickedURL in
-                    soulseek.setCustomDownloadFolder(pickedURL)
-                }
-                .ignoresSafeArea()
-            }
-            .sheet(isPresented: $showFolderOptions) {
-                DownloadFolderOptionsSheet(
-                    onPickFolder: {
-                        showFolderOptions = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            showFolderPicker = true
-                        }
-                    },
-                    onCreateSubfolder: {
-                        showFolderOptions = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            newFolderName = ""
-                            showNewFolderAlert = true
-                        }
-                    },
-                    onBrowseFolder: {
-                        showFolderOptions = false
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                            folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
-                        }
-                    }
-                )
-            }
-            .alert("Create New Download Folder", isPresented: $showNewFolderAlert) {
-                TextField("Folder name (e.g. Albums, Vinyl)", text: $newFolderName)
-                Button("Create & Select") {
-                    soulseek.createAndSelectSubfolder(named: newFolderName)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Creates a folder inside On My iPhone › Seekios and sets it as your default download folder.")
-            }
-            .alert(
-                "Folder Unavailable",
-                isPresented: Binding(
-                    get: { soulseek.downloadLocationError != nil },
-                    set: { if !$0 { soulseek.downloadLocationError = nil } }
-                )
-            ) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(soulseek.downloadLocationError ?? "")
+            .fullScreenCover(item: $videoItem) { item in
+                VideoPlayerSheet(url: item.url)
             }
             .fullScreenCover(item: $previewItem) { item in
                 QuickLookPreview(url: item.url)
@@ -462,117 +408,71 @@ struct DownloadsView: View {
         remainingBytes: UInt64,
         globalETA: String?
     ) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            // Speed & queue strip
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 10) {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 10) {
+                    Label(
+                        transfers.totalDownloadSpeed > 0 ? Formatting.speed(transfers.totalDownloadSpeed) : "0 KB/s",
+                        systemImage: "arrow.down.circle.fill"
+                    )
+                    .foregroundStyle(transfers.totalDownloadSpeed > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+
+                    if transfers.activeUploadCount > 0 || transfers.totalUploadSpeed > 0 {
                         Label(
-                            transfers.totalDownloadSpeed > 0 ? Formatting.speed(transfers.totalDownloadSpeed) : "0 KB/s",
-                            systemImage: "arrow.down.circle.fill"
+                            transfers.totalUploadSpeed > 0 ? Formatting.speed(transfers.totalUploadSpeed) : "0 KB/s",
+                            systemImage: "arrow.up.circle.fill"
                         )
-                        .foregroundStyle(transfers.totalDownloadSpeed > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
-
-                        if transfers.activeUploadCount > 0 || transfers.totalUploadSpeed > 0 {
-                            Label(
-                                transfers.totalUploadSpeed > 0 ? Formatting.speed(transfers.totalUploadSpeed) : "0 KB/s",
-                                systemImage: "arrow.up.circle.fill"
-                            )
-                            .foregroundStyle(.green)
-                        }
+                        .foregroundStyle(.green)
                     }
-                    .font(.subheadline.weight(.semibold).monospacedDigit())
-
-                    HStack(spacing: 5) {
-                        if downloadingCount > 0 {
-                            Text("\(downloadingCount) downloading")
-                        }
-                        if queuedCount > 0 {
-                            Text(downloadingCount > 0 ? "· \(queuedCount) queued" : "\(queuedCount) queued")
-                        }
-                        if activeCount == 0 {
-                            if pausedCount > 0 || failedCount > 0 {
-                                Text("\(pausedCount) paused · \(failedCount) failed")
-                            } else {
-                                Text("Idle")
-                            }
-                        }
-                        if let globalETA {
-                            Text("· ETA \(globalETA)")
-                        }
-                        if remainingBytes > 0 {
-                            Text("· \(Formatting.bytes(remainingBytes)) left")
-                        }
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
                 }
+                .font(.subheadline.weight(.semibold).monospacedDigit())
 
-                Spacer(minLength: 4)
-
-                if activeCount > 0 {
-                    Button {
-                        soulseek.pauseAllActive()
-                    } label: {
-                        Label("Pause", systemImage: "pause.fill")
-                            .font(.caption.weight(.semibold))
+                HStack(spacing: 5) {
+                    if downloadingCount > 0 {
+                        Text("\(downloadingCount) downloading")
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                } else if pausedCount + failedCount > 0 {
-                    Button {
-                        soulseek.retryAllFailed()
-                    } label: {
-                        Label("Resume", systemImage: "play.fill")
-                            .font(.caption.weight(.semibold))
+                    if queuedCount > 0 {
+                        Text(downloadingCount > 0 ? "· \(queuedCount) queued" : "\(queuedCount) queued")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                    if activeCount == 0 {
+                        if pausedCount > 0 || failedCount > 0 {
+                            Text("\(pausedCount) paused · \(failedCount) failed")
+                        } else {
+                            Text("Idle")
+                        }
+                    }
+                    if let globalETA {
+                        Text("· ETA \(globalETA)")
+                    }
+                    if remainingBytes > 0 {
+                        Text("· \(Formatting.bytes(remainingBytes)) left")
+                    }
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
             }
 
-            Divider()
+            Spacer(minLength: 4)
 
-            // Compact Default Download Folder bar (respects iOS sandbox via native folder picker)
-            HStack(spacing: 8) {
+            if activeCount > 0 {
                 Button {
-                    folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
+                    soulseek.pauseAllActive()
                 } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "folder.fill")
-                            .foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("Default Folder")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            Text(soulseek.currentDownloadFolderDisplayName)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                        }
-                    }
-                }
-                .buttonStyle(.plain)
-
-                Spacer(minLength: 4)
-
-                Button("Change") {
-                    showFolderPicker = true
-                }
-                .font(.caption.weight(.semibold))
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-
-                Button {
-                    showFolderOptions = true
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .font(.caption)
+                    Label("Pause", systemImage: "pause.fill")
+                        .font(.caption.weight(.semibold))
                 }
                 .buttonStyle(.bordered)
-                .controlSize(.mini)
-                .accessibilityLabel("Download Folder Settings")
+                .controlSize(.small)
+            } else if pausedCount + failedCount > 0 {
+                Button {
+                    soulseek.retryAllFailed()
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
             }
         }
         .padding(.vertical, 2)
@@ -728,6 +628,7 @@ struct DownloadsView: View {
         DownloadRow(
             item: item,
             showPeer: showPeer,
+            onPlayVideo: { url in videoItem = VideoPlaybackItem(url: url) },
             onPreview: { url in previewItem = QuickLookPreviewItem(url: url) },
             onShowFolder: { folderURL in folderToBrowse = LocalFolderItem(url: folderURL) },
             onBrowsePeer: { target in browsePeerTarget = target }
@@ -928,88 +829,6 @@ struct DownloadsView: View {
     }
 }
 
-private struct DownloadFolderOptionsSheet: View {
-    @EnvironmentObject private var soulseek: SoulseekModel
-    @Environment(\.dismiss) private var dismiss
-    @AppStorage(AppSettings.keepAudioInLibraryKey) private var keepAudioInLibrary = true
-    @AppStorage(AppSettings.downloadFolderStructureKey) private var folderStructureRaw = DownloadFolderStructure.album.rawValue
-
-    let onPickFolder: () -> Void
-    let onCreateSubfolder: () -> Void
-    let onBrowseFolder: () -> Void
-
-    private var folderStructure: Binding<DownloadFolderStructure> {
-        Binding(
-            get: { DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album },
-            set: { folderStructureRaw = $0.rawValue }
-        )
-    }
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    HStack(spacing: 12) {
-                        Image(systemName: "folder.fill")
-                            .font(.title2)
-                            .foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Current Default Folder")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(soulseek.currentDownloadFolderDisplayName)
-                                .font(.subheadline.weight(.semibold))
-                        }
-                    }
-
-                    Button(action: onPickFolder) {
-                        Label("Choose Folder in Files / iCloud…", systemImage: "folder.badge.gearshape")
-                    }
-                    Button(action: onCreateSubfolder) {
-                        Label("Create Subfolder in Seekios…", systemImage: "folder.badge.plus")
-                    }
-                    Button(action: onBrowseFolder) {
-                        Label("Browse Download Folder", systemImage: "folder.badge.magnifyingglass")
-                    }
-                } header: {
-                    Text("Default Download Location")
-                } footer: {
-                    Text("Because of iOS sandboxing, picking a folder via the system picker grants persistent write access to any writable folder on On My iPhone or iCloud Drive.")
-                }
-
-                Section {
-                    Picker("Subfolder Layout", selection: folderStructure) {
-                        ForEach(DownloadFolderStructure.allCases) { option in
-                            Text(option.label).tag(option)
-                        }
-                    }
-                    if soulseek.customDownloadDirectory != nil {
-                        Toggle("Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
-                        if soulseek.saveAllToCustomFolder {
-                            Toggle("Also Keep Copy in Seekios Library", isOn: $keepAudioInLibrary)
-                        }
-                        Button("Reset to Default App Folder", role: .destructive) {
-                            soulseek.resetDownloadFolderToDefault()
-                        }
-                    }
-                } header: {
-                    Text("File Organization")
-                } footer: {
-                    Text("Example: \((DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album).example)")
-                }
-            }
-            .navigationTitle("Download Folder")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
-    }
-}
-
 private struct UploadRow: View {
     let upload: UploadItem
     @EnvironmentObject private var soulseek: SoulseekModel
@@ -1081,6 +900,7 @@ private struct UploadRow: View {
 struct DownloadRow: View {
     let item: DownloadItem
     var showPeer: Bool = false
+    let onPlayVideo: (URL) -> Void
     let onPreview: (URL) -> Void
     let onShowFolder: (URL) -> Void
     let onBrowsePeer: (BrowseTarget) -> Void
@@ -1088,6 +908,22 @@ struct DownloadRow: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
     @EnvironmentObject private var router: AppRouter
+
+    private var isVideo: Bool { VideoFileSupport.isVideoExtension(item.fileExtension) }
+    private var isAudio: Bool { LibraryStore.audioExtensions.contains(item.fileExtension) }
+
+    private func openCompleted(_ url: URL) {
+        if isVideo {
+            onPlayVideo(url)
+            return
+        }
+        let libTrack = item.libraryURL.flatMap { library.track(at: $0) } ?? library.track(at: url)
+        if let track = libTrack {
+            player.play([track])
+        } else {
+            onPreview(url)
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1127,16 +963,11 @@ struct DownloadRow: View {
         .contextMenu {
             if case let .completed(url) = item.state {
                 Button {
-                    let libTrack = item.libraryURL.flatMap { library.track(at: $0) } ?? library.track(at: url)
-                    if let track = libTrack {
-                        player.play([track])
-                    } else {
-                        onPreview(url)
-                    }
+                    openCompleted(url)
                 } label: {
                     Label(
-                        LibraryStore.audioExtensions.contains(item.fileExtension) ? "Play / Open File" : "Preview / Open File",
-                        systemImage: LibraryStore.audioExtensions.contains(item.fileExtension) ? "play.circle" : "eye"
+                        isVideo ? "Play Video" : (isAudio ? "Play Track" : "Preview / Open File"),
+                        systemImage: (isVideo || isAudio) ? "play.circle" : "eye"
                     )
                 }
 
@@ -1280,14 +1111,9 @@ struct DownloadRow: View {
                 .buttonStyle(.borderless)
 
                 Button {
-                    let libTrack = item.libraryURL.flatMap { library.track(at: $0) } ?? library.track(at: url)
-                    if let track = libTrack {
-                        player.play([track])
-                    } else {
-                        onPreview(url)
-                    }
+                    openCompleted(url)
                 } label: {
-                    Image(systemName: LibraryStore.audioExtensions.contains(item.fileExtension) ? "play.circle.fill" : "eye.circle.fill")
+                    Image(systemName: (isVideo || isAudio) ? "play.circle.fill" : "eye.circle.fill")
                         .font(.title3)
                 }
                 .buttonStyle(.borderless)
@@ -1318,7 +1144,7 @@ struct DownloadRow: View {
     private func iconForExtension(_ ext: String) -> String {
         if LibraryStore.audioExtensions.contains(ext) { return "music.note" }
         if LibraryStore.imageExtensions.contains(ext) { return "photo" }
-        if ["mp4", "mkv", "mov", "avi", "webm"].contains(ext) { return "film" }
+        if VideoFileSupport.isVideoExtension(ext) { return "film" }
         if ["zip", "rar", "7z", "tar", "gz"].contains(ext) { return "doc.zipper" }
         if ["pdf", "epub", "txt", "md"].contains(ext) { return "book" }
         return "doc.fill"
@@ -1336,11 +1162,11 @@ private struct LocalFileEntry: Identifiable, Sendable {
 struct LocalFolderBrowserView: View {
     let folderURL: URL
     @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
     @State private var entries: [LocalFileEntry] = []
     @State private var previewItem: QuickLookPreviewItem?
+    @State private var videoItem: VideoPlaybackItem?
 
     var body: some View {
         List {
@@ -1352,17 +1178,11 @@ struct LocalFolderBrowserView: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(folderURL.lastPathComponent)
                             .font(.headline)
-                        Text(folderURL.path)
-                            .font(.caption2)
+                        Text("On My iPhone › Seekios › \(folderURL.lastPathComponent)")
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                            .lineLimit(1)
                     }
-                }
-
-                Button {
-                    soulseek.setCustomDownloadFolder(folderURL)
-                } label: {
-                    Label("Use This Folder for Future Downloads", systemImage: "checkmark.folder.fill")
                 }
 
                 Button {
@@ -1389,17 +1209,21 @@ struct LocalFolderBrowserView: View {
                                 Label(entry.name, systemImage: "folder.fill")
                             }
                         } else {
+                            let ext = entry.url.pathExtension.lowercased()
+                            let isVideo = VideoFileSupport.isVideoExtension(ext)
+                            let isAudio = LibraryStore.audioExtensions.contains(ext)
                             HStack {
                                 Button {
-                                    let ext = entry.url.pathExtension.lowercased()
-                                    if LibraryStore.audioExtensions.contains(ext), let track = library.track(at: entry.url) {
+                                    if isVideo {
+                                        videoItem = VideoPlaybackItem(url: entry.url)
+                                    } else if isAudio, let track = library.track(at: entry.url) {
                                         player.play([track])
                                     } else {
                                         previewItem = QuickLookPreviewItem(url: entry.url)
                                     }
                                 } label: {
                                     HStack {
-                                        Image(systemName: "doc.fill")
+                                        Image(systemName: isVideo ? "film" : (isAudio ? "music.note" : "doc.fill"))
                                             .foregroundStyle(.tint)
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(entry.name)
@@ -1442,6 +1266,9 @@ struct LocalFolderBrowserView: View {
             }
         }
         .task(id: folderURL) { await reloadContents() }
+        .fullScreenCover(item: $videoItem) { item in
+            VideoPlayerSheet(url: item.url)
+        }
         .fullScreenCover(item: $previewItem) { item in
             QuickLookPreview(url: item.url)
                 .ignoresSafeArea()
@@ -1451,8 +1278,6 @@ struct LocalFolderBrowserView: View {
     private func reloadContents() async {
         let target = folderURL
         let loaded = await Task.detached(priority: .userInitiated) { () -> [LocalFileEntry] in
-            let scoped = target.startAccessingSecurityScopedResource()
-            defer { if scoped { target.stopAccessingSecurityScopedResource() } }
             let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey]
             let items = (try? FileManager.default.contentsOfDirectory(
                 at: target,
@@ -1473,8 +1298,6 @@ struct LocalFolderBrowserView: View {
     private func deleteItem(_ url: URL) {
         Task {
             await Task.detached(priority: .userInitiated) {
-                let scoped = folderURL.startAccessingSecurityScopedResource()
-                defer { if scoped { folderURL.stopAccessingSecurityScopedResource() } }
                 try? FileManager.default.removeItem(at: url)
             }.value
             await reloadContents()
@@ -1484,56 +1307,6 @@ struct LocalFolderBrowserView: View {
     private func openInSystemFilesApp(_ url: URL) {
         if let sharedURL = URL(string: "shareddocuments://\(url.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? url.path)") {
             UIApplication.shared.open(sharedURL)
-        }
-    }
-}
-
-/// Native iOS folder picker using SwiftUI `@Environment(\.dismiss)` without double-dismiss races.
-struct FolderDocumentPicker: UIViewControllerRepresentable {
-    @Environment(\.dismiss) private var dismiss
-    var onPick: (URL) -> Void
-
-    init(onPick: @escaping (URL) -> Void) {
-        self.onPick = onPick
-    }
-
-    func makeCoordinator() -> Coordinator {
-        Coordinator(parent: self)
-    }
-
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
-        picker.allowsMultipleSelection = false
-        picker.shouldShowFileExtensions = true
-        picker.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-        picker.delegate = context.coordinator
-        return picker
-    }
-
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
-        context.coordinator.parent = self
-    }
-
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        var parent: FolderDocumentPicker
-
-        init(parent: FolderDocumentPicker) {
-            self.parent = parent
-        }
-
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            if let first = urls.first {
-                DispatchQueue.main.async {
-                    self.parent.onPick(first)
-                    self.parent.dismiss()
-                }
-            } else {
-                DispatchQueue.main.async { self.parent.dismiss() }
-            }
-        }
-
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            DispatchQueue.main.async { self.parent.dismiss() }
         }
     }
 }

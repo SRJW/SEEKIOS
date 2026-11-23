@@ -210,8 +210,7 @@ enum AppSettings {
     /// Sharing & privacy on iPhone: opt-in by default to protect battery, cellular data, and privacy.
     static let sharingEnabledKey = "slsk.sharingEnabled"
     static let shareOnWiFiOnlyKey = "slsk.shareOnWiFiOnly"
-    /// Download folder organization & iOS Library integration.
-    static let keepAudioInLibraryKey = "slsk.keepAudioInLibrary"
+    /// Subfolder layout for non-audio downloads inside Seekios/Downloads.
     static let downloadFolderStructureKey = "slsk.downloadFolderStructure"
     /// Transfer & Soulseek tuning (Nicotine+-style controls).
     static let maxConcurrentDownloadsKey = "slsk.maxConcurrentDownloads"
@@ -223,7 +222,6 @@ enum AppSettings {
     static var lyricsLookupEnabled: Bool { flag(lyricsLookupKey) }
     static var sharingEnabled: Bool { UserDefaults.standard.bool(forKey: sharingEnabledKey) }
     static var shareOnWiFiOnly: Bool { flag(shareOnWiFiOnlyKey) }
-    static var keepAudioInLibrary: Bool { flag(keepAudioInLibraryKey) }
     static var seedingEnabled: Bool { UserDefaults.standard.bool(forKey: seedingKey) }
     static var distributedSearchEnabled: Bool { flag(distributedSearchKey) }
 

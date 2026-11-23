@@ -160,9 +160,9 @@ public final class SoulseekClient: @unchecked Sendable {
     private var distribRepliesThisMinute = 0
 
     // Maintenance & keepalive
+    public var serverPingInterval: TimeInterval = 90
     private var maintenanceTimer: DispatchSourceTimer?
     private var lastServerPingSent: Date?
-    private var awaitingServerPong = false
     private var lastQueuePollAt = Date.distantPast
 
     public init(downloadDirectory: URL, incompleteDirectory: URL) {
@@ -674,9 +674,9 @@ public final class SoulseekClient: @unchecked Sendable {
                     receive(on: connection, onData: { [weak self, weak link] data in
                         guard let self, let link else { return }
                         self.handleFileData(link, data)
-                    }, onClose: { [weak self, weak link] _ in
+                    }, onClose: { [weak self, weak link] error in
                         guard let self, let link else { return }
-                        self.closeFile(link, reason: "Connection closed early")
+                        self.closeFile(link, reason: error == nil ? nil : "Connection closed early")
                     })
                 }
 
@@ -698,10 +698,12 @@ public final class SoulseekClient: @unchecked Sendable {
         server = connection
         serverFrames = FrameBuffer()
 
+        var serverBecameReady = false
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, self.server === connection else { return }
             switch state {
             case .ready:
+                serverBecameReady = true
                 self.log("Connected to \(self.serverHost), logging in as \(username)")
                 self.sendServer(.login(username: username, password: password,
                                        majorVersion: ServerRequest.majorVersion,
@@ -713,7 +715,16 @@ public final class SoulseekClient: @unchecked Sendable {
                     guard let self, self.server === connection else { return }
                     self.tearDown(.failed("Disconnected from server"))
                 })
-            case let .waiting(error), let .failed(error):
+            case let .waiting(error):
+                // Transient iOS network transition: allow up to 15s for route recovery before giving up.
+                let waitingSince = Date()
+                self.queue.asyncAfter(deadline: .now() + 15) { [weak self] in
+                    guard let self, self.server === connection, !serverBecameReady else { return }
+                    if Date().timeIntervalSince(waitingSince) >= 14.5 {
+                        self.tearDown(.failed("Can't reach server: \(error.localizedDescription)"))
+                    }
+                }
+            case let .failed(error):
                 self.tearDown(.failed("Can't reach server: \(error.localizedDescription)"))
             default:
                 break
@@ -724,6 +735,7 @@ public final class SoulseekClient: @unchecked Sendable {
 
     private func startMaintenanceTimer() {
         maintenanceTimer?.cancel()
+        lastServerPingSent = Date()
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 15, repeating: 15)
         timer.setEventHandler { [weak self] in
@@ -737,29 +749,34 @@ public final class SoulseekClient: @unchecked Sendable {
         guard isLoggedIn else { return }
         let now = Date()
 
-        // 1. ServerPing keepalive (60s interval, 25s pong watchdog).
-        if awaitingServerPong, let sent = lastServerPingSent, now.timeIntervalSince(sent) > 25 {
-            log("Server ping timed out; reconnecting")
-            tearDown(.failed("Server connection timed out"))
-            return
-        }
-        if !awaitingServerPong, lastServerPingSent == nil || now.timeIntervalSince(lastServerPingSent!) >= 60 {
-            awaitingServerPong = true
+        // 1. One-way ServerPing keepalive (official server does NOT send a pong back).
+        let pingInterval = max(serverPingInterval, 60)
+        if lastServerPingSent == nil || now.timeIntervalSince(lastServerPingSent!) >= pingInterval {
             lastServerPingSent = now
             sendServer(.serverPing)
         }
 
-        // 2. Stall detection on active downloads (45s without bytes).
+        // 2. Stall detection on active downloads (60s without bytes, matching Nicotine+).
         for link in Array(fileLinks.values) {
-            if case let .downloading(id) = link.role, now.timeIntervalSince(link.lastDataAt) > 45 {
-                log("Download stalled for \(id.path), retrying")
-                closeFile(link, reason: "Transfer stalled")
+            if case let .downloading(id) = link.role, now.timeIntervalSince(link.lastDataAt) > 60 {
                 if let record = downloads[id], record.retries < 3 {
+                    log("Download stalled for \(id.path), retrying (\(record.retries + 1)/3)")
+                    // Detach role before closing so closeFile does not emit a spurious .failed state.
+                    link.role = .awaitingToken
+                    closeFile(link, reason: nil)
+                    if let token = record.token {
+                        downloadsByToken.removeValue(forKey: tokenKey(id.username, token))
+                        downloads[id]?.token = nil
+                    }
                     downloads[id]?.retries += 1
                     downloads[id]?.state = .queued(place: nil)
                     downloads[id]?.sentToPeer = false
+                    downloads[id]?.bytesPerSecond = 0
                     if !stagedDownloadQueue.contains(id) { stagedDownloadQueue.append(id) }
                     emitDownload(id)
+                } else {
+                    log("Download stalled for \(id.path)")
+                    closeFile(link, reason: "Transfer stalled")
                 }
             }
         }
@@ -807,7 +824,6 @@ public final class SoulseekClient: @unchecked Sendable {
         isLoggedIn = false
         maintenanceTimer?.cancel()
         maintenanceTimer = nil
-        awaitingServerPong = false
         lastServerPingSent = nil
         activeSearches.removeAll()
         watchedUsers.removeAll()
@@ -917,7 +933,7 @@ public final class SoulseekClient: @unchecked Sendable {
             }
 
         case .serverPing:
-            awaitingServerPong = false
+            break
 
         case let .embeddedMessage(distribCode, payload):
             if sharingEnabled, distributedSearchEnabled,
@@ -1226,26 +1242,35 @@ public final class SoulseekClient: @unchecked Sendable {
             attemptIndirectPeerOrFail(link, allowIndirectFallback: allowIndirectFallback)
             return
         }
-        let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 6))
+        let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 8))
         link.connection = connection
+
+        let handleConnectFailure: () -> Void = { [weak self, weak link] in
+            guard let self, let link, !link.isClosed, !link.isReady, link.connection === connection else { return }
+            if let pierceToken {
+                self.sendServer(.cantConnectToPeer(token: pierceToken, username: link.username))
+                self.closePeer(link, failed: true)
+            } else {
+                // Direct failed: invalidate cached address and try indirect ConnectToPeer if possible.
+                self.addressCache.removeValue(forKey: link.username)
+                connection.stateUpdateHandler = nil
+                connection.cancel()
+                link.connection = nil
+                self.attemptIndirectPeerOrFail(link, allowIndirectFallback: allowIndirectFallback)
+            }
+        }
 
         connection.stateUpdateHandler = { [weak self, weak link] state in
             guard let self, let link, !link.isClosed, link.connection === connection else { return }
             switch state {
             case .ready:
                 self.attachReadyPeer(link, connection: connection, sendFirstFrame: firstFrame, leftover: Data())
-            case .waiting, .failed:
-                if let pierceToken {
-                    self.sendServer(.cantConnectToPeer(token: pierceToken, username: link.username))
-                    self.closePeer(link, failed: true)
-                } else {
-                    // Direct failed: invalidate cached address and try indirect ConnectToPeer if possible.
-                    self.addressCache.removeValue(forKey: link.username)
-                    connection.stateUpdateHandler = nil
-                    connection.cancel()
-                    link.connection = nil
-                    self.attemptIndirectPeerOrFail(link, allowIndirectFallback: allowIndirectFallback)
+            case .waiting:
+                self.queue.asyncAfter(deadline: .now() + 4) {
+                    handleConnectFailure()
                 }
+            case .failed:
+                handleConnectFailure()
             default:
                 break
             }
@@ -1550,19 +1575,10 @@ public final class SoulseekClient: @unchecked Sendable {
             sendToPeer(username, [.transferResponse(token: token, allowed: false, reason: "Cancelled", size: nil)])
             return
         case .failed:
-            // Only accept late offers if the transfer wasn't manually aborted/paused.
+            // Accept late offers from a peer whose queue finally opened for us.
             break
         default:
             break
-        }
-
-        let activeTransferring = downloads.values.filter {
-            $0.state == .transferring || $0.state == .starting
-        }.count
-        if activeTransferring >= maxConcurrentDownloads {
-            // Politely ask the peer to keep us queued until a download slot frees up.
-            sendToPeer(username, [.transferResponse(token: token, allowed: false, reason: "Queued", size: nil)])
-            return
         }
 
         if let size { record.size = size }
@@ -1575,7 +1591,7 @@ public final class SoulseekClient: @unchecked Sendable {
         sendToPeer(username, [.transferResponse(token: token, allowed: true, reason: nil, size: nil)])
         emitDownload(id)
 
-        queue.asyncAfter(deadline: .now() + 45) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 60) { [weak self] in
             guard let self, let current = self.downloads[id], current.token == token, current.state == .starting else { return }
             self.downloadsByToken.removeValue(forKey: self.tokenKey(username, token))
             self.downloads[id]?.token = nil
@@ -1591,24 +1607,32 @@ public final class SoulseekClient: @unchecked Sendable {
             sendServer(.cantConnectToPeer(token: token, username: username))
             return
         }
-        let connection = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: Self.tcpParameters(timeout: 8))
+        let connection = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: Self.tcpParameters(timeout: 10))
         let link = FileLink(username: username, connection: connection, role: .awaitingToken)
         fileLinks[ObjectIdentifier(link)] = link
+        var becameReady = false
 
         connection.stateUpdateHandler = { [weak self, weak link] state in
             guard let self, let link, !link.isClosed else { return }
             switch state {
             case .ready:
+                becameReady = true
                 connection.send(content: PeerInitMessage.pierceFirewall(token: token).frame,
                                 completion: .contentProcessed { _ in })
                 self.receive(on: connection, onData: { [weak self, weak link] data in
                     guard let self, let link else { return }
                     self.handleFileData(link, data)
-                }, onClose: { [weak self, weak link] _ in
+                }, onClose: { [weak self, weak link] error in
                     guard let self, let link else { return }
-                    self.closeFile(link, reason: "Connection closed early")
+                    self.closeFile(link, reason: error == nil ? nil : "Connection closed early")
                 })
-            case .waiting, .failed:
+            case .waiting:
+                self.queue.asyncAfter(deadline: .now() + 6) { [weak self, weak link] in
+                    guard let self, let link, !link.isClosed, !becameReady else { return }
+                    self.sendServer(.cantConnectToPeer(token: token, username: username))
+                    self.closeFile(link, reason: "Couldn't open file connection")
+                }
+            case .failed:
                 self.sendServer(.cantConnectToPeer(token: token, username: username))
                 self.closeFile(link, reason: "Couldn't open file connection")
             default:
@@ -1778,14 +1802,30 @@ public final class SoulseekClient: @unchecked Sendable {
         switch link.role {
         case let .downloading(id):
             guard let record = downloads[id], record.state == .transferring else { return }
-            let percent = record.size > 0 ? Int(Double(record.received) / Double(record.size) * 100) : 0
             if let token = record.token {
                 downloadsByToken.removeValue(forKey: tokenKey(id.username, token))
                 downloads[id]?.token = nil
             }
             downloads[id]?.sentToPeer = false
             downloads[id]?.bytesPerSecond = 0
-            downloads[id]?.state = .failed("\(reason ?? "Interrupted") at \(percent)%")
+
+            // Unknown-size transfer that closed cleanly at EOF: finalize as completed.
+            if record.size == 0, record.received > 0, reason == nil {
+                downloads[id]?.size = record.received
+                do {
+                    let destination = try moveToLibrary(partialURL(for: id), id: id)
+                    downloads[id]?.state = .completed(destination)
+                    log("Finished \(destination.lastPathComponent)")
+                } catch {
+                    downloads[id]?.state = .failed("Couldn't save file: \(error.localizedDescription)")
+                }
+                emitDownload(id)
+                pumpDownloads()
+                return
+            }
+
+            let percent = record.size > 0 ? Int(Double(record.received) / Double(record.size) * 100) : 0
+            downloads[id]?.state = .failed("\(reason ?? "Connection closed early") at \(percent)%")
             emitDownload(id)
             pumpDownloads()
         case let .uploading(token):

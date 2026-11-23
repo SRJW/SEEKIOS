@@ -17,7 +17,6 @@ struct SettingsView: View {
     @AppStorage(AppSettings.sharingEnabledKey) private var sharingEnabled = false
     @AppStorage(AppSettings.shareOnWiFiOnlyKey) private var shareOnWiFiOnly = true
     @AppStorage(AppSettings.distributedSearchKey) private var distributedSearch = true
-    @AppStorage(AppSettings.keepAudioInLibraryKey) private var keepAudioInLibrary = true
     @AppStorage(AppSettings.downloadFolderStructureKey) private var folderStructureRaw = DownloadFolderStructure.album.rawValue
     @AppStorage(AppSettings.maxConcurrentDownloadsKey) private var maxConcurrentDownloads = 4
     @AppStorage(AppSettings.maxConcurrentUploadsKey) private var maxConcurrentUploads = 2
@@ -26,7 +25,6 @@ struct SettingsView: View {
     @State private var username = ""
     @State private var didSeedUsername = false
     @State private var password = ""
-    @State private var showFolderPicker = false
     @State private var showDownloadsFolderSheet = false
     @State private var showPeersSheet = false
     @State private var storage: StorageBreakdown?
@@ -157,42 +155,22 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    HStack {
-                        Label("Default Folder", systemImage: "folder.fill")
-                        Spacer()
-                        Text(soulseek.currentDownloadFolderDisplayName)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    Button {
-                        showFolderPicker = true
-                    } label: {
-                        Label("Choose Default Download Folder…", systemImage: "folder.badge.gearshape")
-                    }
-                    Button {
-                        showDownloadsFolderSheet = true
-                    } label: {
-                        Label("Browse Download Folder", systemImage: "folder.badge.magnifyingglass")
-                    }
-                    Picker("Subfolder Layout", selection: folderStructure) {
+                    LabeledContent("Music", value: "Seekios › Music")
+                    LabeledContent("Videos & Files", value: "Seekios › Downloads")
+                    Picker("Downloads Subfolders", selection: folderStructure) {
                         ForEach(DownloadFolderStructure.allCases) { option in
                             Text(option.label).tag(option)
                         }
                     }
-                    if soulseek.customDownloadDirectory != nil {
-                        Toggle("Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
-                        if soulseek.saveAllToCustomFolder {
-                            Toggle("Also Keep Copy in Seekios Library", isOn: $keepAudioInLibrary)
-                        }
-                        Button("Reset Download Folder to Default", role: .destructive) {
-                            soulseek.resetDownloadFolderToDefault()
-                        }
+                    Button {
+                        showDownloadsFolderSheet = true
+                    } label: {
+                        Label("Browse Downloaded Files", systemImage: "folder.badge.magnifyingglass")
                     }
                 } header: {
-                    Text("Download Location")
+                    Text("App Folders")
                 } footer: {
-                    Text("Layout: \((DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album).example). iOS grants persistent access to any writable folder you select in On My iPhone or iCloud Drive.")
+                    Text("Audio goes straight to your Library in On My iPhone › Seekios › Music. Videos and other files are saved to On My iPhone › Seekios › Downloads (\((DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album).example)) and are visible in the iOS Files app.")
                 }
 
                 Section {
@@ -262,12 +240,6 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationDestination(isPresented: $router.showWiFiTransfer) { WiFiTransferView() }
-            .sheet(isPresented: $showFolderPicker) {
-                FolderDocumentPicker { pickedURL in
-                    soulseek.setCustomDownloadFolder(pickedURL)
-                }
-                .ignoresSafeArea()
-            }
             .sheet(isPresented: $showDownloadsFolderSheet) {
                 NavigationStack {
                     LocalFolderBrowserView(folderURL: soulseek.otherDownloadsDirectory)
@@ -275,17 +247,6 @@ struct SettingsView: View {
             }
             .sheet(isPresented: $showPeersSheet) {
                 PeersManagerSheet()
-            }
-            .alert(
-                "Folder Unavailable",
-                isPresented: Binding(
-                    get: { soulseek.downloadLocationError != nil },
-                    set: { if !$0 { soulseek.downloadLocationError = nil } }
-                )
-            ) {
-                Button("OK", role: .cancel) {}
-            } message: {
-                Text(soulseek.downloadLocationError ?? "")
             }
             .onAppear {
                 if !didSeedUsername {
