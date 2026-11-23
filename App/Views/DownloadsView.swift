@@ -9,21 +9,94 @@ struct LocalFolderItem: Identifiable {
     var id: String { url.path }
 }
 
-private struct DownloadFolderGroup: Identifiable {
-    let id: String
-    let folderName: String
-    let folderPath: String
-    let username: String
-    let items: [DownloadItem]
+private enum TransferGroupMode: String, CaseIterable, Identifiable {
+    case folder = "folder"
+    case user = "user"
+    case flat = "flat"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .folder: return "Group by Folder"
+        case .user: return "Group by User"
+        case .flat: return "Ungrouped (Flat)"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .folder: return "Folder"
+        case .user: return "User"
+        case .flat: return "Flat"
+        }
+    }
+}
+
+private enum TransferSortMode: String, CaseIterable, Identifiable {
+    case newest = "newest"
+    case status = "status"
+    case speed = "speed"
+    case progress = "progress"
+    case size = "size"
+    case filename = "filename"
+    case user = "user"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .newest: return "Order Added"
+        case .status: return "Status"
+        case .speed: return "Speed"
+        case .progress: return "Progress"
+        case .size: return "File Size"
+        case .filename: return "Filename"
+        case .user: return "Username"
+        }
+    }
 }
 
 private enum TransferFilter: String, CaseIterable, Identifiable {
     case all = "All"
-    case active = "Active"
+    case downloading = "Downloading"
+    case queued = "Queued"
     case paused = "Paused"
     case failed = "Failed"
-    case done = "Done"
+    case finished = "Finished"
+
     var id: String { rawValue }
+}
+
+private struct TransferGroup: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let username: String
+    let folderPath: String
+    let isUserGroup: Bool
+    let items: [DownloadItem]
+
+    var totalBytes: UInt64 { items.reduce(0) { $0 + $1.size } }
+    var receivedBytes: UInt64 {
+        items.reduce(0) { acc, item in
+            acc + (item.isCompleted ? item.size : min(item.received, item.size))
+        }
+    }
+    var progress: Double {
+        totalBytes > 0 ? min(max(Double(receivedBytes) / Double(totalBytes), 0), 1) : 0
+    }
+    var speed: Double {
+        items.reduce(0) { acc, item in
+            acc + (item.state == .transferring ? item.bytesPerSecond : 0)
+        }
+    }
+    var completedCount: Int { items.filter(\.isCompleted).count }
+    var activeCount: Int { items.filter(\.isActive).count }
+    var pausedCount: Int { items.filter(\.isPaused).count }
+    var failedCount: Int { items.filter(\.isFailed).count }
+    var remainingBytes: UInt64 { items.filter(\.isActive).reduce(0) { $0 + $1.remainingBytes } }
+    var etaText: String? { Formatting.eta(remainingBytes: remainingBytes, bytesPerSecond: speed) }
 }
 
 struct DownloadsView: View {
@@ -31,194 +104,90 @@ struct DownloadsView: View {
     @EnvironmentObject private var transfers: TransfersStore
     @EnvironmentObject private var router: AppRouter
 
+    @AppStorage("downloads.groupMode") private var groupModeRaw = TransferGroupMode.folder.rawValue
+    @AppStorage("downloads.sortMode") private var sortModeRaw = TransferSortMode.newest.rawValue
+
     @State private var selection = Set<DownloadID>()
     @State private var editMode: EditMode = .inactive
+    @State private var collapsedGroups = Set<String>()
     @State private var previewItem: QuickLookPreviewItem?
     @State private var folderToBrowse: LocalFolderItem?
     @State private var browsePeerTarget: BrowseTarget?
     @State private var showFolderPicker = false
+    @State private var showFolderOptions = false
     @State private var showNewFolderAlert = false
     @State private var newFolderName = ""
     @State private var filter: TransferFilter = .all
     @State private var searchText = ""
 
+    private var groupMode: TransferGroupMode {
+        TransferGroupMode(rawValue: groupModeRaw) ?? .folder
+    }
+
+    private var sortMode: TransferSortMode {
+        TransferSortMode(rawValue: sortModeRaw) ?? .newest
+    }
+
     var body: some View {
         let allDownloads = transfers.downloads
+        let downloadingCount = allDownloads.filter { $0.state == .transferring || $0.state == .starting }.count
+        let queuedCount = allDownloads.filter {
+            switch $0.state {
+            case .requesting, .queued: return true
+            default: return false
+            }
+        }.count
         let activeList = allDownloads.filter(\.isActive)
         let pausedList = allDownloads.filter(\.isPaused)
         let failedList = allDownloads.filter(\.isFailed)
         let completedList = allDownloads.filter(\.isCompleted)
-        let filteredDownloads = applyFilter(allDownloads)
-        let grouped = groupByFolder(filteredDownloads)
+        let filteredDownloads = sortItems(applyFilter(allDownloads))
+        let groups = buildGroups(filteredDownloads)
         let totalRemainingBytes = activeList.reduce(UInt64(0)) { $0 + $1.remainingBytes }
         let globalETA = Formatting.eta(remainingBytes: totalRemainingBytes, bytesPerSecond: transfers.totalDownloadSpeed)
         let resumableSelectedCount = allDownloads.filter { selection.contains($0.id) && ($0.isFailed || $0.isPaused) }.count
 
         NavigationStack {
             List(selection: $selection) {
-                // 1. Live Speed & ETA summary bar (Nicotine+-style)
-                if !activeList.isEmpty || transfers.activeUploadCount > 0 {
-                    Section {
-                        HStack(spacing: 14) {
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 10) {
-                                    Label(
-                                        transfers.totalDownloadSpeed > 0 ? Formatting.speed(transfers.totalDownloadSpeed) : "0 KB/s",
-                                        systemImage: "arrow.down.circle.fill"
-                                    )
-                                    .foregroundStyle(.tint)
-                                    if transfers.activeUploadCount > 0 || transfers.totalUploadSpeed > 0 {
-                                        Label(
-                                            transfers.totalUploadSpeed > 0 ? Formatting.speed(transfers.totalUploadSpeed) : "0 KB/s",
-                                            systemImage: "arrow.up.circle.fill"
-                                        )
-                                        .foregroundStyle(.green)
-                                    }
-                                }
-                                .font(.subheadline.weight(.semibold).monospacedDigit())
-
-                                HStack(spacing: 6) {
-                                    Text("\(activeList.count) active")
-                                    if let globalETA {
-                                        Text("· ETA \(globalETA)")
-                                    }
-                                    if totalRemainingBytes > 0 {
-                                        Text("· \(Formatting.bytes(totalRemainingBytes)) left")
-                                    }
-                                }
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if !activeList.isEmpty {
-                                Button {
-                                    soulseek.pauseAllActive()
-                                } label: {
-                                    Label("Pause All", systemImage: "pause.circle")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-
-                // 2. Destination controls
+                // 1. Compact Nicotine+ Status + Default Download Folder Strip
                 Section {
-                    HStack(spacing: 12) {
-                        Image(systemName: "folder.fill.badge.gearshape")
-                            .font(.title3)
-                            .foregroundStyle(.tint)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Save Location")
-                                .font(.subheadline.weight(.semibold))
-                            Text(soulseek.currentDownloadFolderDisplayName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer()
-                        Button("Choose") {
-                            showFolderPicker = true
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    }
-
-                    HStack(spacing: 16) {
-                        Button {
-                            folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
-                        } label: {
-                            Label("Show Downloads Folder", systemImage: "folder.fill")
-                                .font(.subheadline)
-                        }
-                        .buttonStyle(.borderless)
-
-                        Spacer()
-
-                        Button {
-                            newFolderName = ""
-                            showNewFolderAlert = true
-                        } label: {
-                            Label("New Folder…", systemImage: "folder.badge.plus")
-                                .font(.caption.weight(.semibold))
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-
-                    if soulseek.customDownloadDirectory != nil {
-                        Toggle("Also Copy Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
-                        Button("Reset to Default App Folder", role: .destructive) {
-                            soulseek.resetDownloadFolderToDefault()
-                        }
-                        .font(.footnote)
-                    }
-                } header: {
-                    Text("Download Destination")
+                    statusAndDestinationHeader(
+                        activeCount: activeList.count,
+                        downloadingCount: downloadingCount,
+                        queuedCount: queuedCount,
+                        pausedCount: pausedList.count,
+                        failedCount: failedList.count,
+                        remainingBytes: totalRemainingBytes,
+                        globalETA: globalETA
+                    )
                 }
 
-                // 3. Filter & Quick Actions bar
+                // 2. Horizontal Nicotine+ Status Filter Chips
                 if !allDownloads.isEmpty {
                     Section {
-                        Picker("Filter", selection: $filter) {
-                            ForEach(TransferFilter.allCases) { f in
-                                Text(filterLabel(f, total: allDownloads.count, active: activeList.count, paused: pausedList.count, failed: failedList.count, done: completedList.count))
-                                    .tag(f)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-
-                        HStack(spacing: 8) {
-                            Image(systemName: "magnifyingglass")
-                                .foregroundStyle(.secondary)
-                            TextField("Filter by filename, folder or peer…", text: $searchText)
-                                .textInputAutocapitalization(.never)
-                                .autocorrectionDisabled()
-                            if !searchText.isEmpty {
-                                Button { searchText = "" } label: {
-                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(TransferFilter.allCases) { option in
+                                    let count = countFor(
+                                        option,
+                                        total: allDownloads.count,
+                                        downloading: downloadingCount,
+                                        queued: queuedCount,
+                                        paused: pausedList.count,
+                                        failed: failedList.count,
+                                        finished: completedList.count
+                                    )
+                                    filterChip(option, count: count)
                                 }
-                                .buttonStyle(.plain)
                             }
+                            .padding(.vertical, 2)
                         }
-
-                        if !failedList.isEmpty || !pausedList.isEmpty || !completedList.isEmpty {
-                            HStack(spacing: 10) {
-                                let resumableCount = failedList.count + pausedList.count
-                                if resumableCount > 0 {
-                                    Button {
-                                        soulseek.retryAllFailed()
-                                    } label: {
-                                        Label("Resume All (\(resumableCount))", systemImage: "play.circle.fill")
-                                            .font(.caption.weight(.semibold))
-                                    }
-                                    .buttonStyle(.borderedProminent)
-                                    .tint(.orange)
-                                }
-
-                                if !completedList.isEmpty {
-                                    Button {
-                                        soulseek.clearCompleted()
-                                    } label: {
-                                        Label("Clear Done", systemImage: "checkmark.circle")
-                                            .font(.caption.weight(.semibold))
-                                    }
-                                    .buttonStyle(.bordered)
-                                }
-
-                                Spacer()
-                                Text("\(completedList.count) done")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+                        .listRowInsets(EdgeInsets(top: 6, leading: 14, bottom: 6, trailing: 14))
+                        .listRowBackground(Color.clear)
                     }
                 }
 
-                // 4. Uploads section (with state, speed, abort & clear)
+                // 3. Uploads Section (only when active or present — hidden when sharing is off)
                 if !transfers.uploads.isEmpty {
                     Section {
                         ForEach(transfers.uploads) { upload in
@@ -226,7 +195,7 @@ struct DownloadsView: View {
                         }
                     } header: {
                         HStack {
-                            Text("Uploads (\(transfers.uploads.count))")
+                            Label("Uploads (\(transfers.uploads.count))", systemImage: "arrow.up.circle")
                             Spacer()
                             if transfers.uploads.contains(where: { !$0.isActive }) {
                                 Button("Clear Finished") {
@@ -239,64 +208,42 @@ struct DownloadsView: View {
                     }
                 }
 
-                // 5. Grouped Downloads (unique ID per user + full remote folder path)
-                if grouped.isEmpty {
+                // 4. Downloads Tree / List (Nicotine+ Folder / User / Flat)
+                if filteredDownloads.isEmpty {
                     Section {
                         EmptyStateView(
-                            title: allDownloads.isEmpty ? "No Transfers" : "No Matching Transfers",
+                            title: allDownloads.isEmpty ? "No Downloads Yet" : "No Matching Transfers",
                             message: allDownloads.isEmpty
-                                ? "Files you download from Search appear here. Paused and interrupted transfers keep their partial data on disk for resuming."
-                                : "Try switching the transfer filter or clearing your search.",
+                                ? "Search for music or files to queue downloads. Interrupted or paused files keep their partial data so you can resume anytime."
+                                : "Try another status filter or clear your search query.",
                             systemImage: "arrow.down.circle"
                         )
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 24)
                         .listRowBackground(Color.clear)
                     }
+                } else if groupMode == .flat {
+                    Section {
+                        ForEach(filteredDownloads) { item in
+                            downloadRowView(item, showPeer: true)
+                        }
+                    } header: {
+                        HStack {
+                            Text("All Files (\(filteredDownloads.count))")
+                            Spacer()
+                            Text(sortMode.label)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                 } else {
-                    ForEach(grouped) { group in
+                    ForEach(groups) { group in
+                        let isCollapsed = collapsedGroups.contains(group.id)
                         Section {
-                            ForEach(group.items) { item in
-                                DownloadRow(
-                                    item: item,
-                                    onPreview: { url in previewItem = QuickLookPreviewItem(url: url) },
-                                    onShowFolder: { folderURL in folderToBrowse = LocalFolderItem(url: folderURL) },
-                                    onBrowsePeer: { target in browsePeerTarget = target }
-                                )
-                                .tag(item.id)
-                            }
-                        } header: {
-                            HStack {
-                                Label(group.folderName, systemImage: "folder.fill")
-                                    .font(.subheadline.weight(.semibold))
-                                    .lineLimit(1)
-                                Spacer()
-                                Button {
-                                    folderToBrowse = LocalFolderItem(url: localContainerFolder(for: group))
-                                } label: {
-                                    Label("Folder", systemImage: "folder.badge.magnifyingglass")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .textCase(nil)
-                            }
-                        } footer: {
-                            HStack {
-                                Button {
-                                    browsePeerTarget = BrowseTarget(username: group.username, folder: group.folderPath)
-                                } label: {
-                                    Label("From \(group.username)", systemImage: "person")
-                                        .font(.caption2)
-                                }
-                                .buttonStyle(.plain)
-
-                                Spacer()
-
-                                let hasResumable = group.items.contains { $0.isFailed || $0.isPaused }
-                                if hasResumable {
-                                    Button("Resume Folder") {
-                                        soulseek.retry(Set(group.items.map(\.id)))
-                                    }
-                                    .font(.caption2.weight(.semibold))
+                            groupSummaryRow(group, isCollapsed: isCollapsed)
+                            if !isCollapsed {
+                                ForEach(group.items) { item in
+                                    downloadRowView(item, showPeer: false)
                                 }
                             }
                         }
@@ -305,6 +252,7 @@ struct DownloadsView: View {
             }
             .listStyle(.insetGrouped)
             .navigationTitle("Downloads")
+            .searchable(text: $searchText, prompt: "Filter filename, folder, or user")
             .environment(\.editMode, $editMode)
             .onChange(of: allDownloads.isEmpty) { _, isEmpty in
                 if isEmpty {
@@ -322,24 +270,49 @@ struct DownloadsView: View {
                             }
                         }
                     }
+
                     Menu {
+                        Picker("Group By", selection: $groupModeRaw) {
+                            ForEach(TransferGroupMode.allCases) { mode in
+                                Text(mode.label).tag(mode.rawValue)
+                            }
+                        }
+
+                        Picker("Sort By", selection: $sortModeRaw) {
+                            ForEach(TransferSortMode.allCases) { mode in
+                                Text(mode.label).tag(mode.rawValue)
+                            }
+                        }
+
+                        if groupMode != .flat && !groups.isEmpty {
+                            Divider()
+                            Button {
+                                collapsedGroups.removeAll()
+                            } label: {
+                                Label("Expand All Groups", systemImage: "chevron.down.circle")
+                            }
+                            Button {
+                                collapsedGroups = Set(groups.map(\.id))
+                            } label: {
+                                Label("Collapse All Groups", systemImage: "chevron.right.circle")
+                            }
+                        }
+
+                        Divider()
+
+                        Button {
+                            showFolderOptions = true
+                        } label: {
+                            Label("Download Folder Settings…", systemImage: "folder.badge.gearshape")
+                        }
                         Button {
                             folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
                         } label: {
-                            Label("Show Downloads Folder", systemImage: "folder")
+                            Label("Browse Download Folder", systemImage: "folder")
                         }
-                        Button {
-                            showFolderPicker = true
-                        } label: {
-                            Label("Change Download Location…", systemImage: "folder.badge.gearshape")
-                        }
-                        Button {
-                            newFolderName = ""
-                            showNewFolderAlert = true
-                        } label: {
-                            Label("Create New Download Folder…", systemImage: "folder.badge.plus")
-                        }
+
                         Divider()
+
                         if !activeList.isEmpty {
                             Button {
                                 soulseek.pauseAllActive()
@@ -347,18 +320,25 @@ struct DownloadsView: View {
                                 Label("Pause All Active", systemImage: "pause.circle")
                             }
                         }
-                        if !failedList.isEmpty || !pausedList.isEmpty {
+                        if !failedList.isEmpty {
+                            Button {
+                                soulseek.retryOnlyFailed()
+                            } label: {
+                                Label("Retry Failed (\(failedList.count))", systemImage: "arrow.clockwise")
+                            }
+                        }
+                        if !pausedList.isEmpty || !failedList.isEmpty {
                             Button {
                                 soulseek.retryAllFailed()
                             } label: {
-                                Label("Resume All Paused / Failed", systemImage: "arrow.clockwise")
+                                Label("Resume All Paused & Failed", systemImage: "play.circle")
                             }
                         }
                         if !completedList.isEmpty {
                             Button {
                                 soulseek.clearCompleted()
                             } label: {
-                                Label("Clear Completed", systemImage: "checkmark.circle")
+                                Label("Clear Finished (\(completedList.count))", systemImage: "checkmark.circle")
                             }
                         }
                         if !failedList.isEmpty {
@@ -372,7 +352,7 @@ struct DownloadsView: View {
                             Button(role: .destructive) {
                                 soulseek.cancelAllActive()
                             } label: {
-                                Label("Cancel & Delete Active", systemImage: "stop.circle")
+                                Label("Abort All Active", systemImage: "stop.circle")
                             }
                         }
                     } label: {
@@ -420,14 +400,48 @@ struct DownloadsView: View {
                 }
                 .ignoresSafeArea()
             }
+            .sheet(isPresented: $showFolderOptions) {
+                DownloadFolderOptionsSheet(
+                    onPickFolder: {
+                        showFolderOptions = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            showFolderPicker = true
+                        }
+                    },
+                    onCreateSubfolder: {
+                        showFolderOptions = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            newFolderName = ""
+                            showNewFolderAlert = true
+                        }
+                    },
+                    onBrowseFolder: {
+                        showFolderOptions = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
+                        }
+                    }
+                )
+            }
             .alert("Create New Download Folder", isPresented: $showNewFolderAlert) {
-                TextField("Folder name (e.g. Albums, Archives)", text: $newFolderName)
+                TextField("Folder name (e.g. Albums, Vinyl)", text: $newFolderName)
                 Button("Create & Select") {
                     soulseek.createAndSelectSubfolder(named: newFolderName)
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text("Creates a folder inside On My iPhone › Seekios and sets it as your active download folder.")
+                Text("Creates a folder inside On My iPhone › Seekios and sets it as your default download folder.")
+            }
+            .alert(
+                "Folder Unavailable",
+                isPresented: Binding(
+                    get: { soulseek.downloadLocationError != nil },
+                    set: { if !$0 { soulseek.downloadLocationError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(soulseek.downloadLocationError ?? "")
             }
             .fullScreenCover(item: $previewItem) { item in
                 QuickLookPreview(url: item.url)
@@ -436,13 +450,333 @@ struct DownloadsView: View {
         }
     }
 
-    private func filterLabel(_ filter: TransferFilter, total: Int, active: Int, paused: Int, failed: Int, done: Int) -> String {
-        switch filter {
-        case .all: return "All"
-        case .active: return active > 0 ? "Active (\(active))" : "Active"
-        case .paused: return paused > 0 ? "Paused (\(paused))" : "Paused"
-        case .failed: return failed > 0 ? "Failed (\(failed))" : "Failed"
-        case .done: return done > 0 ? "Done (\(done))" : "Done"
+    // MARK: - Nicotine+ Header & Filter Chips
+
+    @ViewBuilder
+    private func statusAndDestinationHeader(
+        activeCount: Int,
+        downloadingCount: Int,
+        queuedCount: Int,
+        pausedCount: Int,
+        failedCount: Int,
+        remainingBytes: UInt64,
+        globalETA: String?
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Speed & queue strip
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 10) {
+                        Label(
+                            transfers.totalDownloadSpeed > 0 ? Formatting.speed(transfers.totalDownloadSpeed) : "0 KB/s",
+                            systemImage: "arrow.down.circle.fill"
+                        )
+                        .foregroundStyle(transfers.totalDownloadSpeed > 0 ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+
+                        if transfers.activeUploadCount > 0 || transfers.totalUploadSpeed > 0 {
+                            Label(
+                                transfers.totalUploadSpeed > 0 ? Formatting.speed(transfers.totalUploadSpeed) : "0 KB/s",
+                                systemImage: "arrow.up.circle.fill"
+                            )
+                            .foregroundStyle(.green)
+                        }
+                    }
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+
+                    HStack(spacing: 5) {
+                        if downloadingCount > 0 {
+                            Text("\(downloadingCount) downloading")
+                        }
+                        if queuedCount > 0 {
+                            Text(downloadingCount > 0 ? "· \(queuedCount) queued" : "\(queuedCount) queued")
+                        }
+                        if activeCount == 0 {
+                            if pausedCount > 0 || failedCount > 0 {
+                                Text("\(pausedCount) paused · \(failedCount) failed")
+                            } else {
+                                Text("Idle")
+                            }
+                        }
+                        if let globalETA {
+                            Text("· ETA \(globalETA)")
+                        }
+                        if remainingBytes > 0 {
+                            Text("· \(Formatting.bytes(remainingBytes)) left")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                }
+
+                Spacer(minLength: 4)
+
+                if activeCount > 0 {
+                    Button {
+                        soulseek.pauseAllActive()
+                    } label: {
+                        Label("Pause", systemImage: "pause.fill")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                } else if pausedCount + failedCount > 0 {
+                    Button {
+                        soulseek.retryAllFailed()
+                    } label: {
+                        Label("Resume", systemImage: "play.fill")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                }
+            }
+
+            Divider()
+
+            // Compact Default Download Folder bar (respects iOS sandbox via native folder picker)
+            HStack(spacing: 8) {
+                Button {
+                    folderToBrowse = LocalFolderItem(url: soulseek.otherDownloadsDirectory)
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "folder.fill")
+                            .foregroundStyle(.tint)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Default Folder")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            Text(soulseek.currentDownloadFolderDisplayName)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 4)
+
+                Button("Change") {
+                    showFolderPicker = true
+                }
+                .font(.caption.weight(.semibold))
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+
+                Button {
+                    showFolderOptions = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .accessibilityLabel("Download Folder Settings")
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func filterChip(_ option: TransferFilter, count: Int) -> some View {
+        let selected = filter == option
+        return Button {
+            filter = option
+        } label: {
+            HStack(spacing: 4) {
+                Text(option.rawValue)
+                if count > 0 {
+                    Text("\(count)")
+                        .font(.caption2.weight(.bold).monospacedDigit())
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(selected ? Color.white.opacity(0.25) : Color.secondary.opacity(0.18), in: Capsule())
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .padding(.horizontal, 11)
+            .padding(.vertical, 6)
+            .background(selected ? AnyShapeStyle(.tint) : AnyShapeStyle(Color(.secondarySystemGroupedBackground)), in: Capsule())
+            .foregroundStyle(selected ? .white : .primary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - Nicotine+ Collapsible Group Row & File Row
+
+    private func groupSummaryRow(_ group: TransferGroup, isCollapsed: Bool) -> some View {
+        let groupIDs = Set(group.items.map(\.id))
+        let peerStatus = soulseek.userStatuses[group.username.lowercased()]
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        if isCollapsed {
+                            collapsedGroups.remove(group.id)
+                        } else {
+                            collapsedGroups.insert(group.id)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                            .font(.caption.weight(.bold))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 14)
+
+                        Image(systemName: group.isUserGroup ? "person.crop.circle.fill" : "folder.fill")
+                            .font(.title3)
+                            .foregroundStyle(.tint)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(group.title)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+
+                            HStack(spacing: 5) {
+                                if let status = peerStatus {
+                                    Circle()
+                                        .fill(statusColor(status))
+                                        .frame(width: 6, height: 6)
+                                }
+                                Text(group.subtitle)
+                                Text("·")
+                                Text("\(group.completedCount)/\(group.items.count)")
+                                    .monospacedDigit()
+                                if group.speed > 0 {
+                                    Text("· \(Formatting.speed(group.speed))")
+                                        .foregroundStyle(.tint)
+                                        .monospacedDigit()
+                                }
+                                if let eta = group.etaText {
+                                    Text("· \(eta)")
+                                        .monospacedDigit()
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        }
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 4)
+
+                Menu {
+                    if group.activeCount > 0 {
+                        Button {
+                            soulseek.pause(groupIDs)
+                        } label: {
+                            Label("Pause Group", systemImage: "pause.circle")
+                        }
+                    }
+                    if group.pausedCount > 0 || group.failedCount > 0 {
+                        Button {
+                            soulseek.retry(groupIDs)
+                        } label: {
+                            Label("Resume / Retry Group", systemImage: "play.circle")
+                        }
+                    }
+                    Button {
+                        folderToBrowse = LocalFolderItem(url: localContainerFolder(for: group))
+                    } label: {
+                        Label("Open Local Folder", systemImage: "folder")
+                    }
+                    Button {
+                        browsePeerTarget = BrowseTarget(username: group.username, folder: group.isUserGroup ? "" : group.folderPath)
+                    } label: {
+                        Label("Browse \(group.username)", systemImage: "folder.badge.person.crop")
+                    }
+                    if group.completedCount > 0 {
+                        Button {
+                            soulseek.clearCompleted(in: groupIDs)
+                        } label: {
+                            Label("Clear Finished in Group", systemImage: "checkmark.circle")
+                        }
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        soulseek.remove(groupIDs, deletePartial: true)
+                    } label: {
+                        Label("Remove Group & Partials", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+
+            if group.totalBytes > 0 {
+                HStack(spacing: 8) {
+                    ProgressView(value: group.progress)
+                        .tint(groupTint(group))
+                    Text("\(Formatting.bytes(group.receivedBytes)) / \(Formatting.bytes(group.totalBytes))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func downloadRowView(_ item: DownloadItem, showPeer: Bool) -> some View {
+        DownloadRow(
+            item: item,
+            showPeer: showPeer,
+            onPreview: { url in previewItem = QuickLookPreviewItem(url: url) },
+            onShowFolder: { folderURL in folderToBrowse = LocalFolderItem(url: folderURL) },
+            onBrowsePeer: { target in browsePeerTarget = target }
+        )
+        .tag(item.id)
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            if item.isActive {
+                Button {
+                    soulseek.pause(item)
+                } label: {
+                    Label("Pause", systemImage: "pause.fill")
+                }
+                .tint(.orange)
+            } else if item.isPaused || item.isFailed {
+                Button {
+                    soulseek.retry(item)
+                } label: {
+                    Label("Resume", systemImage: "play.fill")
+                }
+                .tint(.green)
+            }
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) {
+                soulseek.cancel(item, deletePartial: true)
+            } label: {
+                Label("Remove", systemImage: "trash")
+            }
+        }
+    }
+
+    // MARK: - Filtering, Sorting & Grouping
+
+    private func countFor(
+        _ option: TransferFilter,
+        total: Int,
+        downloading: Int,
+        queued: Int,
+        paused: Int,
+        failed: Int,
+        finished: Int
+    ) -> Int {
+        switch option {
+        case .all: return total
+        case .downloading: return downloading
+        case .queued: return queued
+        case .paused: return paused
+        case .failed: return failed
+        case .finished: return finished
         }
     }
 
@@ -450,11 +784,21 @@ struct DownloadsView: View {
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return items.filter { item in
             switch filter {
-            case .all: break
-            case .active: if !item.isActive { return false }
-            case .paused: if !item.isPaused { return false }
-            case .failed: if !item.isFailed { return false }
-            case .done: if !item.isCompleted { return false }
+            case .all:
+                break
+            case .downloading:
+                if item.state != .transferring && item.state != .starting { return false }
+            case .queued:
+                switch item.state {
+                case .requesting, .queued: break
+                default: return false
+                }
+            case .paused:
+                if !item.isPaused { return false }
+            case .failed:
+                if !item.isFailed { return false }
+            case .finished:
+                if !item.isCompleted { return false }
             }
             if !trimmed.isEmpty {
                 return item.filename.lowercased().contains(trimmed)
@@ -465,24 +809,109 @@ struct DownloadsView: View {
         }
     }
 
-    private func groupByFolder(_ items: [DownloadItem]) -> [DownloadFolderGroup] {
-        var groups: [String: (folderName: String, folderPath: String, username: String, items: [DownloadItem])] = [:]
-        var order: [String] = []
-        for item in items {
-            let key = "\(item.id.username)|\(item.folderPath)"
-            if groups[key] == nil {
-                order.append(key)
-                groups[key] = (folderName: item.leafFolder, folderPath: item.folderPath, username: item.id.username, items: [])
-            }
-            groups[key]?.items.append(item)
-        }
-        return order.compactMap { key in
-            guard let g = groups[key] else { return nil }
-            return DownloadFolderGroup(id: key, folderName: g.folderName, folderPath: g.folderPath, username: g.username, items: g.items)
+    private func statusRank(_ state: DownloadState) -> Int {
+        switch state {
+        case .transferring: return 0
+        case .starting: return 1
+        case .queued: return 2
+        case .requesting: return 3
+        case .paused: return 4
+        case .failed: return 5
+        case .completed: return 6
         }
     }
 
-    private func localContainerFolder(for group: DownloadFolderGroup) -> URL {
+    private func sortItems(_ items: [DownloadItem]) -> [DownloadItem] {
+        switch sortMode {
+        case .newest:
+            return items
+        case .status:
+            return items.sorted {
+                let lhs = statusRank($0.state), rhs = statusRank($1.state)
+                if lhs != rhs { return lhs < rhs }
+                return $0.filename.localizedStandardCompare($1.filename) == .orderedAscending
+            }
+        case .speed:
+            return items.sorted {
+                if $0.bytesPerSecond != $1.bytesPerSecond { return $0.bytesPerSecond > $1.bytesPerSecond }
+                return $0.progress > $1.progress
+            }
+        case .progress:
+            return items.sorted { $0.progress > $1.progress }
+        case .size:
+            return items.sorted { $0.size > $1.size }
+        case .filename:
+            return items.sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
+        case .user:
+            return items.sorted {
+                let cmp = $0.id.username.localizedCaseInsensitiveCompare($1.id.username)
+                if cmp != .orderedSame { return cmp == .orderedAscending }
+                return $0.filename.localizedStandardCompare($1.filename) == .orderedAscending
+            }
+        }
+    }
+
+    private func buildGroups(_ items: [DownloadItem]) -> [TransferGroup] {
+        var bucket: [String: (title: String, subtitle: String, username: String, folderPath: String, isUser: Bool, items: [DownloadItem])] = [:]
+        var order: [String] = []
+        for item in items {
+            let key: String
+            let title: String
+            let subtitle: String
+            let isUser: Bool
+            switch groupMode {
+            case .folder:
+                key = "\(item.id.username)|\(item.folderPath)"
+                title = item.leafFolder
+                subtitle = item.id.username
+                isUser = false
+            case .user:
+                key = "user|\(item.id.username.lowercased())"
+                title = item.id.username
+                subtitle = "Peer"
+                isUser = true
+            case .flat:
+                key = "flat"
+                title = "All Files"
+                subtitle = ""
+                isUser = false
+            }
+            if bucket[key] == nil {
+                order.append(key)
+                bucket[key] = (title: title, subtitle: subtitle, username: item.id.username, folderPath: item.folderPath, isUser: isUser, items: [])
+            }
+            bucket[key]?.items.append(item)
+        }
+        return order.compactMap { key in
+            guard let g = bucket[key] else { return nil }
+            return TransferGroup(
+                id: key,
+                title: g.title,
+                subtitle: g.subtitle,
+                username: g.username,
+                folderPath: g.folderPath,
+                isUserGroup: g.isUser,
+                items: g.items
+            )
+        }
+    }
+
+    private func statusColor(_ status: UserStatus) -> Color {
+        switch status {
+        case .online: return .green
+        case .away: return .orange
+        case .offline: return .secondary
+        }
+    }
+
+    private func groupTint(_ group: TransferGroup) -> AnyShapeStyle {
+        if group.completedCount == group.items.count { return AnyShapeStyle(Color.green) }
+        if group.activeCount > 0 { return AnyShapeStyle(.tint) }
+        if group.failedCount > 0 || group.pausedCount > 0 { return AnyShapeStyle(Color.orange) }
+        return AnyShapeStyle(Color.secondary)
+    }
+
+    private func localContainerFolder(for group: TransferGroup) -> URL {
         for item in group.items {
             if case let .completed(url) = item.state {
                 let parent = url.deletingLastPathComponent()
@@ -491,11 +920,93 @@ struct DownloadsView: View {
                 }
             }
         }
-        let candidate = soulseek.otherDownloadsDirectory.appendingPathComponent(group.folderName, isDirectory: true)
+        let candidate = soulseek.otherDownloadsDirectory.appendingPathComponent(group.title, isDirectory: true)
         if FileManager.default.fileExists(atPath: candidate.path) {
             return candidate
         }
         return soulseek.otherDownloadsDirectory
+    }
+}
+
+private struct DownloadFolderOptionsSheet: View {
+    @EnvironmentObject private var soulseek: SoulseekModel
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(AppSettings.keepAudioInLibraryKey) private var keepAudioInLibrary = true
+    @AppStorage(AppSettings.downloadFolderStructureKey) private var folderStructureRaw = DownloadFolderStructure.album.rawValue
+
+    let onPickFolder: () -> Void
+    let onCreateSubfolder: () -> Void
+    let onBrowseFolder: () -> Void
+
+    private var folderStructure: Binding<DownloadFolderStructure> {
+        Binding(
+            get: { DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album },
+            set: { folderStructureRaw = $0.rawValue }
+        )
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 12) {
+                        Image(systemName: "folder.fill")
+                            .font(.title2)
+                            .foregroundStyle(.tint)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Current Default Folder")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Text(soulseek.currentDownloadFolderDisplayName)
+                                .font(.subheadline.weight(.semibold))
+                        }
+                    }
+
+                    Button(action: onPickFolder) {
+                        Label("Choose Folder in Files / iCloud…", systemImage: "folder.badge.gearshape")
+                    }
+                    Button(action: onCreateSubfolder) {
+                        Label("Create Subfolder in Seekios…", systemImage: "folder.badge.plus")
+                    }
+                    Button(action: onBrowseFolder) {
+                        Label("Browse Download Folder", systemImage: "folder.badge.magnifyingglass")
+                    }
+                } header: {
+                    Text("Default Download Location")
+                } footer: {
+                    Text("Because of iOS sandboxing, picking a folder via the system picker grants persistent write access to any writable folder on On My iPhone or iCloud Drive.")
+                }
+
+                Section {
+                    Picker("Subfolder Layout", selection: folderStructure) {
+                        ForEach(DownloadFolderStructure.allCases) { option in
+                            Text(option.label).tag(option)
+                        }
+                    }
+                    if soulseek.customDownloadDirectory != nil {
+                        Toggle("Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
+                        if soulseek.saveAllToCustomFolder {
+                            Toggle("Also Keep Copy in Seekios Library", isOn: $keepAudioInLibrary)
+                        }
+                        Button("Reset to Default App Folder", role: .destructive) {
+                            soulseek.resetDownloadFolderToDefault()
+                        }
+                    }
+                } header: {
+                    Text("File Organization")
+                } footer: {
+                    Text("Example: \((DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album).example)")
+                }
+            }
+            .navigationTitle("Download Folder")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
     }
 }
 
@@ -569,6 +1080,7 @@ private struct UploadRow: View {
 
 struct DownloadRow: View {
     let item: DownloadItem
+    var showPeer: Bool = false
     let onPreview: (URL) -> Void
     let onShowFolder: (URL) -> Void
     let onBrowsePeer: (BrowseTarget) -> Void
@@ -581,9 +1093,10 @@ struct DownloadRow: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: iconForExtension(item.fileExtension))
-                    .font(.title3)
+                    .font(.body)
                     .foregroundStyle(.tint)
-                    .frame(width: 26)
+                    .frame(width: 22)
+                    .padding(.top, 2)
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(item.filename)
@@ -591,6 +1104,13 @@ struct DownloadRow: View {
                         .lineLimit(2)
 
                     statusSubtitle
+
+                    if showPeer {
+                        Text("\(item.id.username) · \(item.leafFolder)")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                            .lineLimit(1)
+                    }
                 }
 
                 Spacer()
@@ -607,15 +1127,23 @@ struct DownloadRow: View {
         .contextMenu {
             if case let .completed(url) = item.state {
                 Button {
-                    onPreview(url)
+                    let libTrack = item.libraryURL.flatMap { library.track(at: $0) } ?? library.track(at: url)
+                    if let track = libTrack {
+                        player.play([track])
+                    } else {
+                        onPreview(url)
+                    }
                 } label: {
-                    Label("Preview / Open File", systemImage: "eye")
+                    Label(
+                        LibraryStore.audioExtensions.contains(item.fileExtension) ? "Play / Open File" : "Preview / Open File",
+                        systemImage: LibraryStore.audioExtensions.contains(item.fileExtension) ? "play.circle" : "eye"
+                    )
                 }
 
                 Button {
                     onShowFolder(url.deletingLastPathComponent())
                 } label: {
-                    Label("Show Container Folder", systemImage: "folder")
+                    Label("Open Container Folder", systemImage: "folder")
                 }
 
                 ShareLink(item: url) {
@@ -656,6 +1184,12 @@ struct DownloadRow: View {
             }
 
             Button {
+                onBrowsePeer(BrowseTarget(username: item.id.username, folder: ""))
+            } label: {
+                Label("Browse All Files from \(item.id.username)", systemImage: "externaldrive.connected.to.line.below")
+            }
+
+            Button {
                 soulseek.toggleFavoriteUser(item.id.username)
             } label: {
                 Label(
@@ -668,6 +1202,20 @@ struct DownloadRow: View {
                 soulseek.toggleBlockedUser(item.id.username)
             } label: {
                 Label("Block \(item.id.username)", systemImage: "hand.raised")
+            }
+
+            Divider()
+
+            Button {
+                UIPasteboard.general.string = item.filename
+            } label: {
+                Label("Copy Filename", systemImage: "doc.on.doc")
+            }
+
+            Button {
+                UIPasteboard.general.string = item.id.username
+            } label: {
+                Label("Copy Username", systemImage: "person.crop.square")
             }
 
             Divider()
@@ -688,7 +1236,7 @@ struct DownloadRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         case let .queued(place):
-            let placeStr = place.map { "Place #\($0) in queue" } ?? "Queued"
+            let placeStr = place.map { "Queued #\($0)" } ?? "Queued"
             Text("\(placeStr) · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
                 .font(.caption)
                 .foregroundStyle(.orange)
@@ -705,11 +1253,11 @@ struct DownloadRow: View {
                 .foregroundStyle(.secondary)
         case .paused:
             let pct = Int((item.progress * 100).rounded())
-            Text("Paused at \(pct)% · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
+            Text("Paused \(pct)% · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
                 .font(.caption)
                 .foregroundStyle(.orange)
         case let .completed(url):
-            Text("Completed · \(Formatting.bytes(item.size)) · \(url.deletingLastPathComponent().lastPathComponent)")
+            Text("Finished · \(Formatting.bytes(item.size)) · \(url.deletingLastPathComponent().lastPathComponent)")
                 .font(.caption)
                 .foregroundStyle(.green)
         case let .failed(reason):

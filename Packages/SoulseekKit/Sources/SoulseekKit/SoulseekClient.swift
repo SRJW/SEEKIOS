@@ -122,7 +122,8 @@ public final class SoulseekClient: @unchecked Sendable {
     private var maxConcurrentDownloads = 4
     private var maxConcurrentUploads = 2
     private var maxQueuedPerPeer = 10
-    private var distributedSearchEnabled = true
+    private var sharingEnabled = false
+    private var distributedSearchEnabled = false
 
     // Peer & address management
     private var peers: [String: PeerLink] = [:]
@@ -188,15 +189,44 @@ public final class SoulseekClient: @unchecked Sendable {
         maxConcurrentDownloads: Int,
         maxConcurrentUploads: Int,
         maxQueuedPerPeer: Int,
+        sharingEnabled: Bool = false,
         distributedSearchEnabled: Bool
     ) {
         queue.async {
+            let wasSharing = self.sharingEnabled
             self.maxConcurrentDownloads = max(1, min(maxConcurrentDownloads, 16))
             self.maxConcurrentUploads = max(1, min(maxConcurrentUploads, 8))
             self.maxQueuedPerPeer = max(1, min(maxQueuedPerPeer, 50))
-            self.distributedSearchEnabled = distributedSearchEnabled
+            self.sharingEnabled = sharingEnabled
+            self.distributedSearchEnabled = sharingEnabled && distributedSearchEnabled
+
+            if !self.distributedSearchEnabled {
+                self.closeDistributedParent()
+            }
+            if !self.sharingEnabled {
+                let queued = self.uploadQueue
+                self.uploadQueue.removeAll()
+                for job in queued {
+                    self.emitUpload(username: job.username, path: job.path, state: .failed, sent: 0, size: job.share.size, speed: 0)
+                }
+                let activeTokens = Array(self.activeUploads.keys)
+                for token in activeTokens {
+                    for link in self.fileLinks.values {
+                        if case let .uploading(t) = link.role, t == token {
+                            self.closeFileLink(link)
+                        }
+                    }
+                    self.finishUpload(token: token, succeeded: false)
+                }
+            }
+            if self.isLoggedIn && wasSharing != self.sharingEnabled {
+                self.sendShareCounts()
+                self.sendServer(.haveNoParent(self.distributedSearchEnabled))
+            }
             self.pumpDownloads()
-            self.startNextUploads()
+            if self.sharingEnabled {
+                self.startNextUploads()
+            }
         }
     }
 
@@ -850,7 +880,7 @@ public final class SoulseekClient: @unchecked Sendable {
             log("Logged in (public IP \(ownIP)). \(greeting)")
             sendServer(.setWaitPort(UInt32(activeListenPort)))
             sendServer(.setStatus(2))
-            sendServer(.haveNoParent(true))
+            sendServer(.haveNoParent(sharingEnabled && distributedSearchEnabled))
             sendServer(.branchRoot(username))
             sendServer(.branchLevel(0))
             sendServer(.acceptChildren(false))
@@ -890,13 +920,13 @@ public final class SoulseekClient: @unchecked Sendable {
             awaitingServerPong = false
 
         case let .embeddedMessage(distribCode, payload):
-            if distributedSearchEnabled,
+            if sharingEnabled, distributedSearchEnabled,
                let msg = try? DistributedMessage.decodePayload(code: distribCode, payload: payload) {
                 handleDistributedMessage(msg)
             }
 
         case let .possibleParents(parents):
-            if distributedSearchEnabled, !shares.isEmpty, parentConnection == nil, !parents.isEmpty {
+            if sharingEnabled, distributedSearchEnabled, !shares.isEmpty, parentConnection == nil, !parents.isEmpty {
                 connectDistributedParent(from: parents)
             }
 
@@ -966,6 +996,10 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func sendShareCounts() {
+        guard sharingEnabled else {
+            sendServer(.sharedFoldersFiles(folders: 0, files: 0))
+            return
+        }
         let folders = Set(shares.keys.map { Self.splitVirtualPath($0).folder })
         sendServer(.sharedFoldersFiles(folders: UInt32(folders.count), files: UInt32(shares.count)))
     }
@@ -1059,7 +1093,7 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func respondToDistributedSearch(requester: String, token: UInt32, query: String) {
-        guard distributedSearchEnabled, !shares.isEmpty, requester != username else { return }
+        guard sharingEnabled, distributedSearchEnabled, !shares.isEmpty, requester != username else { return }
         let now = Date()
         if now.timeIntervalSince(lastDistribReplyAt) > 60 {
             distribRepliesThisMinute = 0
@@ -1391,7 +1425,7 @@ public final class SoulseekClient: @unchecked Sendable {
                 description: "Seekios (iOS)",
                 totalUploads: completedUploads,
                 queueSize: UInt32(uploadQueue.count),
-                slotsFree: activeUploads.count < maxConcurrentUploads
+                slotsFree: sharingEnabled && activeUploads.count < maxConcurrentUploads
             )])
 
         case let .placeInQueueRequest(filename):
@@ -1799,6 +1833,10 @@ public final class SoulseekClient: @unchecked Sendable {
     // MARK: - Uploads (Multi-Slot + Indirect Fallback + Clean EOF Shutdown)
 
     private func enqueueUpload(for username: String, path: String) {
+        guard sharingEnabled else {
+            sendToPeer(username, [.uploadDenied(filename: path, reason: "Sharing disabled.")])
+            return
+        }
         guard let share = shares[path] else {
             sendToPeer(username, [.uploadDenied(filename: path, reason: "File not shared.")])
             return
@@ -2016,6 +2054,7 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func sharedFolders() -> [SharedFolder] {
+        guard sharingEnabled else { return [] }
         var grouped: [String: [SharedFile]] = [:]
         for share in shares.values {
             let parts = Self.splitVirtualPath(share.virtualPath)

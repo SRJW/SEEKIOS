@@ -75,7 +75,7 @@ final class TransferMonitor {
         liveActivityTask?.cancel()
     }
 
-    var isSeeding: Bool { AppSettings.seedingEnabled }
+    var isSeeding: Bool { AppSettings.seedingEnabled && soulseek.isEffectivelySharing }
 
     private func requestNotificationPermissionIfNeeded() {
         guard !requestedNotificationPermission else { return }

@@ -171,6 +171,31 @@ enum Formatting {
     }
 }
 
+/// How completed downloads are organized inside the chosen download folder (Nicotine+-style).
+enum DownloadFolderStructure: String, CaseIterable, Identifiable {
+    case album = "album"
+    case userAndAlbum = "userAndAlbum"
+    case flat = "flat"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .album: return "Album Folder"
+        case .userAndAlbum: return "User / Album"
+        case .flat: return "Flat (No Subfolders)"
+        }
+    }
+
+    var example: String {
+        switch self {
+        case .album: return "Downloads/Album/01 Track.flac"
+        case .userAndAlbum: return "Downloads/peer/Album/01 Track.flac"
+        case .flat: return "Downloads/01 Track.flac"
+        }
+    }
+}
+
 /// User-facing switches, stored in UserDefaults so views can bind with @AppStorage.
 enum AppSettings {
     static let artworkLookupKey = "artworkLookup"
@@ -182,6 +207,12 @@ enum AppSettings {
     /// Defaults to off.
     static let bitPerfectKey = "bitPerfect"
     static let seedingKey = "seedingMode"
+    /// Sharing & privacy on iPhone: opt-in by default to protect battery, cellular data, and privacy.
+    static let sharingEnabledKey = "slsk.sharingEnabled"
+    static let shareOnWiFiOnlyKey = "slsk.shareOnWiFiOnly"
+    /// Download folder organization & iOS Library integration.
+    static let keepAudioInLibraryKey = "slsk.keepAudioInLibrary"
+    static let downloadFolderStructureKey = "slsk.downloadFolderStructure"
     /// Transfer & Soulseek tuning (Nicotine+-style controls).
     static let maxConcurrentDownloadsKey = "slsk.maxConcurrentDownloads"
     static let maxConcurrentUploadsKey = "slsk.maxConcurrentUploads"
@@ -190,8 +221,19 @@ enum AppSettings {
 
     static var artworkLookupEnabled: Bool { flag(artworkLookupKey) }
     static var lyricsLookupEnabled: Bool { flag(lyricsLookupKey) }
+    static var sharingEnabled: Bool { UserDefaults.standard.bool(forKey: sharingEnabledKey) }
+    static var shareOnWiFiOnly: Bool { flag(shareOnWiFiOnlyKey) }
+    static var keepAudioInLibrary: Bool { flag(keepAudioInLibraryKey) }
     static var seedingEnabled: Bool { UserDefaults.standard.bool(forKey: seedingKey) }
     static var distributedSearchEnabled: Bool { flag(distributedSearchKey) }
+
+    static var downloadFolderStructure: DownloadFolderStructure {
+        guard let raw = UserDefaults.standard.string(forKey: downloadFolderStructureKey),
+              let value = DownloadFolderStructure(rawValue: raw) else {
+            return .album
+        }
+        return value
+    }
 
     static var maxConcurrentDownloads: Int {
         let value = UserDefaults.standard.integer(forKey: maxConcurrentDownloadsKey)

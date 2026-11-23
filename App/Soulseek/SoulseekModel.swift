@@ -1,4 +1,5 @@
 import Foundation
+import Network
 import SoulseekKit
 
 /// Elemento de la Lista de Deseos (Wishlist)
@@ -42,10 +43,12 @@ final class SoulseekModel: ObservableObject {
     @Published private(set) var userStatuses: [String: UserStatus] = [:]
     @Published private(set) var logLines: [SoulseekLogEntry] = []
     @Published var username: String = UserDefaults.standard.string(forKey: "username") ?? ""
+    @Published private(set) var isOnWiFi: Bool = true
+    @Published var downloadLocationError: String?
 
     /// Ruta personalizada de descargas elegida por el usuario (o nil si usa la carpeta por defecto de la app)
     @Published private(set) var customDownloadDirectory: URL?
-    @Published var saveAllToCustomFolder: Bool = UserDefaults.standard.bool(forKey: "save_all_to_custom_folder_v1") {
+    @Published var saveAllToCustomFolder: Bool = UserDefaults.standard.object(forKey: "save_all_to_custom_folder_v1") as? Bool ?? true {
         didSet { UserDefaults.standard.set(saveAllToCustomFolder, forKey: "save_all_to_custom_folder_v1") }
     }
 
@@ -64,6 +67,8 @@ final class SoulseekModel: ObservableObject {
     private var coverRequested = Set<String>()
     private var hasSecurityScopeAccess = false
     private var nextLogID = 1
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "seekios.pathmonitor")
 
     private let searchHistoryKey = "search_history_v1"
     private let wishlistKey = "wishlist_items_v1"
@@ -71,6 +76,19 @@ final class SoulseekModel: ObservableObject {
     private let blockedUsersKey = "blocked_users_v1"
     private let customDownloadBookmarkKey = "custom_download_folder_bookmark_v1"
     private let customDownloadPathKey = "custom_download_folder_path_v1"
+
+    var isEffectivelySharing: Bool {
+        AppSettings.sharingEnabled && (!AppSettings.shareOnWiFiOnly || isOnWiFi)
+    }
+
+    var sharingStatusSummary: String {
+        guard AppSettings.sharingEnabled else { return "Off (Download Only)" }
+        if AppSettings.shareOnWiFiOnly && !isOnWiFi {
+            return "Paused on Cellular (Wi-Fi Only)"
+        }
+        let count = library.tracks.count
+        return "Sharing \(count) song\(count == 1 ? "" : "s")"
+    }
 
     var otherDownloadsDirectory: URL {
         customDownloadDirectory ?? defaultDownloadsDirectory
@@ -115,18 +133,37 @@ final class SoulseekModel: ObservableObject {
         transfers.loadHistory(client: client)
         loadSearchHistory()
         loadWishlistAndPeers()
+        startNetworkMonitor()
         applyClientSettings()
 
         client.onEvent = { [weak self] event in self?.handle(event) }
         library.onSharesChanged = { [weak self] shares in self?.client.updateShares(shares) }
     }
 
+    deinit {
+        pathMonitor.cancel()
+    }
+
+    private func startNetworkMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let wifi = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            Task { @MainActor [weak self] in
+                guard let self, self.isOnWiFi != wifi else { return }
+                self.isOnWiFi = wifi
+                self.applyClientSettings()
+            }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+    }
+
     func applyClientSettings() {
+        let effectiveShare = isEffectivelySharing
         client.configure(
             maxConcurrentDownloads: AppSettings.maxConcurrentDownloads,
             maxConcurrentUploads: AppSettings.maxConcurrentUploads,
             maxQueuedPerPeer: AppSettings.maxQueuedPerPeer,
-            distributedSearchEnabled: AppSettings.distributedSearchEnabled
+            sharingEnabled: effectiveShare,
+            distributedSearchEnabled: effectiveShare && AppSettings.distributedSearchEnabled
         )
     }
 
@@ -156,21 +193,35 @@ final class SoulseekModel: ObservableObject {
 
     @discardableResult
     func setCustomDownloadFolder(_ url: URL) -> Bool {
-        if let old = customDownloadDirectory, hasSecurityScopeAccess {
+        downloadLocationError = nil
+        let accessed = url.startAccessingSecurityScopedResource()
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url, withIntermediateDirectories: true)
+
+        // Verify iOS actually grants write permission (some cloud/read-only providers refuse writes).
+        let probe = url.appendingPathComponent(".seekios-write-test-\(UUID().uuidString)")
+        do {
+            try Data().write(to: probe, options: .atomic)
+            try? fm.removeItem(at: probe)
+        } catch {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            downloadLocationError = "iOS did not allow writing to “\(url.lastPathComponent)”. Choose a writable folder in On My iPhone or iCloud Drive."
+            return false
+        }
+
+        if let old = customDownloadDirectory, hasSecurityScopeAccess, old.canonicalPath != url.canonicalPath {
             old.stopAccessingSecurityScopedResource()
             hasSecurityScopeAccess = false
         }
 
-        let accessed = url.startAccessingSecurityScopedResource()
         hasSecurityScopeAccess = accessed
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-
         if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             UserDefaults.standard.set(data, forKey: customDownloadBookmarkKey)
         }
         UserDefaults.standard.set(url.path, forKey: customDownloadPathKey)
 
         customDownloadDirectory = url
+        saveAllToCustomFolder = true
         return true
     }
 
@@ -185,6 +236,7 @@ final class SoulseekModel: ObservableObject {
     }
 
     func resetDownloadFolderToDefault() {
+        downloadLocationError = nil
         if let old = customDownloadDirectory, hasSecurityScopeAccess {
             old.stopAccessingSecurityScopedResource()
             hasSecurityScopeAccess = false
@@ -556,8 +608,16 @@ final class SoulseekModel: ObservableObject {
         remove(Set(transfers.downloads.filter(\.isCompleted).map(\.id)))
     }
 
+    func clearCompleted(in ids: Set<DownloadID>) {
+        remove(Set(transfers.downloads.filter { ids.contains($0.id) && $0.isCompleted }.map(\.id)))
+    }
+
     func clearFailed() {
         remove(Set(transfers.downloads.filter(\.isFailed).map(\.id)), deletePartial: true)
+    }
+
+    func retryOnlyFailed() {
+        retry(Set(transfers.downloads.filter(\.isFailed).map(\.id)))
     }
 
     func retryAllFailed() {
@@ -653,11 +713,20 @@ final class SoulseekModel: ObservableObject {
 
     // MARK: - Background File Relocation (off MainActor)
 
+    private nonisolated static func cleanPathComponent(_ raw: String) -> String {
+        let cleaned = String(raw.map { "/:\0\\".contains($0) ? "_" : $0 })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty || cleaned == "." || cleaned == ".." ? "Misc" : cleaned
+    }
+
     private nonisolated static func relocateCompletedFile(
         fileURL: URL,
+        username: String,
         remotePath: String,
         isAudioOrSidecar: Bool,
         saveAllToCustomFolder: Bool,
+        keepAudioInLibrary: Bool,
+        structure: DownloadFolderStructure,
         customDownloadDirectory: URL?,
         targetBase: URL,
         libraryRoot: URL
@@ -671,8 +740,20 @@ final class SoulseekModel: ObservableObject {
 
         let shared = SharedFile(path: remotePath, size: 0)
         let rawFolderName = shared.folder.split(separator: "\\").last.map(String.init) ?? "Misc"
-        let cleanFolderName = String(rawFolderName.map { "/:\0".contains($0) ? "_" : $0 })
-        let targetSubfolder = targetBase.appendingPathComponent(cleanFolderName, isDirectory: true)
+        let cleanFolderName = cleanPathComponent(rawFolderName)
+        let cleanUser = cleanPathComponent(username)
+
+        let targetSubfolder: URL
+        switch structure {
+        case .album:
+            targetSubfolder = targetBase.appendingPathComponent(cleanFolderName, isDirectory: true)
+        case .userAndAlbum:
+            targetSubfolder = targetBase
+                .appendingPathComponent(cleanUser, isDirectory: true)
+                .appendingPathComponent(cleanFolderName, isDirectory: true)
+        case .flat:
+            targetSubfolder = targetBase
+        }
         try? fm.createDirectory(at: targetSubfolder, withIntermediateDirectories: true)
 
         let destinationURL = targetSubfolder.appendingPathComponent(fileURL.lastPathComponent)
@@ -681,7 +762,7 @@ final class SoulseekModel: ObservableObject {
         }
         try? fm.removeItem(at: destinationURL)
         do {
-            if isAudioOrSidecar {
+            if isAudioOrSidecar && keepAudioInLibrary {
                 try fm.copyItem(at: fileURL, to: destinationURL)
                 return (destinationURL, fileURL)
             } else {
@@ -746,14 +827,19 @@ final class SoulseekModel: ObservableObject {
                     let targetBase = otherDownloadsDirectory
                     let customDir = customDownloadDirectory
                     let saveAll = saveAllToCustomFolder
+                    let keepInLib = AppSettings.keepAudioInLibrary
+                    let structure = AppSettings.downloadFolderStructure
                     let libRoot = library.root
                     Task { [weak self] in
                         let relocated = await Task.detached(priority: .userInitiated) {
                             Self.relocateCompletedFile(
                                 fileURL: url,
+                                username: update.id.username,
                                 remotePath: update.id.path,
                                 isAudioOrSidecar: isAudio || isSidecar,
                                 saveAllToCustomFolder: saveAll,
+                                keepAudioInLibrary: keepInLib,
+                                structure: structure,
                                 customDownloadDirectory: customDir,
                                 targetBase: targetBase,
                                 libraryRoot: libRoot
@@ -761,7 +847,7 @@ final class SoulseekModel: ObservableObject {
                         }.value
                         guard let self else { return }
                         self.transfers.applyDownloadUpdate(update, finalState: .completed(relocated.displayURL), libraryURL: relocated.libraryURL)
-                        self.handleCompletedSideEffects(ext: ext, isAudio: isAudio)
+                        self.handleCompletedSideEffects(ext: ext, isAudio: isAudio && relocated.libraryURL != nil)
                     }
                 } else {
                     transfers.applyDownloadUpdate(update, finalState: .completed(url), libraryURL: url)
