@@ -130,6 +130,10 @@ struct VideoPlayerSheet: View {
         avPlayer?.pause()
         avPlayer?.replaceCurrentItem(with: nil)
         avPlayer = nil
+        AudioSessionCoordinator.shared.updatePlaybackState(
+            isPlaying: player.isPlaying,
+            hasTrack: player.current != nil
+        )
     }
 }
 

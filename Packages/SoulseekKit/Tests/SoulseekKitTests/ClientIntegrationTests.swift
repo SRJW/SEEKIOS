@@ -209,7 +209,7 @@ final class ClientIntegrationTests: XCTestCase {
 // MARK: - Loopback Mock Soulseek Server & Peer
 
 private final class MockSoulseekServer: @unchecked Sendable {
-    let port: UInt16
+    private(set) var port: UInt16 = 0
     var peerAddresses: [String: (String, UInt32)] = [:]
     var onServerFrame: ((UInt32, inout ByteReader) -> Void)?
 
@@ -327,7 +327,7 @@ private final class MockSoulseekPeer: @unchecked Sendable {
         case indirectStalledThenResume(server: MockSoulseekServer, firstSendLimit: Int)
     }
 
-    let port: UInt16
+    private(set) var port: UInt16 = 0
     var lastReceivedOffset: UInt64 = 0
 
     private let username: String
@@ -479,9 +479,15 @@ private final class MockSoulseekPeer: @unchecked Sendable {
         case let .indirectStalledThenResume(_, firstSendLimit):
             if transferAttempt == 1 {
                 let end = min(offset + firstSendLimit, payload.count)
-                let slice = payload.subdata(in: offset..<end)
-                conn.send(content: slice, completion: .contentProcessed { _ in
-                    // Hold connection open after first chunk so client receives it and can pause.
+                let split = max(offset, end - 1024)
+                let firstPart = payload.subdata(in: offset..<split)
+                let tailPart = payload.subdata(in: split..<end)
+                conn.send(content: firstPart, completion: .contentProcessed { [weak self] _ in
+                    self?.queue.asyncAfter(deadline: .now() + 0.5) {
+                        conn.send(content: tailPart, completion: .contentProcessed { _ in
+                            // Hold connection open after first chunk so client receives progress update and pauses.
+                        })
+                    }
                 })
             } else {
                 let slice = payload.subdata(in: offset..<payload.count)
