@@ -4,25 +4,34 @@ import MetricKit
 import UIKit
 
 /// App-wide logging and crash capture, all kept on the phone. A rolling in-memory buffer feeds
-/// the Logs screen; the same lines are appended to a session file. Crashes are caught two ways:
-/// MetricKit delivers a full diagnostic on the next launch (the reliable path), and lightweight
-/// exception/signal handlers leave a short report immediately (best-effort).
+/// the Logs screen; the same lines are appended to a session file. MetricKit delivers reliable
+/// crash diagnostics on the next launch without unsafe POSIX signal handlers.
 final class Diagnostics: NSObject, @unchecked Sendable {
     static let shared = Diagnostics()
 
-    /// Fires (coalesced) when new lines arrive, so an open Logs screen can refresh.
+    struct LogLine: Identifiable, Hashable, Sendable {
+        let id: Int
+        let text: String
+    }
+
+    /// Fires on the main queue when new lines arrive, so an open Logs screen can refresh.
     let didLog = PassthroughSubject<Void, Never>()
 
     private let lock = NSLock()
-    private var buffer: [String] = []
+    private var buffer: [LogLine] = []
+    private var nextLineID = 1
+    private var isStarted = false
     private let maxLines = 3000
-    private let writeQueue = DispatchQueue(label: "colon3.diagnostics")
+    private let maxSessionFileBytes: UInt64 = 3 * 1024 * 1024
+    private let writeQueue = DispatchQueue(label: "seekios.diagnostics")
     private var sessionHandle: FileHandle?
+    private var sessionBytesWritten: UInt64 = 0
 
     let logsDirectory: URL
     let crashesDirectory: URL
     private let sessionFile: URL
 
+    /// Protected by `lock`.
     private static let stamp: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -31,57 +40,127 @@ final class Diagnostics: NSObject, @unchecked Sendable {
     }()
 
     private override init() {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Diagnostics", isDirectory: true)
-        logsDirectory = base
-        crashesDirectory = base.appendingPathComponent("Crashes", isDirectory: true)
-        try? FileManager.default.createDirectory(at: crashesDirectory, withIntermediateDirectories: true)
-        sessionFile = base.appendingPathComponent("session.log")
+        var crashes = AppDirectories.applicationSupport
+            .appendingPathComponent("Diagnostics", isDirectory: true)
+            .appendingPathComponent("Crashes", isDirectory: true)
+        logsDirectory = caches
+        crashesDirectory = crashes
+        try? FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: crashes, withIntermediateDirectories: true)
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? crashes.setResourceValues(values)
+        sessionFile = caches.appendingPathComponent("session.log")
         super.init()
     }
 
-    /// Call once, early. Opens the session file, installs crash handlers and MetricKit.
+    /// Call once, early. Opens the session file and registers MetricKit.
     func start() {
-        // Keep the previous session's log so a crash's lead-up survives the relaunch.
-        let previous = logsDirectory.appendingPathComponent("session-previous.log")
-        try? FileManager.default.removeItem(at: previous)
-        try? FileManager.default.moveItem(at: sessionFile, to: previous)
-        FileManager.default.createFile(atPath: sessionFile.path, contents: nil)
-        sessionHandle = try? FileHandle(forWritingTo: sessionFile)
+        lock.lock()
+        if isStarted {
+            lock.unlock()
+            return
+        }
+        isStarted = true
+        lock.unlock()
+
+        writeQueue.sync {
+            let fm = FileManager.default
+            try? fm.createDirectory(at: self.logsDirectory, withIntermediateDirectories: true)
+            let previous = self.logsDirectory.appendingPathComponent("session-previous.log")
+            try? fm.removeItem(at: previous)
+            if fm.fileExists(atPath: self.sessionFile.path) {
+                try? fm.moveItem(at: self.sessionFile, to: previous)
+            }
+            fm.createFile(atPath: self.sessionFile.path, contents: nil)
+            self.sessionHandle = try? FileHandle(forWritingTo: self.sessionFile)
+            self.sessionBytesWritten = 0
+        }
 
         let device = UIDevice.current
-        log("colon3 \(Bundle.appVersion) on \(device.systemName) \(device.systemVersion)", category: "app")
-        installCrashHandlers()
+        log("Seekios \(Bundle.appVersion) on \(device.systemName) \(device.systemVersion)", category: "app")
         MXMetricManager.shared.add(self)
     }
 
     // MARK: Logging
 
     func log(_ message: String, category: String = "app") {
-        let line = "\(Self.stamp.string(from: Date())) [\(category)] \(message)"
         lock.lock()
-        buffer.append(line)
-        if buffer.count > maxLines { buffer.removeFirst(buffer.count - maxLines) }
+        let timestamp = Self.stamp.string(from: Date())
+        let formatted = "\(timestamp) [\(category)] \(message)"
+        let entry = LogLine(id: nextLineID, text: formatted)
+        nextLineID += 1
+        buffer.append(entry)
+        if buffer.count > maxLines {
+            buffer.removeFirst(buffer.count - maxLines)
+        }
         lock.unlock()
 
         writeQueue.async { [weak self] in
-            guard let self, let data = (line + "\n").data(using: .utf8) else { return }
-            self.sessionHandle?.write(data)
+            self?.appendToSessionFile(formatted + "\n")
         }
-        didLog.send()
+        DispatchQueue.main.async { [weak self] in
+            self?.didLog.send()
+        }
     }
 
-    var lines: [String] {
+    private func appendToSessionFile(_ line: String) {
+        guard let data = line.data(using: .utf8) else { return }
+        if sessionBytesWritten + UInt64(data.count) > maxSessionFileBytes {
+            rotateSessionFile()
+        }
+        guard let handle = sessionHandle else { return }
+        do {
+            try handle.write(contentsOf: data)
+            sessionBytesWritten += UInt64(data.count)
+        } catch {
+            // Disk full or closed fd: close handle safely instead of raising Obj-C NSException.
+            try? handle.close()
+            sessionHandle = nil
+        }
+    }
+
+    private func rotateSessionFile() {
+        try? sessionHandle?.close()
+        sessionHandle = nil
+        let fm = FileManager.default
+        let previous = logsDirectory.appendingPathComponent("session-previous.log")
+        try? fm.removeItem(at: previous)
+        try? fm.moveItem(at: sessionFile, to: previous)
+        fm.createFile(atPath: sessionFile.path, contents: nil)
+        sessionHandle = try? FileHandle(forWritingTo: sessionFile)
+        sessionBytesWritten = 0
+    }
+
+    var entries: [LogLine] {
         lock.lock(); defer { lock.unlock() }
         return buffer
     }
 
+    var lines: [String] {
+        entries.map(\.text)
+    }
+
     func clearSession() {
-        lock.lock(); buffer.removeAll(); lock.unlock()
+        lock.lock()
+        buffer.removeAll()
+        lock.unlock()
         writeQueue.async { [weak self] in
-            self?.sessionHandle?.truncateFile(atOffset: 0)
+            guard let self, let handle = self.sessionHandle else { return }
+            do {
+                try handle.truncate(atOffset: 0)
+                try handle.seek(toOffset: 0)
+                self.sessionBytesWritten = 0
+            } catch {
+                try? handle.close()
+                self.sessionHandle = nil
+            }
         }
-        didLog.send()
+        DispatchQueue.main.async { [weak self] in
+            self?.didLog.send()
+        }
     }
 
     /// The whole session log as text, for sharing.
@@ -108,7 +187,7 @@ final class Diagnostics: NSObject, @unchecked Sendable {
             .filter { $0.pathExtension == "txt" || $0.pathExtension == "json" }
             .map { url in
                 let date = (try? url.resourceValues(forKeys: Set(keys)))?.contentModificationDate ?? .distantPast
-                let kind = url.pathExtension == "json" ? "MetricKit" : "Signal"
+                let kind = url.pathExtension == "json" ? "MetricKit" : "Crash"
                 return CrashReport(url: url, date: date, kind: kind)
             }
             .sorted { $0.date > $1.date }
@@ -123,43 +202,6 @@ final class Diagnostics: NSObject, @unchecked Sendable {
             try? FileManager.default.removeItem(at: file)
         }
     }
-
-    // MARK: Crash capture
-
-    private func installCrashHandlers() {
-        NSSetUncaughtExceptionHandler { exception in
-            let text = """
-            Uncaught exception
-            Name: \(exception.name.rawValue)
-            Reason: \(exception.reason ?? "–")
-
-            \(exception.callStackSymbols.joined(separator: "\n"))
-            """
-            Diagnostics.shared.writeCrash(text)
-        }
-        for signalNumber in [SIGABRT, SIGILL, SIGSEGV, SIGFPE, SIGBUS, SIGTRAP] {
-            signal(signalNumber) { received in
-                let text = "Signal \(received)\n\n" + Thread.callStackSymbols.joined(separator: "\n")
-                Diagnostics.shared.writeCrash(text)
-                // Restore the default handler and re-raise so the OS still records it.
-                signal(received, SIG_DFL)
-                raise(received)
-            }
-        }
-    }
-
-    /// Best-effort synchronous write from a crash context.
-    fileprivate func writeCrash(_ text: String) {
-        // The signal may have landed while the lock was held; don't block, just skip the tail.
-        var recent = ""
-        if lock.try() {
-            recent = buffer.suffix(80).joined(separator: "\n")
-            lock.unlock()
-        }
-        let full = text + "\n\n--- recent log ---\n" + recent + "\n"
-        let url = crashesDirectory.appendingPathComponent("crash-\(Int(Date().timeIntervalSince1970)).txt")
-        try? full.data(using: .utf8)?.write(to: url)
-    }
 }
 
 extension Diagnostics: MXMetricManagerSubscriber {
@@ -168,8 +210,10 @@ extension Diagnostics: MXMetricManagerSubscriber {
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         for payload in payloads where !payload.crashDiagnostics.isNilOrEmpty {
             let date = payload.timeStampEnd
-            let name = "metrickit-\(Int(date.timeIntervalSince1970)).json"
-            try? payload.jsonRepresentation().write(to: crashesDirectory.appendingPathComponent(name))
+            let suffix = UUID().uuidString.prefix(8)
+            let name = "metrickit-\(Int(date.timeIntervalSince1970))-\(suffix).json"
+            try? FileManager.default.createDirectory(at: crashesDirectory, withIntermediateDirectories: true)
+            try? payload.jsonRepresentation().write(to: crashesDirectory.appendingPathComponent(name), options: .atomic)
         }
     }
 }

@@ -13,7 +13,7 @@ struct LibraryView: View {
 
     struct Section<Item>: Identifiable {
         let letter: String
-        let items: [Item]
+        var items: [Item]
         var id: String { letter }
     }
 
@@ -45,10 +45,9 @@ struct LibraryView: View {
                     if selecting { selectionBar }
                 }
                 .confirmDelete($pendingDelete) { _ in
-                    selection.removeAll()
-                    selecting = false
+                    endSelection()
                 }
-                .onChange(of: scope) { _, _ in selection.removeAll() }
+                .onChange(of: scope) { _, _ in endSelection() }
         }
     }
 
@@ -58,7 +57,7 @@ struct LibraryView: View {
             ScrollView {
                 scopePicker
                 EmptyStateView(title: library.isScanning ? "Loading Library…" : "No Music Yet",
-                               message: "Download from Search, tap + to import files, or copy music into colon3 › Music in the Files app.",
+                               message: "Download from Search, tap + to import files, or copy music into Seekios › Music in the Files app.",
                                systemImage: "music.note.house")
                     .padding(.top, 60)
                 if !library.isScanning {
@@ -66,6 +65,7 @@ struct LibraryView: View {
                         .buttonStyle(.borderedProminent)
                 }
             }
+            .refreshable { library.rescan() }
         } else {
             switch scope {
             case .albums: albumsGrid
@@ -119,7 +119,12 @@ struct LibraryView: View {
 
     private var filteredArtists: [ArtistEntry] {
         library.artists.filter { artist in
-            matches(artist.name) || artist.albums.contains { matches($0.title) } || artist.singles.contains { matches($0.title) }
+            if favoritesOnly {
+                let hasFav = artist.albums.contains { favorites.isFavorite($0) }
+                    || artist.singles.contains { favorites.isFavorite($0) }
+                if !hasFav { return false }
+            }
+            return matches(artist.name) || artist.albums.contains { matches($0.title) } || artist.singles.contains { matches($0.title) }
         }
     }
 
@@ -139,7 +144,7 @@ struct LibraryView: View {
             for item in sorted {
                 let letter = SortKey.section(for: key(item))
                 if result.last?.letter == letter {
-                    result[result.count - 1] = Section(letter: letter, items: result[result.count - 1].items + [item])
+                    result[result.count - 1].items.append(item)
                 } else {
                     result.append(Section(letter: letter, items: [item]))
                 }
@@ -157,7 +162,7 @@ struct LibraryView: View {
     }
 
     private func indexBar(_ letters: [String], proxy: ScrollViewProxy) -> some View {
-        SectionIndexBar(available: letters) { letter in
+        SectionIndexBar(available: Set(letters)) { letter in
             proxy.scrollTo("section-" + letter, anchor: .top)
         }
         .padding(.trailing, 2)
@@ -183,6 +188,7 @@ struct LibraryView: View {
                 .padding(.horizontal, 20)
                 .padding(.bottom, 24)
             }
+            .refreshable { library.rescan() }
             .overlay(alignment: .trailing) {
                 if sort != .recent, letters.count > 1, query.isEmpty { indexBar(letters, proxy: proxy) }
             }
@@ -294,6 +300,7 @@ struct LibraryView: View {
                 }
                 .padding(.bottom, 24)
             }
+            .refreshable { library.rescan() }
             .overlay(alignment: .trailing) {
                 if sort != .recent, letters.count > 1, query.isEmpty { indexBar(letters, proxy: proxy) }
             }
@@ -305,7 +312,7 @@ struct LibraryView: View {
         return Button {
             if selecting {
                 toggleSelection(id)
-            } else if let index = ordered.firstIndex(of: track) {
+            } else if let index = ordered.firstIndex(where: { $0.id == track.id }) {
                 player.play(ordered, startAt: index)
             }
         } label: {
@@ -325,7 +332,7 @@ struct LibraryView: View {
 
     private var artistsList: some View {
         let artists = filteredArtists
-        let grouped = makeSections(artists, title: \.name, artist: \.name, added: { $0.albums.first?.addedAt ?? .distantPast })
+        let grouped = makeSections(artists, title: \.name, artist: \.name, added: \.mostRecentDate)
         let letters = grouped.map(\.letter).filter { !$0.isEmpty }
         return ScrollViewReader { proxy in
             ScrollView {
@@ -361,8 +368,9 @@ struct LibraryView: View {
                 }
                 .padding(.bottom, 24)
             }
+            .refreshable { library.rescan() }
             .overlay(alignment: .trailing) {
-                if letters.count > 1, query.isEmpty { indexBar(letters, proxy: proxy) }
+                if sort != .recent, letters.count > 1, query.isEmpty { indexBar(letters, proxy: proxy) }
             }
         }
     }
@@ -374,6 +382,7 @@ struct LibraryView: View {
             scopePicker
             PlaylistsListContent(query: query)
         }
+        .refreshable { library.rescan() }
     }
 
     // MARK: Selection
@@ -468,8 +477,13 @@ struct LibraryView: View {
                     Label("Import Playlist (.m3u)…", systemImage: "music.note.list")
                 }
                 Button {
+                    let needsSwitch = router.tab != .settings
                     router.tab = .settings
-                    router.showWiFiTransfer = true
+                    if needsSwitch {
+                        Task { @MainActor in router.showWiFiTransfer = true }
+                    } else {
+                        router.showWiFiTransfer = true
+                    }
                 } label: {
                     Label("Wi-Fi Transfer", systemImage: "wifi")
                 }

@@ -35,6 +35,7 @@ targets:
         UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
         ITSAppUsesNonExemptEncryption: false
         NSSupportsLiveActivities: true
+        NSSupportsLiveActivitiesFrequentUpdates: true
         NSLocalNetworkUsageDescription: "Seekios uses the local network for Wi-Fi Transfer, so a computer on your Wi-Fi can add or download files."
         CFBundleURLTypes:
           - CFBundleURLName: com.srjw.seekios
@@ -51,6 +52,8 @@ targets:
               - com.microsoft.waveform-audio
               - public.aiff-audio
               - public.aifc-audio
+              - public.m3u-playlist
+              - public.plain-text
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.srjw.seekios

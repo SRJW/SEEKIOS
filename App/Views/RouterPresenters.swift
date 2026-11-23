@@ -20,8 +20,14 @@ struct RouterPresenters: ViewModifier {
             .fileImporter(isPresented: active ? $router.showImporter : .constant(false),
                           allowedContentTypes: router.importKind.types,
                           allowsMultipleSelection: router.importKind.allowsMultiple) { result in
-                guard case let .success(urls) = result, !urls.isEmpty else { return }
-                handleImport(urls, kind: router.importKind)
+                switch result {
+                case let .success(urls) where !urls.isEmpty:
+                    handleImport(urls, kind: router.importKind)
+                case .success:
+                    break
+                case let .failure(error):
+                    router.message = "Couldn't open the selected file: \(error.localizedDescription)"
+                }
             }
             .photosPicker(isPresented: active ? $router.showPhotoPicker : .constant(false),
                           selection: $photoItem, matching: .images)
@@ -60,26 +66,35 @@ struct RouterPresenters: ViewModifier {
             }
 
         case .playlist:
-            if let playlist = playlists.importM3U(urls[0], library: library) {
-                router.message = "Imported “\(playlist.name)” with \(playlist.trackIDs.count) songs."
-            } else {
-                router.message = "None of the playlist's songs are in your library."
+            let url = urls[0]
+            Task {
+                if let playlist = await playlists.importM3U(url, library: library) {
+                    let count = playlist.trackIDs.count
+                    router.message = "Imported “\(playlist.name)” with \(count) song\(count == 1 ? "" : "s")."
+                } else {
+                    router.message = "None of the playlist's songs are in your library."
+                }
             }
 
         case let .lyrics(track):
-            if library.importLyrics(from: urls[0], for: track) {
-                Task { await LyricsService.shared.forget(cacheKey: track.id) }
-                router.lyricsChanged()
-            } else {
-                router.message = "Couldn't read that lyrics file."
+            let url = urls[0]
+            Task {
+                if await library.importLyrics(from: url, for: track) {
+                    await LyricsService.shared.forget(cacheKey: track.id)
+                    router.lyricsChanged()
+                } else {
+                    router.message = "Couldn't read that lyrics file."
+                }
             }
 
         case let .artwork(target):
             let url = urls[0]
             Task {
-                let scoped = url.startAccessingSecurityScopedResource()
-                let data = try? Data(contentsOf: url)
-                if scoped { url.stopAccessingSecurityScopedResource() }
+                let data: Data? = await Task.detached(priority: .userInitiated) {
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    return try? Data(contentsOf: url)
+                }.value
                 guard let data, await library.setCustomArtwork(data, for: target) else {
                     router.message = "That image couldn't be used."
                     return

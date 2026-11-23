@@ -2,10 +2,12 @@ import SwiftUI
 
 struct EqualizerView: View {
     @ObservedObject var equalizer: Equalizer
+    var showDone = true
     @EnvironmentObject private var player: Player
     @Environment(\.dismiss) private var dismiss
     @State private var naming = false
     @State private var newName = ""
+    @State private var saveError: String?
 
     var body: some View {
         ScrollView {
@@ -90,14 +92,23 @@ struct EqualizerView: View {
         .navigationTitle("Equalizer")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Done") { dismiss() }
+            if showDone {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
             }
         }
         .alert("Save Preset", isPresented: $naming) {
             TextField("Name", text: $newName)
-            Button("Save") { equalizer.saveCurrent(as: newName) }
+            Button("Save") {
+                if !equalizer.saveCurrent(as: newName) {
+                    saveError = "Choose a non-empty name that isn't a built-in preset."
+                }
+            }
             Button("Cancel", role: .cancel) {}
+        }
+        .alert(saveError ?? "", isPresented: Binding(get: { saveError != nil }, set: { if !$0 { saveError = nil } })) {
+            Button("OK", role: .cancel) {}
         }
     }
 
@@ -131,8 +142,8 @@ struct VerticalGainSlider: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let height = geometry.size.height
-            let span = range.upperBound - range.lowerBound
+            let height = max(geometry.size.height, 1)
+            let span = max(range.upperBound - range.lowerBound, 0.001)
             let fraction = CGFloat((value - range.lowerBound) / span)
             let knobY = height * (1 - fraction)
             let zeroY = height * (1 - CGFloat((0 - range.lowerBound) / span))
@@ -157,11 +168,11 @@ struct VerticalGainSlider: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             .contentShape(Rectangle())
-            .gesture(
+            .highPriorityGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
                         let clampedY = min(max(gesture.location.y, 0), height)
-                        let raw = range.upperBound - Float(clampedY / max(height, 1)) * span
+                        let raw = range.upperBound - Float(clampedY / height) * span
                         var snapped = (raw * 2).rounded() / 2
                         if abs(snapped) < 0.75 { snapped = 0 }
                         if snapped != value { value = snapped }
@@ -180,9 +191,10 @@ struct ResponseCurve: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let points = gains.enumerated().map { index, gain in
+            let maxGain = max(Equalizer.gainRange.upperBound, 1)
+            let points: [CGPoint] = gains.isEmpty ? [] : gains.enumerated().map { index, gain in
                 CGPoint(x: size.width * (CGFloat(index) + 0.5) / CGFloat(gains.count),
-                        y: size.height / 2 - CGFloat(gain / 12) * (size.height / 2 - 4))
+                        y: size.height / 2 - CGFloat(gain / maxGain) * (size.height / 2 - 4))
             }
             ZStack {
                 Path { path in

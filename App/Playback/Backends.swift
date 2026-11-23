@@ -5,6 +5,8 @@ import Foundation
 protocol PlaybackBackend: AnyObject {
     /// Called when the current file plays to the end.
     var onFinish: (() -> Void)? { get set }
+    /// Called if playback fails or stops unexpectedly.
+    var onPlaybackStateChanged: ((Bool) -> Void)? { get set }
     var duration: Double { get }
     var currentTime: Double { get }
     var isPlaying: Bool { get }
@@ -24,16 +26,16 @@ protocol PlaybackBackend: AnyObject {
 @MainActor
 final class EngineBackend: PlaybackBackend {
     var onFinish: (() -> Void)?
+    var onPlaybackStateChanged: ((Bool) -> Void)?
     /// Called after the output's sample rate or route changed, so the UI can update.
     var onOutputChange: (() -> Void)?
     private(set) var isPlaying = false
     var bitPerfect = false {
         didSet {
             guard bitPerfect != oldValue else { return }
-            if bitPerfect, let rate = file?.processingFormat.sampleRate {
+            if bitPerfect, let rate = file?.processingFormat.sampleRate, rate > 0 {
                 matchHardwareRate(rate)
             } else if !bitPerfect {
-                // Back to the usual 48 kHz so other apps' audio isn't resampled oddly.
                 restoreDefaultRate()
             }
         }
@@ -48,21 +50,29 @@ final class EngineBackend: PlaybackBackend {
     private var segmentStart: AVAudioFramePosition = 0
     private var generation = 0
     private var lastTime: Double = 0
-    private var configObserver: NSObjectProtocol?
+    private var isRebuilding = false
+    private var lastRequestedRate: Double = 0
+    nonisolated(unsafe) private var configObserver: NSObjectProtocol?
 
     init() {
         attachGraph()
     }
 
+    deinit {
+        if let configObserver {
+            NotificationCenter.default.removeObserver(configObserver)
+        }
+    }
+
     var duration: Double {
-        guard let file else { return 0 }
+        guard let file, file.processingFormat.sampleRate > 0 else { return 0 }
         return Double(file.length) / file.processingFormat.sampleRate
     }
 
     var fileSampleRate: Double { file?.processingFormat.sampleRate ?? 0 }
 
     var currentTime: Double {
-        guard let file else { return 0 }
+        guard let file, file.processingFormat.sampleRate > 0 else { return 0 }
         guard isPlaying, let nodeTime = node.lastRenderTime, nodeTime.isSampleTimeValid,
               let playerTime = node.playerTime(forNodeTime: nodeTime) else { return lastTime }
         let seconds = Double(segmentStart + playerTime.sampleTime) / file.processingFormat.sampleRate
@@ -72,6 +82,9 @@ final class EngineBackend: PlaybackBackend {
 
     func load(_ url: URL) throws {
         let newFile = try AVAudioFile(forReading: url)
+        guard newFile.processingFormat.sampleRate > 0, newFile.length > 0 else {
+            throw NSError(domain: "EngineBackend", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid or empty audio file"])
+        }
         stopNode()
         file = newFile
         let format = newFile.processingFormat
@@ -84,7 +97,10 @@ final class EngineBackend: PlaybackBackend {
     }
 
     func play() {
-        guard file != nil else { return }
+        guard let file, file.length > 0 else { return }
+        if segmentStart >= file.length {
+            schedule(fromFrame: 0)
+        }
         do {
             if !engine.isRunning {
                 engine.prepare()
@@ -94,6 +110,7 @@ final class EngineBackend: PlaybackBackend {
             isPlaying = true
         } catch {
             isPlaying = false
+            onPlaybackStateChanged?(false)
         }
     }
 
@@ -104,13 +121,14 @@ final class EngineBackend: PlaybackBackend {
     }
 
     func seek(to seconds: Double) {
-        guard let file else { return }
+        guard let file, file.processingFormat.sampleRate > 0 else { return }
         let wasPlaying = isPlaying
-        let clamped = min(max(seconds, 0), duration)
+        let clamped = min(max(seconds.isFinite ? seconds : 0, 0), duration)
         stopNode()
         lastTime = clamped
-        schedule(fromFrame: AVAudioFramePosition(clamped * file.processingFormat.sampleRate))
-        if wasPlaying { play() }
+        let targetFrame = min(AVAudioFramePosition(clamped * file.processingFormat.sampleRate), file.length)
+        schedule(fromFrame: targetFrame, fireFinishIfAtEnd: wasPlaying)
+        if wasPlaying && targetFrame < file.length { play() }
     }
 
     func stop() {
@@ -118,6 +136,21 @@ final class EngineBackend: PlaybackBackend {
         file = nil
         lastTime = 0
         engine.pause()
+    }
+
+    func rebuildAfterMediaServicesReset() {
+        let wasPlaying = isPlaying
+        let position = currentTime
+        stopNode()
+        rebuildEngine()
+        if file != nil {
+            let clamped = min(max(position, 0), duration)
+            lastTime = clamped
+            if let file, file.processingFormat.sampleRate > 0 {
+                schedule(fromFrame: AVAudioFramePosition(clamped * file.processingFormat.sampleRate))
+            }
+            if wasPlaying { play() }
+        }
     }
 
     // MARK: Graph
@@ -135,15 +168,20 @@ final class EngineBackend: PlaybackBackend {
         }
     }
 
+    /// Safely stops/disconnects before mutating node bus formats (prevents Obj-C NSException).
     private func connect(_ format: AVAudioFormat) {
+        let wasRunning = engine.isRunning
+        if wasRunning { engine.stop() }
+        engine.disconnectNodeOutput(node)
+        engine.disconnectNodeOutput(eq)
         engine.connect(node, to: eq, format: format)
         engine.connect(eq, to: engine.mainMixerNode, format: format)
         connectedFormat = format
     }
 
-    /// A fresh engine picks up the hardware's current format for its mixer → output link,
-    /// which is the reliable way to follow a sample-rate switch.
     private func rebuildEngine() {
+        isRebuilding = true
+        defer { isRebuilding = false }
         engine.stop()
         engine.detach(node)
         engine.detach(eq)
@@ -153,22 +191,28 @@ final class EngineBackend: PlaybackBackend {
         if let format = file?.processingFormat { connect(format) }
     }
 
-    /// Asks the output for `rate`. Returns whether the engine had to be rebuilt.
+    private var isWiredOutput: Bool {
+        let port = AVAudioSession.sharedInstance().currentRoute.outputs.first?.portType
+        return port.map { [.usbAudio, .headphones, .lineOut, .HDMI].contains($0) } ?? false
+    }
+
     @discardableResult
     private func matchHardwareRate(_ rate: Double) -> Bool {
         let session = AVAudioSession.sharedInstance()
+        guard isWiredOutput else { return false }
         try? session.setActive(true)
         guard abs(session.sampleRate - rate) > 1 else { return false }
+        lastRequestedRate = rate
         try? session.setPreferredSampleRate(rate)
-        // The switch is usually immediate; rebuild so the mixer runs at the new rate too.
         let wasPlaying = isPlaying
-        let position = lastTime
+        let position = currentTime
         stopNode()
         rebuildEngine()
-        if file != nil, wasPlaying {
-            lastTime = position
-            seek(to: position)
-            play()
+        if let file, file.processingFormat.sampleRate > 0 {
+            let clamped = min(max(position, 0), duration)
+            lastTime = clamped
+            schedule(fromFrame: AVAudioFramePosition(clamped * file.processingFormat.sampleRate))
+            if wasPlaying { play() }
         }
         onOutputChange?()
         return true
@@ -177,8 +221,8 @@ final class EngineBackend: PlaybackBackend {
     private func restoreDefaultRate() {
         let session = AVAudioSession.sharedInstance()
         guard abs(session.sampleRate - 48_000) > 1 else { return }
+        lastRequestedRate = 48_000
         try? session.setPreferredSampleRate(48_000)
-        // The configuration-change notification handles the rest.
     }
 
     private func stopNode() {
@@ -187,13 +231,15 @@ final class EngineBackend: PlaybackBackend {
         isPlaying = false
     }
 
-    private func schedule(fromFrame frame: AVAudioFramePosition) {
+    /// Chunks segments > UInt32.max frames (long hi-res / .m4b files) and avoids infinite 0-frame loops.
+    private func schedule(fromFrame frame: AVAudioFramePosition, fireFinishIfAtEnd: Bool = true) {
         guard let file else { return }
         generation += 1
         let token = generation
         segmentStart = frame
         let remaining = file.length - frame
         guard remaining > 0 else {
+            guard fireFinishIfAtEnd else { return }
             Task { @MainActor [weak self] in
                 guard let self, self.generation == token else { return }
                 self.isPlaying = false
@@ -201,34 +247,52 @@ final class EngineBackend: PlaybackBackend {
             }
             return
         }
-        node.scheduleSegment(file, startingFrame: frame, frameCount: AVAudioFrameCount(remaining), at: nil,
+
+        let maxChunk = AVAudioFramePosition(UInt32.max)
+        let chunkFrames = min(remaining, maxChunk)
+        let nextFrame = frame + chunkFrames
+        let isFinalChunk = nextFrame >= file.length
+
+        node.scheduleSegment(file, startingFrame: frame, frameCount: AVAudioFrameCount(chunkFrames), at: nil,
                              completionCallbackType: .dataPlayedBack) { [weak self] _ in
             Task { @MainActor [weak self] in
-                // Stopping the node (seek, new track) also fires this; the generation check ignores those.
                 guard let self, self.generation == token else { return }
-                self.isPlaying = false
-                self.onFinish?()
+                if isFinalChunk {
+                    self.isPlaying = false
+                    self.onFinish?()
+                } else {
+                    self.schedule(fromFrame: nextFrame, fireFinishIfAtEnd: true)
+                    self.play()
+                }
             }
         }
     }
 
-    /// Route or sample-rate changes (headphones, DACs, AirPlay, Bluetooth) stop the engine;
-    /// rebuild it for the new output and pick up where we were.
     private func recoverFromConfigurationChange() {
+        guard !isRebuilding else { return }
         defer { onOutputChange?() }
-        guard file != nil else {
+        guard let file, file.processingFormat.sampleRate > 0 else {
             rebuildEngine()
             return
         }
         let wasPlaying = isPlaying
-        let position = lastTime
+        let position = currentTime
+        // Don't auto-blast audio on built-in speaker if headphones were just unplugged.
+        let outputType = AVAudioSession.sharedInstance().currentRoute.outputs.first?.portType
+        let shouldResume = wasPlaying && outputType != .builtInSpeaker && outputType != .builtInReceiver
         stopNode()
-        if bitPerfect, let rate = file?.processingFormat.sampleRate {
-            try? AVAudioSession.sharedInstance().setPreferredSampleRate(rate)
+        if bitPerfect && isWiredOutput, abs(AVAudioSession.sharedInstance().sampleRate - file.processingFormat.sampleRate) > 1 {
+            try? AVAudioSession.sharedInstance().setPreferredSampleRate(file.processingFormat.sampleRate)
         }
         rebuildEngine()
-        isPlaying = wasPlaying
-        seek(to: position)  // reschedules, and restarts playback if we were playing
+        let clamped = min(max(position, 0), duration)
+        lastTime = clamped
+        schedule(fromFrame: AVAudioFramePosition(clamped * file.processingFormat.sampleRate))
+        if shouldResume {
+            play()
+        } else if wasPlaying {
+            onPlaybackStateChanged?(false)
+        }
     }
 }
 
@@ -237,28 +301,52 @@ final class EngineBackend: PlaybackBackend {
 @MainActor
 final class AVPlayerBackend: PlaybackBackend {
     var onFinish: (() -> Void)?
+    var onPlaybackStateChanged: ((Bool) -> Void)?
     private let player = AVPlayer()
-    private var endObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var endObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var failObserver: NSObjectProtocol?
+    private var statusObservation: NSKeyValueObservation?
+    private var pendingSeekTarget: Double?
 
-    var isPlaying: Bool { player.rate > 0 }
+    deinit {
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let failObserver { NotificationCenter.default.removeObserver(failObserver) }
+    }
+
+    var isPlaying: Bool {
+        player.timeControlStatus == .playing || player.rate > 0
+    }
 
     var duration: Double {
-        guard let duration = player.currentItem?.duration, duration.isNumeric else { return 0 }
-        return duration.seconds
+        guard let duration = player.currentItem?.duration, duration.isNumeric, duration.seconds.isFinite else { return 0 }
+        return max(0, duration.seconds)
     }
 
     var currentTime: Double {
+        if let pendingSeekTarget { return pendingSeekTarget }
         let time = player.currentTime()
-        return time.isNumeric ? time.seconds : 0
+        return (time.isNumeric && time.seconds.isFinite) ? max(0, time.seconds) : 0
     }
 
     func load(_ url: URL) throws {
+        clearObservers()
+        pendingSeekTarget = nil
         let item = AVPlayerItem(url: url)
         item.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item,
-                                                             queue: .main) { [weak self] _ in
+        endObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
+        ) { [weak self] _ in
             MainActor.assumeIsolated { self?.onFinish?() }
+        }
+        failObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime, object: item, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.onPlaybackStateChanged?(false) }
+        }
+        statusObservation = item.observe(\.status, options: [.new]) { [weak self] observed, _ in
+            if observed.status == .failed {
+                Task { @MainActor in self?.onPlaybackStateChanged?(false) }
+            }
         }
         player.replaceCurrentItem(with: item)
     }
@@ -267,13 +355,26 @@ final class AVPlayerBackend: PlaybackBackend {
     func pause() { player.pause() }
 
     func seek(to seconds: Double) {
-        player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+        let clamped = max(0, seconds.isFinite ? seconds : 0)
+        pendingSeekTarget = clamped
+        player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            Task { @MainActor in self?.pendingSeekTarget = nil }
+        }
     }
 
     func stop() {
         player.pause()
-        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
-        endObserver = nil
+        clearObservers()
+        pendingSeekTarget = nil
         player.replaceCurrentItem(with: nil)
+    }
+
+    private func clearObservers() {
+        statusObservation?.invalidate()
+        statusObservation = nil
+        if let endObserver { NotificationCenter.default.removeObserver(endObserver) }
+        if let failObserver { NotificationCenter.default.removeObserver(failObserver) }
+        endObserver = nil
+        failObserver = nil
     }
 }

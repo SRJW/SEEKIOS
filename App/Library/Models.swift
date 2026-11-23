@@ -2,7 +2,7 @@ import Foundation
 
 /// One audio file in the library. `id` is the path relative to the Music folder, which stays
 /// stable across app updates (the absolute container path doesn't).
-struct Track: Identifiable, Hashable {
+struct Track: Identifiable, Hashable, Sendable {
     let id: String
     let url: URL
     var title: String
@@ -21,12 +21,9 @@ struct Track: Identifiable, Hashable {
 
     var folder: URL { url.deletingLastPathComponent() }
     var fileExtension: String { url.pathExtension.lowercased() }
-
-    static func == (lhs: Track, rhs: Track) -> Bool { lhs.id == rhs.id }
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
-struct Album: Identifiable, Hashable {
+struct Album: Identifiable, Hashable, Sendable {
     let id: String
     let title: String
     let artist: String
@@ -37,13 +34,10 @@ struct Album: Identifiable, Hashable {
 
     var duration: Double { tracks.reduce(0) { $0 + $1.duration } }
     var isSpatial: Bool { tracks.contains(where: \.isSpatial) }
-
-    static func == (lhs: Album, rhs: Album) -> Bool { lhs.id == rhs.id }
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
 }
 
 /// What the library grid shows: albums, plus songs that don't belong to one.
-enum LibraryItem: Identifiable, Hashable {
+enum LibraryItem: Identifiable, Hashable, Sendable {
     case album(Album)
     case single(Track)
 
@@ -90,23 +84,25 @@ enum LibraryItem: Identifiable, Hashable {
     }
 }
 
-struct ArtistEntry: Identifiable, Hashable {
+struct ArtistEntry: Identifiable, Hashable, Sendable {
     var id: String { name }
     let name: String
     let albums: [Album]
     let singles: [Track]
 
     var trackCount: Int { albums.reduce(singles.count) { $0 + $1.tracks.count } }
+    var mostRecentDate: Date {
+        let maxAlbum = albums.map(\.addedAt).max() ?? .distantPast
+        let maxSingle = singles.map(\.addedAt).max() ?? .distantPast
+        return max(maxAlbum, maxSingle)
+    }
     var artwork: ArtworkSource? {
         if let album = albums.first { return .album(album) }
         return singles.first.map { .track($0) }
     }
-
-    static func == (lhs: ArtistEntry, rhs: ArtistEntry) -> Bool { lhs.name == rhs.name }
-    func hash(into hasher: inout Hasher) { hasher.combine(name) }
 }
 
-enum ArtworkSource: Hashable {
+enum ArtworkSource: Hashable, Sendable {
     case album(Album)
     case track(Track)
     /// A free-text "artist album" query, looked up online (search results, downloads).
@@ -124,16 +120,21 @@ enum ArtworkSource: Hashable {
 enum SortKey {
     /// First letter for A–Z sections; everything else (digits, symbols, other scripts) goes under "#".
     static func section(for text: String) -> String {
-        let folded = text.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
-        guard let first = sortable(folded).first, first.isASCII, first.isLetter else { return "#" }
+        let sortBase = sortable(text)
+        let folded = sortBase.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
+        guard let first = folded.first, first.isASCII, first.isLetter else { return "#" }
         return String(first).uppercased()
     }
 
-    /// Ignores a leading "The " the way Apple Music does.
+    /// Ignores a leading ASCII "The " the way Apple Music does (preserving diacritics like "Thé").
     static func sortable(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.lowercased().hasPrefix("the "), trimmed.count > 4 {
-            return String(trimmed.dropFirst(4))
+        if trimmed.count > 4 {
+            let prefix = trimmed.prefix(4)
+            if prefix == "The " || prefix == "the " || prefix == "THE " {
+                let remainder = trimmed.dropFirst(4).trimmingCharacters(in: .whitespaces)
+                if !remainder.isEmpty { return remainder }
+            }
         }
         return trimmed
     }

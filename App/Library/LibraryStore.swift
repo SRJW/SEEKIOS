@@ -20,13 +20,16 @@ final class LibraryStore: ObservableObject {
 
     private var cache: [String: CachedEntry] = [:]
     private var rescanQueued = false
+    private var activeImportCount = 0
     private var albumByTrack: [String: Album] = [:]
     private var tracksByID: [String: Track] = [:]
     private var albumsByID: [String: Album] = [:]
+    private var ownedFilenamesLower = Set<String>()
+    private var ownedFolderNamesLower = Set<String>()
+    private let cacheWriteQueue = DispatchQueue(label: "seekios.library-cache")
 
     nonisolated private static var cacheURL: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("library-cache-v2.json")  // v2: adds MusicBrainz IDs, forces one re-read
+        AppDirectories.applicationSupport.appendingPathComponent("library-cache-v2.json")
     }
 
     nonisolated static let audioExtensions: Set<String> = ["mp3", "m4a", "m4b", "mp4", "aac", "alac", "flac", "wav", "aif", "aiff", "caf"]
@@ -38,6 +41,8 @@ final class LibraryStore: ObservableObject {
         let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         root = documents.appendingPathComponent("Music", isDirectory: true)
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let canonicalRoot = root.canonicalFileURL
+        Task { await ArtworkStore.shared.setLibraryRoot(canonicalRoot) }
         if let data = try? Data(contentsOf: Self.cacheURL),
            let decoded = try? JSONDecoder().decode([String: CachedEntry].self, from: data) {
             cache = decoded
@@ -54,13 +59,20 @@ final class LibraryStore: ObservableObject {
 
     func artist(named name: String) -> ArtistEntry? { artists.first { $0.name == name } }
 
+    func ownsFile(named filename: String) -> Bool {
+        ownedFilenamesLower.contains(filename.lowercased())
+    }
+
+    func ownsFolder(named folderName: String) -> Bool {
+        ownedFolderNamesLower.contains(folderName.lowercased())
+    }
+
     /// The library song stored at a file URL (e.g. a finished download), if any.
     func track(at url: URL) -> Track? {
-        let rootPath = root.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        guard path.hasPrefix(rootPath) else { return nil }
-        var relative = String(path.dropFirst(rootPath.count))
-        if relative.hasPrefix("/") { relative.removeFirst() }
+        let rootPath = root.canonicalPath
+        let path = url.canonicalPath
+        guard path.hasPrefix(rootPath + "/") else { return nil }
+        let relative = String(path.dropFirst(rootPath.count + 1))
         return tracksByID[relative]
     }
 
@@ -106,16 +118,22 @@ final class LibraryStore: ObservableObject {
         track.url.deletingPathExtension().appendingPathExtension("lrc")
     }
 
-    /// Copies a picked .lrc/.txt next to the song so it's used instead of LRCLIB.
-    func importLyrics(from source: URL, for track: Track) -> Bool {
-        let scoped = source.startAccessingSecurityScopedResource()
-        defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-        guard let data = try? Data(contentsOf: source), !data.isEmpty, data.count < 2_000_000 else { return false }
-        return (try? data.write(to: Self.lyricsURL(for: track), options: .atomic)) != nil
+    /// Copies a picked .lrc/.txt next to the song off the main actor so it's used instead of LRCLIB.
+    func importLyrics(from source: URL, for track: Track) async -> Bool {
+        let destination = Self.lyricsURL(for: track)
+        return await Task.detached(priority: .userInitiated) {
+            let scoped = source.startAccessingSecurityScopedResource()
+            defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: source), !data.isEmpty, data.count < 2_000_000 else { return false }
+            return (try? data.write(to: destination, options: .atomic)) != nil
+        }.value
     }
 
     func removeLyricsFile(for track: Track) {
-        try? FileManager.default.removeItem(at: Self.lyricsURL(for: track))
+        let url = Self.lyricsURL(for: track)
+        Task.detached(priority: .utility) {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     // MARK: Scanning
@@ -137,30 +155,29 @@ final class LibraryStore: ObservableObject {
 
     private func apply(_ result: ScanResult) {
         cache = result.cache
-        let grouped = Self.group(result.tracks, root: root)
         tracks = result.tracks
-        albums = grouped.albums
-        items = grouped.items
-        artists = grouped.artists
-        tracksByID = Dictionary(result.tracks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        albumsByID = Dictionary(grouped.albums.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        var byTrack: [String: Album] = [:]
-        for album in grouped.albums {
-            for track in album.tracks { byTrack[track.id] = album }
-        }
-        albumByTrack = byTrack
+        albums = result.albums
+        items = result.items
+        artists = result.artists
+        tracksByID = result.tracksByID
+        albumsByID = result.albumsByID
+        albumByTrack = result.albumByTrack
+        ownedFilenamesLower = result.ownedFilenamesLower
+        ownedFolderNamesLower = result.ownedFolderNamesLower
         isScanning = false
         onSharesChanged?(result.shares)
-        // New folders may have brought cover files; let artwork views look again.
+
         Task {
             await ArtworkStore.shared.forgetFolderListings()
             self.artworkRevision += 1
         }
 
         let snapshot = result.cache
-        Task.detached(priority: .background) {
+        let targetURL = Self.cacheURL
+        cacheWriteQueue.async {
+            AppDirectories.ensureParentDirectory(for: targetURL)
             if let data = try? JSONEncoder().encode(snapshot) {
-                try? data.write(to: Self.cacheURL, options: .atomic)
+                try? data.write(to: targetURL, options: .atomic)
             }
         }
 
@@ -172,6 +189,14 @@ final class LibraryStore: ObservableObject {
 
     private struct ScanResult: Sendable {
         let tracks: [Track]
+        let albums: [Album]
+        let items: [LibraryItem]
+        let artists: [ArtistEntry]
+        let tracksByID: [String: Track]
+        let albumsByID: [String: Album]
+        let albumByTrack: [String: Album]
+        let ownedFilenamesLower: Set<String>
+        let ownedFolderNamesLower: Set<String>
         let shares: [LocalShare]
         let cache: [String: CachedEntry]
     }
@@ -182,7 +207,6 @@ final class LibraryStore: ObservableObject {
         var tracks: [Track] = []
         var shares: [LocalShare] = []
 
-        // Read new files a few at a time; cached ones are free.
         var pending: [(FileEntry, Int)] = []
         var infos = [TrackInfo?](repeating: nil, count: files.count)
         for (index, file) in files.enumerated() {
@@ -192,24 +216,35 @@ final class LibraryStore: ObservableObject {
                 pending.append((file, index))
             }
         }
-        for chunkStart in stride(from: 0, to: pending.count, by: 4) {
-            let chunk = pending[chunkStart..<min(chunkStart + 4, pending.count)]
-            await withTaskGroup(of: (Int, TrackInfo).self) { group in
-                for (file, index) in chunk {
-                    group.addTask {
-                        let info = await MetadataReader.read(url: file.url)
-                        return (index, info)
-                    }
+
+        // Sliding window of 4 concurrent metadata reads (eliminates chunk head-of-line blocking).
+        await withTaskGroup(of: (Int, TrackInfo).self) { group in
+            var nextIndex = 0
+            let maxConcurrent = 4
+            while nextIndex < min(maxConcurrent, pending.count) {
+                let (file, idx) = pending[nextIndex]
+                nextIndex += 1
+                group.addTask { (idx, await MetadataReader.read(url: file.url)) }
+            }
+            for await (idx, info) in group {
+                infos[idx] = info
+                if nextIndex < pending.count {
+                    let (file, nextIdx) = pending[nextIndex]
+                    nextIndex += 1
+                    group.addTask { (nextIdx, await MetadataReader.read(url: file.url)) }
                 }
-                for await (index, info) in group { infos[index] = info }
             }
         }
+
+        var filenamesLower = Set<String>()
+        var foldersLower = Set<String>()
+        let canonicalRoot = root.canonicalPath
 
         for (index, file) in files.enumerated() {
             let info = infos[index] ?? TrackInfo()
             newCache[file.relativePath] = CachedEntry(size: file.size, modified: file.modified, info: info)
             let fallbackTitle = file.url.deletingPathExtension().lastPathComponent
-            tracks.append(Track(
+            let track = Track(
                 id: file.relativePath,
                 url: file.url,
                 title: info.title ?? fallbackTitle,
@@ -223,11 +258,40 @@ final class LibraryStore: ObservableObject {
                 addedAt: Date(timeIntervalSince1970: file.modified),
                 isSpatial: info.isSpatial,
                 hasEmbeddedArt: info.hasEmbeddedArt,
-                musicBrainzAlbumID: info.musicBrainzAlbumID))
-            let virtualPath = (["colon3"] + file.relativePath.split(separator: "/").map(String.init)).joined(separator: "\\")
+                musicBrainzAlbumID: info.musicBrainzAlbumID
+            )
+            tracks.append(track)
+            filenamesLower.insert(file.url.lastPathComponent.lowercased())
+            if track.folder.canonicalPath != canonicalRoot {
+                foldersLower.insert(track.folder.lastPathComponent.lowercased())
+            }
+            let virtualPath = (["Seekios"] + file.relativePath.split(separator: "/").map(String.init)).joined(separator: "\\")
             shares.append(LocalShare(virtualPath: virtualPath, url: file.url, size: UInt64(max(file.size, 0))))
         }
-        return ScanResult(tracks: tracks, shares: shares, cache: newCache)
+
+        // Group and index completely off MainActor!
+        let grouped = group(tracks, root: root)
+        let tracksByID = Dictionary(tracks.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let albumsByID = Dictionary(grouped.albums.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        var byTrack: [String: Album] = [:]
+        for album in grouped.albums {
+            foldersLower.insert(album.title.lowercased())
+            for track in album.tracks { byTrack[track.id] = album }
+        }
+
+        return ScanResult(
+            tracks: tracks,
+            albums: grouped.albums,
+            items: grouped.items,
+            artists: grouped.artists,
+            tracksByID: tracksByID,
+            albumsByID: albumsByID,
+            albumByTrack: byTrack,
+            ownedFilenamesLower: filenamesLower,
+            ownedFolderNamesLower: foldersLower,
+            shares: shares,
+            cache: newCache
+        )
     }
 
     private struct FileEntry: Sendable {
@@ -241,15 +305,15 @@ final class LibraryStore: ObservableObject {
         let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
         guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: keys,
                                                               options: [.skipsHiddenFiles]) else { return [] }
-        let rootPath = root.standardizedFileURL.path
+        let rootPath = root.canonicalPath
         var found: [FileEntry] = []
         for case let url as URL in enumerator {
             guard audioExtensions.contains(url.pathExtension.lowercased()),
                   let values = try? url.resourceValues(forKeys: Set(keys)),
                   values.isRegularFile == true else { continue }
-            let fullPath = url.standardizedFileURL.path
-            var relative = fullPath.hasPrefix(rootPath) ? String(fullPath.dropFirst(rootPath.count)) : url.lastPathComponent
-            if relative.hasPrefix("/") { relative.removeFirst() }
+            let fullPath = url.canonicalPath
+            guard fullPath.hasPrefix(rootPath + "/") else { continue }
+            let relative = String(fullPath.dropFirst(rootPath.count + 1))
             found.append(FileEntry(url: url, relativePath: relative, size: Int64(values.fileSize ?? 0),
                                    modified: values.contentModificationDate?.timeIntervalSince1970 ?? 0))
         }
@@ -259,21 +323,29 @@ final class LibraryStore: ObservableObject {
     // MARK: Grouping
 
     private nonisolated static func group(_ tracks: [Track], root: URL) -> (albums: [Album], items: [LibraryItem], artists: [ArtistEntry]) {
-        let rootPath = root.standardizedFileURL.path
-        let audioPerFolder = Dictionary(grouping: tracks, by: { $0.folder.standardizedFileURL.path }).mapValues(\.count)
+        let rootPath = root.canonicalPath
+        let tracksByFolder = Dictionary(grouping: tracks, by: { $0.folder.canonicalPath })
+        // Pre-resolve folder-level albumArtist if any track in the folder defines one, preventing album splits.
+        var folderAlbumArtist: [String: String] = [:]
+        for (folder, folderTracks) in tracksByFolder {
+            if let artist = folderTracks.compactMap(\.albumArtist).first(where: { !$0.isEmpty }) {
+                folderAlbumArtist[folder] = artist
+            }
+        }
 
         var albumTracks: [String: [Track]] = [:]
         var albumTitles: [String: String] = [:]
         var singles: [Track] = []
 
         for track in tracks {
-            let folderPath = track.folder.standardizedFileURL.path
+            let folderPath = track.folder.canonicalPath
             if let album = track.album?.trimmingCharacters(in: .whitespaces), !album.isEmpty {
-                let owner = (track.albumArtist?.lowercased()).map { "artist:" + $0 } ?? "folder:" + folderPath
+                let effectiveAlbumArtist = track.albumArtist ?? folderAlbumArtist[folderPath]
+                let owner = (effectiveAlbumArtist?.lowercased()).map { "artist:" + $0 } ?? "folder:" + folderPath
                 let key = owner + "|" + album.lowercased()
                 albumTracks[key, default: []].append(track)
                 albumTitles[key] = album
-            } else if folderPath != rootPath, (audioPerFolder[folderPath] ?? 0) >= 2 {
+            } else if folderPath != rootPath, (tracksByFolder[folderPath]?.count ?? 0) >= 2 {
                 let key = "folder:" + folderPath
                 albumTracks[key, default: []].append(track)
                 albumTitles[key] = track.folder.lastPathComponent
@@ -284,9 +356,12 @@ final class LibraryStore: ObservableObject {
 
         var albums: [Album] = []
         for (key, members) in albumTracks {
+            // Strict weak ordering: disc -> (trackNumber ?? .max) -> filename
             let sorted = members.sorted { lhs, rhs in
-                if (lhs.discNumber ?? 1) != (rhs.discNumber ?? 1) { return (lhs.discNumber ?? 1) < (rhs.discNumber ?? 1) }
-                if let left = lhs.trackNumber, let right = rhs.trackNumber, left != right { return left < right }
+                let leftDisc = lhs.discNumber ?? 1, rightDisc = rhs.discNumber ?? 1
+                if leftDisc != rightDisc { return leftDisc < rightDisc }
+                let leftTrack = lhs.trackNumber ?? Int.max, rightTrack = rhs.trackNumber ?? Int.max
+                if leftTrack != rightTrack { return leftTrack < rightTrack }
                 return lhs.url.lastPathComponent.localizedStandardCompare(rhs.url.lastPathComponent) == .orderedAscending
             }
             let artists = Set(sorted.map(\.artist))
@@ -311,9 +386,15 @@ final class LibraryStore: ObservableObject {
         for single in singles { artistSingles[single.artist, default: []].append(single) }
         let names = Set(artistAlbums.keys).union(artistSingles.keys)
         let artists = names.sorted(by: SortKey.less).map { name in
-            ArtistEntry(name: name,
-                        albums: (artistAlbums[name] ?? []).sorted { ($0.year ?? 0, $0.title) > ($1.year ?? 0, $1.title) },
-                        singles: (artistSingles[name] ?? []).sorted { SortKey.less($0.title, $1.title) })
+            ArtistEntry(
+                name: name,
+                albums: (artistAlbums[name] ?? []).sorted { lhs, rhs in
+                    let ly = lhs.year ?? 0, ry = rhs.year ?? 0
+                    if ly != ry { return ly > ry }
+                    return SortKey.less(lhs.title, rhs.title)
+                },
+                singles: (artistSingles[name] ?? []).sorted { SortKey.less($0.title, $1.title) }
+            )
         }
         return (albums, items, artists)
     }
@@ -321,28 +402,56 @@ final class LibraryStore: ObservableObject {
     // MARK: Changes
 
     func delete(_ doomed: [Track]) {
-        let fileManager = FileManager.default
-        var folders = Set<URL>()
-        for track in doomed {
-            try? fileManager.removeItem(at: track.url)
-            try? fileManager.removeItem(at: Self.lyricsURL(for: track))
-            folders.insert(track.folder)
+        guard !doomed.isEmpty else { return }
+        let doomedIDs = Set(doomed.map(\.id))
+        let removedArt = customTrackArt.intersection(doomedIDs)
+        if !removedArt.isEmpty {
+            customTrackArt.subtract(removedArt)
+            UserDefaults.standard.set(Array(customTrackArt), forKey: "customTrackArt")
         }
-        // Drop folders that no longer hold any audio (leftover covers included).
-        for folder in folders where folder.standardizedFileURL != root.standardizedFileURL {
-            let contents = (try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
-            let hasAudio = contents.contains { Self.audioExtensions.contains($0.pathExtension.lowercased()) }
-            let hasSubfolders = contents.contains { $0.hasDirectoryPath }
-            if !hasAudio, !hasSubfolders { try? fileManager.removeItem(at: folder) }
+
+        let rootPath = root.canonicalPath
+        let tracksToDelete = doomed
+        Task.detached(priority: .userInitiated) {
+            let fileManager = FileManager.default
+            var folders = Set<URL>()
+            for track in tracksToDelete {
+                try? fileManager.removeItem(at: track.url)
+                try? fileManager.removeItem(at: Self.lyricsURL(for: track))
+                await ArtworkStore.shared.removeOverride(for: .track(track))
+                folders.insert(track.folder)
+            }
+            // Drop folders that no longer hold any audio (never deleting Documents/Music itself).
+            for folder in folders {
+                let folderPath = folder.canonicalPath
+                guard folderPath != rootPath, folderPath.hasPrefix(rootPath + "/") else { continue }
+                let contents = (try? fileManager.contentsOfDirectory(
+                    at: folder,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: []
+                )) ?? []
+                let hasAudio = contents.contains { Self.audioExtensions.contains($0.pathExtension.lowercased()) }
+                let hasSubfolders = contents.contains {
+                    (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+                }
+                if !hasAudio, !hasSubfolders { try? fileManager.removeItem(at: folder) }
+            }
+            await MainActor.run { self.rescan() }
         }
-        rescan()
     }
 
     /// Copies audio files (or whole folders, covers included) into the library. Returns how many
     /// audio files were added.
     func importItems(_ urls: [URL]) async -> Int {
+        activeImportCount += 1
         isImporting = true
-        defer { isImporting = false }
+        defer {
+            activeImportCount -= 1
+            if activeImportCount <= 0 {
+                activeImportCount = 0
+                isImporting = false
+            }
+        }
         let root = self.root
         let added = await Task.detached(priority: .userInitiated) { () -> Int in
             var count = 0
@@ -367,14 +476,14 @@ final class LibraryStore: ObservableObject {
             var count = 0
             guard let enumerator = fileManager.enumerator(at: url, includingPropertiesForKeys: [.isRegularFileKey],
                                                           options: [.skipsHiddenFiles]) else { return 0 }
-            let sourcePath = url.resolvingSymlinksInPath().path
+            let sourcePath = url.canonicalPath
             for case let file as URL in enumerator {
                 let ext = file.pathExtension.lowercased()
                 let isAudio = audioExtensions.contains(ext)
                 guard isAudio || sidecarExtensions.contains(ext) else { continue }
-                let filePath = file.resolvingSymlinksInPath().path
-                guard filePath.hasPrefix(sourcePath) else { continue }
-                let relative = String(filePath.dropFirst(sourcePath.count))
+                let filePath = file.canonicalPath
+                guard filePath.hasPrefix(sourcePath + "/") else { continue }
+                let relative = String(filePath.dropFirst(sourcePath.count + 1))
                 let destination = destinationFolder.appendingPathComponent(relative)
                 try? fileManager.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
                 if (try? fileManager.copyItem(at: file, to: destination)) != nil, isAudio { count += 1 }
@@ -384,14 +493,14 @@ final class LibraryStore: ObservableObject {
 
         let ext = url.pathExtension.lowercased()
         if ext == "lrc" {
-            // A loose .lrc goes next to the song with the same name, wherever it is.
             let base = url.deletingPathExtension().lastPathComponent.lowercased()
             guard let match = audioFiles(in: root).first(where: {
                 $0.url.deletingPathExtension().lastPathComponent.lowercased() == base
             }) else { return 0 }
             let destination = match.url.deletingPathExtension().appendingPathExtension("lrc")
-            try? fileManager.removeItem(at: destination)
-            _ = try? fileManager.copyItem(at: url, to: destination)
+            if let data = try? Data(contentsOf: url), !data.isEmpty, data.count < 2_000_000 {
+                return (try? data.write(to: destination, options: .atomic)) != nil ? 1 : 0
+            }
             return 0
         }
         guard audioExtensions.contains(ext) else { return 0 }

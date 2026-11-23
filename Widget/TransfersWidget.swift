@@ -14,8 +14,8 @@ struct TransfersLiveActivity: Widget {
         ActivityConfiguration(for: TransferActivityAttributes.self) { context in
             LockScreenTransfers(state: context.state, accent: accent(context.attributes))
                 .padding(16)
-                .widgetURL(URL(string: "colon3://downloads"))
-                .activityBackgroundTint(Color.black.opacity(0.55))
+                .widgetURL(URL(string: "seekios://downloads"))
+                .activityBackgroundTint(Color.black.opacity(0.65))
                 .activitySystemActionForegroundColor(.white)
         } dynamicIsland: { context in
             let state = context.state
@@ -48,7 +48,7 @@ struct TransfersLiveActivity: Widget {
                         if state.isIdleSeeding {
                             Text("Sharing your library on Soulseek").font(.caption).foregroundStyle(.secondary)
                         } else {
-                            ProgressView(value: state.fraction).tint(tint)
+                            ProgressView(value: state.clampedFraction).tint(tint)
                         }
                     }
                     .padding(.horizontal, 4)
@@ -63,20 +63,24 @@ struct TransfersLiveActivity: Widget {
                 if state.isIdleSeeding {
                     Image(systemName: state.symbol).foregroundStyle(tint)
                 } else {
-                    ProgressView(value: state.fraction)
-                        .progressViewStyle(.circular)
-                        .tint(tint)
+                    Gauge(value: state.clampedFraction) {
+                        EmptyView()
+                    }
+                    .gaugeStyle(.accessoryCircularCapacity)
+                    .tint(tint)
                 }
             }
-            .widgetURL(URL(string: "colon3://downloads"))
+            .widgetURL(URL(string: "seekios://downloads"))
             .keylineTint(tint)
         }
     }
 
     private func accent(_ attributes: TransferActivityAttributes) -> Color {
-        var text = attributes.accentHex
+        var text = attributes.accentHex.trimmingCharacters(in: .whitespacesAndNewlines)
         if text.hasPrefix("#") { text.removeFirst() }
-        guard text.count == 6, let value = UInt32(text, radix: 16) else { return .pink }
+        guard text.count == 6, let value = UInt32(text, radix: 16) else {
+            return Color(red: 1, green: 0.176, blue: 0.333)
+        }
         return Color(red: Double((value >> 16) & 0xFF) / 255,
                      green: Double((value >> 8) & 0xFF) / 255,
                      blue: Double(value & 0xFF) / 255)
@@ -99,13 +103,18 @@ struct LockScreenTransfers: View {
                     Text(state.compactText).font(.headline.monospacedDigit())
                 }
                 if !state.currentFile.isEmpty {
-                    Text(state.currentFile).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    Text(state.currentFile)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.75))
+                        .lineLimit(1)
                 }
                 if !state.isIdleSeeding {
-                    ProgressView(value: state.fraction).tint(accent)
+                    ProgressView(value: state.clampedFraction).tint(accent)
                 }
                 if !state.speedText.isEmpty {
-                    Text(state.speedText).font(.caption2).foregroundStyle(.secondary)
+                    Text(state.speedText)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.75))
                 }
             }
         }

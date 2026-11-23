@@ -59,6 +59,12 @@ struct ResultFilters: Codable, Equatable {
     var fileType: FileType = .any
     /// Minimum kbps for lossy files; lossless files always pass.
     var minBitrate = 0
+    /// Require hi-res audio (>= 24-bit or > 48 kHz).
+    var hiResOnly = false
+    /// Optional minimum folder size in megabytes (0 = any).
+    var minSizeMB = 0
+    /// Optional exact extension filter (e.g. "flac", "epub", "mkv").
+    var exactExtension = ""
     var freeSlotOnly = false
     var minFiles = 1
     /// Comma- or space-separated words; folders whose path contains any of them are hidden.
@@ -66,12 +72,29 @@ struct ResultFilters: Codable, Equatable {
     var sort: Sort = .relevance
 
     static let bitrateChoices = [0, 128, 192, 256, 320]
+    static let sizeMBChoices = [0, 10, 50, 100, 250, 500]
 
     var isDefault: Bool { self == ResultFilters() }
 
     /// How many filters differ from the defaults (sort doesn't count).
     var activeCount: Int {
-        [fileType != .any, minBitrate > 0, freeSlotOnly, minFiles > 1, !excludedTerms.isEmpty].filter { $0 }.count
+        [
+            fileType != .any,
+            minBitrate > 0,
+            hiResOnly,
+            minSizeMB > 0,
+            !cleanedExtension.isEmpty,
+            freeSlotOnly,
+            minFiles > 1,
+            !excludedTerms.isEmpty,
+        ].filter { $0 }.count
+    }
+
+    var cleanedExtension: String {
+        exactExtension
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+            .lowercased()
     }
 
     var excludedTerms: [String] {
@@ -84,10 +107,15 @@ struct ResultFilters: Codable, Equatable {
     func accepts(_ folder: FolderResult) -> Bool {
         if freeSlotOnly, !folder.slotFree { return false }
         if folder.files.count < minFiles { return false }
-        let path = folder.folder.lowercased()
+        if minSizeMB > 0, folder.totalSize < UInt64(minSizeMB) * 1_048_576 { return false }
+        let path = folder.folderLowercased
         if excludedTerms.contains(where: { path.contains($0) }) { return false }
 
-        let extensions = Set(folder.files.map { $0.fileExtension.lowercased() })
+        let extensions = folder.extensions
+        if !cleanedExtension.isEmpty, !extensions.contains(cleanedExtension) { return false }
+
+        if hiResOnly, !folder.isHiRes { return false }
+
         switch fileType {
         case .any:
             break
@@ -199,35 +227,15 @@ struct ResultFilters: Codable, Equatable {
     }
 
     static func load() -> ResultFilters {
-        guard let data = UserDefaults.standard.data(forKey: "search.filters.v3"),
+        guard let data = UserDefaults.standard.data(forKey: "search.filters.v4")
+                ?? UserDefaults.standard.data(forKey: "search.filters.v3"),
               let filters = try? JSONDecoder().decode(ResultFilters.self, from: data) else { return ResultFilters() }
         return filters
     }
 
     func save() {
         if let data = try? JSONEncoder().encode(self) {
-            UserDefaults.standard.set(data, forKey: "search.filters.v3")
+            UserDefaults.standard.set(data, forKey: "search.filters.v4")
         }
-    }
-}
-
-extension FolderResult {
-    var isLossless: Bool {
-        !files.isEmpty && files.allSatisfy { file in
-            ["flac", "wav", "aif", "aiff", "alac"].contains(file.fileExtension.lowercased()) || file.attributes.bitDepth != nil
-        }
-    }
-
-    /// Rough ordering: hi-res lossless > lossless > high-bitrate lossy > larger general files.
-    var qualityScore: Int {
-        if isLossless {
-            let depth = files.compactMap(\.attributes.bitDepth).max() ?? 16
-            let rate = files.compactMap(\.attributes.sampleRate).max() ?? 44_100
-            return 10_000 + Int(depth) * 100 + Int(rate / 1000)
-        }
-        if let minBitrate = files.compactMap(\.attributes.bitrate).min() {
-            return Int(minBitrate)
-        }
-        return Int(min(totalSize / 1_048_576, 5_000))
     }
 }

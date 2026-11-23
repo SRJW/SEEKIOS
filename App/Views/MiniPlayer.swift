@@ -58,7 +58,9 @@ struct MiniPlayerContent: View {
         .padding(.leading, compact ? 8 : 10)
         .padding(.trailing, 8)
         .contentShape(Rectangle())
-        .onTapGesture(perform: open)
+        .onTapGesture {
+            if player.current != nil { open() }
+        }
     }
 }
 

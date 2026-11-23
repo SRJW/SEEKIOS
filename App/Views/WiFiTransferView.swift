@@ -3,11 +3,19 @@ import UIKit
 
 struct WiFiTransferView: View {
     @EnvironmentObject private var server: WiFiTransferServer
+    @State private var userStopped = false
+    @State private var copied = false
 
     var body: some View {
         List {
             Section {
-                Toggle("Wi-Fi Transfer", isOn: Binding(get: { server.isRunning }, set: { $0 ? server.start() : server.stop() }))
+                Toggle("Wi-Fi Transfer", isOn: Binding(
+                    get: { server.isRunning },
+                    set: { enabled in
+                        userStopped = !enabled
+                        if enabled { server.start() } else { server.stop() }
+                    }
+                ))
             } footer: {
                 Text("Open the address in a browser on a computer on the same Wi-Fi to add music or download files. Keep this screen open while transferring.")
             }
@@ -26,8 +34,14 @@ struct WiFiTransferView: View {
                     if let url = server.url {
                         Button {
                             UIPasteboard.general.string = url
+                            copied = true
+                            Task {
+                                try? await Task.sleep(for: .seconds(2))
+                                copied = false
+                            }
                         } label: {
-                            Label("Copy Link with Code", systemImage: "doc.on.doc")
+                            Label(copied ? "Copied!" : "Copy Link with Code",
+                                  systemImage: copied ? "checkmark" : "doc.on.doc")
                         }
                         ShareLink(item: url) {
                             Label("Send Link to Computer…", systemImage: "square.and.arrow.up")
@@ -45,18 +59,18 @@ struct WiFiTransferView: View {
 
             if !server.log.isEmpty {
                 Section("Activity") {
-                    ForEach(server.log, id: \.self) { line in
-                        Text(line).font(.caption.monospaced()).lineLimit(2)
+                    ForEach(server.log) { entry in
+                        Text(entry.text).font(.caption.monospaced()).lineLimit(2)
                     }
                 }
             }
 
             Section {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("colon3's Music folder is also shared over a cable:")
-                    Text("• Mac: Finder › iPhone › Files › colon3\n• Windows: Apple Devices app › Files\n• Linux: libimobiledevice + ifuse")
+                    Text("Seekios's Music folder is also shared over a cable:")
+                    Text("• Mac: Finder › iPhone › Files › Seekios\n• Windows: Apple Devices app › Files\n• Linux: libimobiledevice + ifuse")
                         .foregroundStyle(.secondary)
-                    Text("ifuse --documents com.aminewallah.colon3 ~/iphone")
+                    Text("ifuse --documents com.srjw.seekios ~/iphone")
                         .font(.caption.monospaced())
                         .textSelection(.enabled)
                         .padding(8)
@@ -74,8 +88,13 @@ struct WiFiTransferView: View {
         .navigationTitle("Wi-Fi Transfer")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            server.start()
-            UIApplication.shared.isIdleTimerDisabled = true
+            if !userStopped, !server.isRunning {
+                server.start()
+            }
+            UIApplication.shared.isIdleTimerDisabled = server.isRunning
+        }
+        .onChange(of: server.isRunning) { _, running in
+            UIApplication.shared.isIdleTimerDisabled = running
         }
         .onDisappear {
             UIApplication.shared.isIdleTimerDisabled = false

@@ -1,15 +1,6 @@
 import Foundation
+import Network
 import SoulseekKit
-
-/// Estructura para guardar el historial de descargas (completadas y en curso) en el disco del iPhone
-struct SavedHistoryItem: Codable {
-    let username: String
-    let path: String
-    let size: UInt64
-    let received: UInt64?
-    let isCompleted: Bool
-    let urlPath: String?
-}
 
 /// Elemento de la Lista de Deseos (Wishlist)
 struct WishlistItem: Codable, Identifiable, Equatable {
@@ -26,161 +17,58 @@ struct BrowseTarget: Hashable, Identifiable {
     var id: String { "\(username)|\(folder)" }
 }
 
-/// A folder from one user's search results — can contain music or any other files.
-struct FolderResult: Identifiable {
-    let id: String
-    let username: String
-    let folder: String
-    var files: [SharedFile]
-    var images: [SharedFile] = []
-    let slotFree: Bool
-    let speed: UInt32
-    let queueLength: UInt32
-
-    var name: String {
-        let parts = folder.split(separator: "\\")
-        return parts.last.map(String.init) ?? username
-    }
-
-    var parentPath: String {
-        folder.split(separator: "\\").dropLast().joined(separator: " › ")
-    }
-
-    var parentFolderPath: String? {
-        let parts = folder.split(separator: "\\")
-        guard parts.count > 1 else { return nil }
-        return parts.dropLast().joined(separator: "\\")
-    }
-
-    var pathLevels: [(name: String, fullPath: String)] {
-        let parts = folder.split(separator: "\\").map(String.init)
-        var current = ""
-        return parts.map { part in
-            current = current.isEmpty ? part : "\(current)\\\(part)"
-            return (name: part, fullPath: current)
-        }
-    }
-
-    var totalSize: UInt64 { files.reduce(0) { $0 + $1.size } }
-    var coverQuery: String { CoverLookup.query(forFolderPath: folder) }
-
-    var formatSummary: String {
-        let extensions = Set(files.map {
-            let ext = $0.fileExtension.uppercased()
-            return ext.isEmpty ? "FILE" : ext
-        })
-        let sorted = extensions.sorted()
-        var summary = sorted.prefix(4).joined(separator: "/")
-        if sorted.count > 4 {
-            summary += " +\(sorted.count - 4)"
-        }
-        if let file = files.first(where: { $0.attributes.bitDepth != nil }),
-           let depth = file.attributes.bitDepth, let rate = file.attributes.sampleRate {
-            summary += " \(depth)/\(Formatting.kilohertz(rate))"
-        } else if let bitrate = files.compactMap({ $0.attributes.bitrate }).max() {
-            summary += " \(bitrate)k"
-        }
-        return summary
-    }
+struct SoulseekLogEntry: Identifiable, Hashable {
+    let id: Int
+    let text: String
 }
 
-struct DownloadItem: Identifiable {
-    let id: DownloadID
-    var state: DownloadState
-    var received: UInt64
-    var size: UInt64
-
-    var filename: String { SharedFile(path: id.path, size: size).filename }
-    var folderPath: String { SharedFile(path: id.path, size: size).folder }
-    var isArtwork: Bool { false }
-
-    var progress: Double {
-        size > 0 ? min(1, Double(received) / Double(size)) : 0
-    }
-
-    var isActive: Bool {
-        switch state {
-        case .completed, .failed: return false
-        default: return true
-        }
-    }
-}
-
-struct TrackCandidate: Identifiable {
-    let username: String
-    let file: SharedFile
-    let slotFree: Bool
-    let speed: UInt32
-    let queueLength: UInt32
-    var id: String { username + "|" + file.path }
-}
-
-struct UploadItem: Identifiable {
-    let id: DownloadID
-    var state: UploadState
-    var sent: UInt64
-    var size: UInt64
-
-    var filename: String { SharedFile(path: id.path, size: size).filename }
-    var progress: Double { size > 0 ? min(1, Double(sent) / Double(size)) : 0 }
-    var isActive: Bool { state == .queued || state == .transferring }
+struct StorageBreakdown: Sendable {
+    let musicBytes: UInt64
+    let downloadsBytes: UInt64
+    let incompleteBytes: UInt64
+    let incompleteCount: Int
+    let artworkCacheBytes: UInt64
 }
 
 @MainActor
 final class SoulseekModel: ObservableObject {
     @Published private(set) var connection: ClientState = .disconnected
-    @Published private(set) var results: [FolderResult] = []
-    @Published private(set) var responseCount = 0
-    @Published private(set) var currentQuery = ""
+    @Published private(set) var listeningPort: UInt16 = 0
+    @Published private(set) var wishlistIntervalSeconds: UInt32 = 720
     @Published private(set) var searchHistory: [String] = []
     @Published private(set) var wishlist: [WishlistItem] = []
     @Published private(set) var isCheckingWishlist = false
     @Published private(set) var favoriteUsers: [String] = []
     @Published private(set) var blockedUsers: [String] = []
-    @Published private(set) var downloads: [DownloadItem] = []
-    @Published private(set) var uploads: [UploadItem] = []
-    @Published private(set) var trackCandidates: [TrackCandidate] = []
-    @Published private(set) var isFindingTrack = false
-    @Published private(set) var logLines: [String] = []
+    @Published private(set) var userStatuses: [String: UserStatus] = [:]
+    @Published private(set) var logLines: [SoulseekLogEntry] = []
     @Published var username: String = UserDefaults.standard.string(forKey: "username") ?? ""
+    @Published private(set) var isOnWiFi: Bool = true
+    @Published var downloadLocationError: String?
 
     /// Ruta personalizada de descargas elegida por el usuario (o nil si usa la carpeta por defecto de la app)
     @Published private(set) var customDownloadDirectory: URL?
-    @Published var saveAllToCustomFolder: Bool = UserDefaults.standard.bool(forKey: "save_all_to_custom_folder_v1") {
+    @Published var saveAllToCustomFolder: Bool = UserDefaults.standard.object(forKey: "save_all_to_custom_folder_v1") as? Bool ?? true {
         didSet { UserDefaults.standard.set(saveAllToCustomFolder, forKey: "save_all_to_custom_folder_v1") }
     }
 
-    @Published var audioOnly = false {
-        didSet { rebuildResults() }
-    }
-    @Published var filters = ResultFilters.load() {
-        didSet {
-            filters.save()
-            rebuildResults()
-        }
-    }
-    @Published private(set) var hiddenCount = 0
-
     let client: SoulseekClient
     let library: LibraryStore
+    let transfers: TransfersStore
+    let searchStore: SearchStore
     let defaultDownloadsDirectory: URL
+    let incompleteDirectory: URL
     weak var completeness: AlbumCompletenessStore?
     weak var stats: StatsStore?
 
-    private var searchToken: UInt32?
-    private var trackSearchToken: UInt32?
     private var wishlistTokens: [UInt32: String] = [:]
-    private var trackSearchTitle = ""
-    private var responses: [SearchResponse] = []
-    private var pendingResponses: [SearchResponse] = []
-    private var flushScheduled = false
+    private var wishlistCheckTask: Task<Void, Never>?
     private var started = false
-    private var didAutoResumeOnLaunch = false
     private var coverRequested = Set<String>()
     private var hasSecurityScopeAccess = false
-
-    private var browseCache: [String: [SharedFile]] = [:]
-    private var fullBrowseLoadedUsers = Set<String>()
+    private var nextLogID = 1
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "seekios.pathmonitor")
 
     private let searchHistoryKey = "search_history_v1"
     private let wishlistKey = "wishlist_items_v1"
@@ -188,6 +76,19 @@ final class SoulseekModel: ObservableObject {
     private let blockedUsersKey = "blocked_users_v1"
     private let customDownloadBookmarkKey = "custom_download_folder_bookmark_v1"
     private let customDownloadPathKey = "custom_download_folder_path_v1"
+
+    var isEffectivelySharing: Bool {
+        AppSettings.sharingEnabled && (!AppSettings.shareOnWiFiOnly || isOnWiFi)
+    }
+
+    var sharingStatusSummary: String {
+        guard AppSettings.sharingEnabled else { return "Off (Download Only)" }
+        if AppSettings.shareOnWiFiOnly && !isOnWiFi {
+            return "Paused on Cellular (Wi-Fi Only)"
+        }
+        let count = library.tracks.count
+        return "Sharing \(count) song\(count == 1 ? "" : "s")"
+    }
 
     var otherDownloadsDirectory: URL {
         customDownloadDirectory ?? defaultDownloadsDirectory
@@ -201,24 +102,69 @@ final class SoulseekModel: ObservableObject {
         return "On My iPhone › Seekios › Downloads"
     }
 
+    var hasCredentials: Bool {
+        !username.isEmpty && Keychain.load(account: username) != nil
+    }
+
+    var isLoggedIn: Bool { connection == .loggedIn }
+
     init(library: LibraryStore) {
         self.library = library
-        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let support = AppDirectories.applicationSupport
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let defaultDir = docs.appendingPathComponent("Downloads", isDirectory: true)
+        let incompleteDir = support.appendingPathComponent("Incomplete", isDirectory: true)
         self.defaultDownloadsDirectory = defaultDir
+        self.incompleteDirectory = incompleteDir
         try? FileManager.default.createDirectory(at: defaultDir, withIntermediateDirectories: true)
+        try? FileManager.default.createDirectory(at: incompleteDir, withIntermediateDirectories: true)
 
-        client = SoulseekClient(downloadDirectory: library.root,
-                                incompleteDirectory: support.appendingPathComponent("Incomplete", isDirectory: true))
+        self.transfers = TransfersStore()
+        self.searchStore = SearchStore()
+        self.client = SoulseekClient(downloadDirectory: library.root, incompleteDirectory: incompleteDir)
+
+        searchStore.blockedUsersProvider = { [weak self] in self?.blockedUsers ?? [] }
+        searchStore.favoriteUsersProvider = { [weak self] in self?.favoriteUsers ?? [] }
+        searchStore.onQueryMatchesUpdated = { [weak self] query, count in
+            self?.updateWishlistCountIfMatching(query: query, count: count)
+        }
 
         loadCustomDownloadFolder()
-        loadHistory()
+        transfers.loadHistory(client: client)
         loadSearchHistory()
         loadWishlistAndPeers()
+        startNetworkMonitor()
+        applyClientSettings()
 
         client.onEvent = { [weak self] event in self?.handle(event) }
         library.onSharesChanged = { [weak self] shares in self?.client.updateShares(shares) }
+    }
+
+    deinit {
+        pathMonitor.cancel()
+    }
+
+    private func startNetworkMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let wifi = path.status == .satisfied && !path.isExpensive && !path.isConstrained
+            Task { @MainActor [weak self] in
+                guard let self, self.isOnWiFi != wifi else { return }
+                self.isOnWiFi = wifi
+                self.applyClientSettings()
+            }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+    }
+
+    func applyClientSettings() {
+        let effectiveShare = isEffectivelySharing
+        client.configure(
+            maxConcurrentDownloads: AppSettings.maxConcurrentDownloads,
+            maxConcurrentUploads: AppSettings.maxConcurrentUploads,
+            maxQueuedPerPeer: AppSettings.maxQueuedPerPeer,
+            sharingEnabled: effectiveShare,
+            distributedSearchEnabled: effectiveShare && AppSettings.distributedSearchEnabled
+        )
     }
 
     // MARK: - Gestión de Carpeta de Descargas Personalizada
@@ -247,28 +193,38 @@ final class SoulseekModel: ObservableObject {
 
     @discardableResult
     func setCustomDownloadFolder(_ url: URL) -> Bool {
-        if let old = customDownloadDirectory, hasSecurityScopeAccess {
+        downloadLocationError = nil
+        let accessed = url.startAccessingSecurityScopedResource()
+        let fm = FileManager.default
+        try? fm.createDirectory(at: url, withIntermediateDirectories: true)
+
+        // Verify iOS actually grants write permission (some cloud/read-only providers refuse writes).
+        let probe = url.appendingPathComponent(".seekios-write-test-\(UUID().uuidString)")
+        do {
+            try Data().write(to: probe, options: .atomic)
+            try? fm.removeItem(at: probe)
+        } catch {
+            if accessed { url.stopAccessingSecurityScopedResource() }
+            downloadLocationError = "iOS did not allow writing to “\(url.lastPathComponent)”. Choose a writable folder in On My iPhone or iCloud Drive."
+            return false
+        }
+
+        if let old = customDownloadDirectory, hasSecurityScopeAccess, old.canonicalPath != url.canonicalPath {
             old.stopAccessingSecurityScopedResource()
             hasSecurityScopeAccess = false
         }
 
-        let accessed = url.startAccessingSecurityScopedResource()
         hasSecurityScopeAccess = accessed
-
-        // Verifica o crea el directorio y guarda el marcador de seguridad persistente
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-
         if let data = try? url.bookmarkData(options: [], includingResourceValuesForKeys: nil, relativeTo: nil) {
             UserDefaults.standard.set(data, forKey: customDownloadBookmarkKey)
         }
         UserDefaults.standard.set(url.path, forKey: customDownloadPathKey)
 
         customDownloadDirectory = url
-        objectWillChange.send()
+        saveAllToCustomFolder = true
         return true
     }
 
-    /// Crea una subcarpeta personalizada dentro de Documents de la app y la asigna como destino automático
     func createAndSelectSubfolder(named name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -280,6 +236,7 @@ final class SoulseekModel: ObservableObject {
     }
 
     func resetDownloadFolderToDefault() {
+        downloadLocationError = nil
         if let old = customDownloadDirectory, hasSecurityScopeAccess {
             old.stopAccessingSecurityScopedResource()
             hasSecurityScopeAccess = false
@@ -287,17 +244,9 @@ final class SoulseekModel: ObservableObject {
         customDownloadDirectory = nil
         UserDefaults.standard.removeObject(forKey: customDownloadBookmarkKey)
         UserDefaults.standard.removeObject(forKey: customDownloadPathKey)
-        objectWillChange.send()
     }
 
-    var hasCredentials: Bool {
-        !username.isEmpty && Keychain.load(account: username) != nil
-    }
-
-    var isLoggedIn: Bool { connection == .loggedIn }
-
-    var activeDownloadCount: Int { downloads.filter { $0.isActive && !$0.isArtwork }.count }
-    var visibleDownloads: [DownloadItem] { downloads.filter { !$0.isArtwork } }
+    // MARK: - Connection
 
     func start() {
         guard !started else { return }
@@ -310,6 +259,7 @@ final class SoulseekModel: ObservableObject {
         switch connection {
         case .disconnected, .failed:
             guard hasCredentials, let password = Keychain.load(account: username) else { return }
+            applyClientSettings()
             client.connect(username: username, password: password)
         case .connecting, .loggedIn:
             break
@@ -317,20 +267,24 @@ final class SoulseekModel: ObservableObject {
     }
 
     func logIn(username: String, password: String) {
-        let trimmed = username.trimmingCharacters(in: .whitespaces)
+        let trimmed = username.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !password.isEmpty else { return }
         if trimmed != self.username { Keychain.delete(account: self.username) }
         self.username = trimmed
         UserDefaults.standard.set(trimmed, forKey: "username")
         Keychain.save(password, account: trimmed)
+        applyClientSettings()
         client.connect(username: trimmed, password: password)
     }
 
     func logOut() {
+        wishlistCheckTask?.cancel()
+        wishlistCheckTask = nil
+        isCheckingWishlist = false
         client.disconnect()
     }
 
-    // MARK: - Wishlist & Usuarios Favoritos / Bloqueados
+    // MARK: - Wishlist & Favorite / Blocked Users
 
     private func loadWishlistAndPeers() {
         if let data = UserDefaults.standard.data(forKey: wishlistKey),
@@ -347,6 +301,16 @@ final class SoulseekModel: ObservableObject {
         }
     }
 
+    private func updateWishlistCountIfMatching(query: String, count: Int) {
+        guard !query.isEmpty,
+              let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(query) == .orderedSame }) else { return }
+        if wishlist[idx].lastMatchCount != count {
+            wishlist[idx].lastMatchCount = count
+            wishlist[idx].lastChecked = Date()
+            saveWishlist()
+        }
+    }
+
     func isInWishlist(_ query: String) -> Bool {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return wishlist.contains { $0.query.caseInsensitiveCompare(trimmed) == .orderedSame }
@@ -358,7 +322,8 @@ final class SoulseekModel: ObservableObject {
         if let index = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             wishlist.remove(at: index)
         } else {
-            wishlist.insert(WishlistItem(query: trimmed, lastMatchCount: results.count, lastChecked: Date()), at: 0)
+            let hits = searchStore.currentQuery.caseInsensitiveCompare(trimmed) == .orderedSame ? searchStore.results.count : 0
+            wishlist.insert(WishlistItem(query: trimmed, lastMatchCount: hits, lastChecked: Date()), at: 0)
         }
         saveWishlist()
     }
@@ -368,23 +333,32 @@ final class SoulseekModel: ObservableObject {
         saveWishlist()
     }
 
+    /// Sends wishlist queries paced with Soulseek's native WishlistSearch (code 103) so the server
+    /// doesn't throttle or silently drop searches.
     func checkAllWishlist() {
         guard isLoggedIn, !wishlist.isEmpty, !isCheckingWishlist else { return }
         isCheckingWishlist = true
         wishlistTokens.removeAll()
+        let items = wishlist
 
-        for index in wishlist.indices {
-            wishlist[index].lastMatchCount = 0
-            wishlist[index].lastChecked = Date()
-            let q = wishlist[index].query
-            let token = client.search(q)
-            wishlistTokens[token] = q
-        }
-        saveWishlist()
-
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 20_000_000_000)
-            self?.isCheckingWishlist = false
+        wishlistCheckTask?.cancel()
+        wishlistCheckTask = Task { [weak self] in
+            guard let self else { return }
+            let spacingNs: UInt64 = 4_000_000_000  // 4s spacing prevents server flood drops
+            for item in items {
+                guard !Task.isCancelled, self.isLoggedIn else { break }
+                if let idx = self.wishlist.firstIndex(where: { $0.id == item.id }) {
+                    self.wishlist[idx].lastMatchCount = 0
+                    self.wishlist[idx].lastChecked = Date()
+                }
+                let token = self.client.wishlistSearch(item.query)
+                self.wishlistTokens[token] = item.query
+                try? await Task.sleep(nanoseconds: spacingNs)
+            }
+            self.saveWishlist()
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            self.isCheckingWishlist = false
         }
     }
 
@@ -393,13 +367,16 @@ final class SoulseekModel: ObservableObject {
     }
 
     func toggleFavoriteUser(_ user: String) {
-        if let idx = favoriteUsers.firstIndex(where: { $0.caseInsensitiveCompare(user) == .orderedSame }) {
+        let trimmed = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idx = favoriteUsers.firstIndex(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             favoriteUsers.remove(at: idx)
         } else {
-            favoriteUsers.insert(user, at: 0)
+            favoriteUsers.insert(trimmed, at: 0)
+            client.watchUser(trimmed)
         }
         UserDefaults.standard.set(favoriteUsers, forKey: favoriteUsersKey)
-        rebuildResults()
+        searchStore.rebuildResults()
     }
 
     func isBlockedUser(_ user: String) -> Bool {
@@ -407,23 +384,23 @@ final class SoulseekModel: ObservableObject {
     }
 
     func toggleBlockedUser(_ user: String) {
-        if let idx = blockedUsers.firstIndex(where: { $0.caseInsensitiveCompare(user) == .orderedSame }) {
+        let trimmed = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let idx = blockedUsers.firstIndex(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
             blockedUsers.remove(at: idx)
         } else {
-            blockedUsers.insert(user, at: 0)
-            favoriteUsers.removeAll { $0.caseInsensitiveCompare(user) == .orderedSame }
+            blockedUsers.insert(trimmed, at: 0)
+            favoriteUsers.removeAll { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
             UserDefaults.standard.set(favoriteUsers, forKey: favoriteUsersKey)
         }
         UserDefaults.standard.set(blockedUsers, forKey: blockedUsersKey)
-        rebuildResults()
+        searchStore.rebuildResults()
     }
 
-    // MARK: - Historial de Búsqueda Persistente
+    // MARK: - Search History
 
     private func loadSearchHistory() {
-        if let saved = UserDefaults.standard.stringArray(forKey: searchHistoryKey) {
-            searchHistory = saved
-        }
+        searchHistory = UserDefaults.standard.stringArray(forKey: searchHistoryKey) ?? []
     }
 
     private func saveSearchHistory() {
@@ -451,225 +428,79 @@ final class SoulseekModel: ObservableObject {
         saveSearchHistory()
     }
 
-    // MARK: - Persistencia y Reanudación Automática de Descargas
-
-    private func saveHistory() {
-        let history = downloads.compactMap { item -> SavedHistoryItem? in
-            switch item.state {
-            case let .completed(url):
-                return SavedHistoryItem(username: item.id.username, path: item.id.path, size: item.size, received: item.size, isCompleted: true, urlPath: url.path)
-            default:
-                return SavedHistoryItem(username: item.id.username, path: item.id.path, size: item.size, received: item.received, isCompleted: false, urlPath: nil)
-            }
-        }
-        if let data = try? JSONEncoder().encode(history) {
-            UserDefaults.standard.set(data, forKey: "downloads_history_v2")
-        }
-    }
-
-    private func loadHistory() {
-        guard let data = UserDefaults.standard.data(forKey: "downloads_history_v2"),
-              let history = try? JSONDecoder().decode([SavedHistoryItem].self, from: data) else { return }
-
-        self.downloads = history.map { saved in
-            let id = DownloadID(username: saved.username, path: saved.path)
-            if saved.isCompleted, let urlPath = saved.urlPath {
-                return DownloadItem(id: id, state: .completed(URL(fileURLWithPath: urlPath)), received: saved.size, size: saved.size)
-            } else {
-                let onDisk = client.partialBytesOnDisk(username: saved.username, path: saved.path)
-                let rec = max(onDisk, saved.received ?? 0)
-                let pct = saved.size > 0 ? Int(Double(min(rec, saved.size)) / Double(saved.size) * 100) : 0
-                let statusMsg = rec > 0 ? "Paused at \(pct)% — Tap Retry to Resume" : "Paused — Tap Retry to Resume"
-                client.restoreInterruptedDownload(username: saved.username, path: saved.path, size: saved.size)
-                return DownloadItem(id: id, state: .failed(statusMsg), received: min(rec, saved.size), size: saved.size)
-            }
-        }
-    }
-
-    private func resumeInterruptedDownloadsOnLogin() {
-        guard !didAutoResumeOnLaunch else { return }
-        didAutoResumeOnLaunch = true
-        for item in downloads {
-            if case .failed = item.state {
-                client.retry(item.id, size: item.size)
-            }
-        }
-    }
-
-    // MARK: - Search & Full User Directory Browsing
+    // MARK: - Search & Lightweight Folder Browsing
 
     func search(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, isLoggedIn else { return }
         recordSearchQuery(trimmed)
-        currentQuery = trimmed
-        responses.removeAll()
-        pendingResponses.removeAll()
-        results.removeAll()
-        hiddenCount = 0
-        responseCount = 0
-        searchToken = client.search(trimmed)
+        let token = client.search(trimmed)
+        searchStore.beginSearch(query: trimmed, token: token)
     }
 
-    private func mergeIntoCache(username: String, newFiles: [SharedFile]) {
-        guard !newFiles.isEmpty else { return }
-        var existing = browseCache[username] ?? []
-        var seen = Set(existing.map { $0.path.lowercased() })
-        for file in newFiles {
-            if seen.insert(file.path.lowercased()).inserted {
-                existing.append(file)
-            }
-        }
-        browseCache[username] = existing
+    func stopActiveSearch() {
+        guard let token = searchStore.activeTabID else { return }
+        client.stopSearch(token)
+        searchStore.markSearchStopped(token: token)
     }
 
-    func browseUserFolder(username: String, folder: String, forceRefresh: Bool = false, completion: @escaping ([SharedFile]?) -> Void) {
-        if !forceRefresh, fullBrowseLoadedUsers.contains(username), let cached = browseCache[username], !cached.isEmpty {
-            completion(knownFiles(for: username))
-            return
+    func closeSearchTab(_ token: UInt32) {
+        searchStore.closeTab(token) { [weak self] stoppedToken in
+            self?.client.stopSearch(stoppedToken)
+        }
+    }
+
+    /// Lightweight Nicotine+-style browsing:
+    /// - If `folder` is non-empty, asks ONLY `FolderContentsRequest` (code 36) unless full shares are requested.
+    /// - If `folder` is empty (user root), asks `SharedFileListRequest` (code 4) and caches it.
+    func browseUserFolder(username: String, folder: String, forceRefresh: Bool = false) async -> RemoteDirectoryIndex {
+        if !forceRefresh, searchStore.hasFullShareList(for: username) {
+            return await searchStore.directoryIndex(for: username)
         }
 
-        client.browseFolder(username: username, folder: "") { [weak self] rootFiles in
-            Task { @MainActor in
-                guard let self else { return }
-                if let rootFiles, !rootFiles.isEmpty {
-                    self.mergeIntoCache(username: username, newFiles: rootFiles)
-                    self.fullBrowseLoadedUsers.insert(username)
-                    completion(self.knownFiles(for: username))
-                } else if !folder.isEmpty {
-                    self.client.browseFolder(username: username, folder: folder) { [weak self] folderFiles in
-                        Task { @MainActor in
-                            guard let self else { return }
-                            if let folderFiles, !folderFiles.isEmpty {
-                                self.mergeIntoCache(username: username, newFiles: folderFiles)
-                            }
-                            completion(self.knownFiles(for: username))
-                        }
-                    }
-                } else {
-                    completion(self.knownFiles(for: username))
+        if !folder.isEmpty {
+            let folderFiles: [SharedFile]? = await withCheckedContinuation { cont in
+                client.browseFolder(username: username, folder: folder) { files in
+                    cont.resume(returning: files)
                 }
             }
+            if let folderFiles, !folderFiles.isEmpty {
+                searchStore.mergeIntoCache(username: username, newFiles: folderFiles)
+                return await searchStore.directoryIndex(for: username)
+            }
+            // Fallback to full share list only if the peer ignored FolderContentsRequest and we have nothing yet.
+            if !searchStore.knownFiles(for: username).isEmpty && !forceRefresh {
+                return await searchStore.directoryIndex(for: username)
+            }
         }
-    }
 
-    func knownFiles(for username: String) -> [SharedFile] {
-        var seen = Set<String>()
-        var output: [SharedFile] = []
-        if let cached = browseCache[username] {
-            for f in cached where seen.insert(f.path.lowercased()).inserted {
-                output.append(f)
+        let allFiles: [SharedFile]? = await withCheckedContinuation { cont in
+            client.browseUserShares(username: username) { files in
+                cont.resume(returning: files)
             }
         }
-        for resp in responses where resp.username.caseInsensitiveCompare(username) == .orderedSame {
-            for f in resp.files where seen.insert(f.path.lowercased()).inserted {
-                output.append(f)
-            }
+        if let allFiles, !allFiles.isEmpty {
+            searchStore.mergeIntoCache(username: username, newFiles: allFiles)
+            searchStore.markFullShareListLoaded(for: username)
         }
-        return output
+        return await searchStore.directoryIndex(for: username)
     }
 
     func findTrack(artist: String, title: String) {
-        guard isLoggedIn else { return }
-        trackCandidates = []
-        trackSearchTitle = AlbumCompletenessStore.normalizeTitle(title)
-        isFindingTrack = true
+        guard isLoggedIn else {
+            searchStore.beginTrackSearch(title: title, token: nil)
+            return
+        }
         let query = ResultFilters.terms("\(artist) \(title)").joined(separator: " ")
-        trackSearchToken = client.search(query)
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 25_000_000_000)
-            self?.isFindingTrack = false
-        }
+        let token = client.search(query)
+        searchStore.beginTrackSearch(title: title, token: token)
     }
 
-    private func addTrackCandidates(from response: SearchResponse) {
-        let wanted = trackSearchTitle
-        let matches = response.files.filter { file in
-            guard LibraryStore.audioExtensions.contains(file.fileExtension) else { return false }
-            let name = AlbumCompletenessStore.normalizeTitle((file.filename as NSString).deletingPathExtension)
-            return wanted.isEmpty || name.contains(wanted)
-        }
-        guard !matches.isEmpty else { return }
-        trackCandidates += matches.prefix(5).map {
-            TrackCandidate(username: response.username, file: $0, slotFree: response.slotFree,
-                           speed: response.averageSpeed, queueLength: response.queueLength)
-        }
-        trackCandidates.sort { lhs, rhs in
-            if lhs.slotFree != rhs.slotFree { return lhs.slotFree }
-            let left = lhs.file.attributes.bitDepth != nil ? 2_000 : Int(lhs.file.attributes.bitrate ?? 0)
-            let right = rhs.file.attributes.bitDepth != nil ? 2_000 : Int(rhs.file.attributes.bitrate ?? 0)
-            if left != right { return left > right }
-            return lhs.speed > rhs.speed
-        }
-        if trackCandidates.count > 60 { trackCandidates.removeLast(trackCandidates.count - 60) }
+    func stopTrackSearch() {
+        searchStore.stopTrackSearch()
     }
 
-    func folder(withID id: String) -> FolderResult? {
-        results.first { $0.id == id }
-    }
-
-    private func flushResponses() {
-        flushScheduled = false
-        guard !pendingResponses.isEmpty else { return }
-        for resp in pendingResponses {
-            mergeIntoCache(username: resp.username, newFiles: resp.files)
-        }
-        responses += pendingResponses
-        responseCount = responses.count
-        pendingResponses.removeAll()
-        rebuildResults()
-    }
-
-    private func rebuildResults() {
-        let blockedSet = Set(blockedUsers.map { $0.lowercased() })
-        let favSet = Set(favoriteUsers.map { $0.lowercased() })
-
-        var folders: [String: FolderResult] = [:]
-        var images: [String: [SharedFile]] = [:]
-        for response in responses {
-            if blockedSet.contains(response.username.lowercased()) { continue }
-
-            for file in response.files where LibraryStore.imageExtensions.contains(file.fileExtension) {
-                images[response.username + "|" + file.folder, default: []].append(file)
-            }
-            let files = audioOnly
-                ? response.files.filter { LibraryStore.audioExtensions.contains($0.fileExtension) }
-                : response.files
-            for file in files {
-                let key = response.username + "|" + file.folder
-                if folders[key] == nil {
-                    folders[key] = FolderResult(id: key, username: response.username, folder: file.folder, files: [],
-                                                slotFree: response.slotFree, speed: response.averageSpeed,
-                                                queueLength: response.queueLength)
-                }
-                folders[key]?.files.append(file)
-            }
-        }
-        let all = folders.values.map { folder in
-            var sorted = folder
-            sorted.images = images[folder.id] ?? []
-            sorted.files.sort { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
-            return sorted
-        }
-        let kept = all.filter { filters.accepts($0) }
-        hiddenCount = all.count - kept.count
-        let ordered = filters.ordered(kept, query: currentQuery)
-
-        results = ordered.sorted { lhs, rhs in
-            let lFav = favSet.contains(lhs.username.lowercased())
-            let rFav = favSet.contains(rhs.username.lowercased())
-            if lFav != rFav { return lFav }
-            return false
-        }
-
-        if let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(currentQuery) == .orderedSame }) {
-            wishlist[idx].lastMatchCount = results.count
-            wishlist[idx].lastChecked = Date()
-            saveWishlist()
-        }
-    }
-
-    // MARK: - Downloads
+    // MARK: - Downloads & Uploads
 
     func download(_ file: SharedFile, from username: String, knownImages: [SharedFile] = []) {
         client.download(username: username, file: file)
@@ -680,26 +511,31 @@ final class SoulseekModel: ObservableObject {
 
     func downloadFolder(_ folder: FolderResult) {
         folder.files.forEach { client.download(username: folder.username, file: $0) }
-        if folder.files.contains(where: { LibraryStore.audioExtensions.contains($0.fileExtension) }) {
+        if folder.isAudioFolder {
             fetchCover(username: folder.username, folder: folder.folder, knownImages: folder.images)
         }
     }
 
     func downloadFiles(_ files: [SharedFile], from username: String) {
         files.forEach { client.download(username: username, file: $0) }
+        let audioFolders = Set(files.filter { LibraryStore.audioExtensions.contains($0.fileExtension) }.map(\.folder))
+        let knownByFolder = Dictionary(grouping: files.filter { LibraryStore.imageExtensions.contains($0.fileExtension) }, by: \.folder)
+        for folder in audioFolders {
+            fetchCover(username: username, folder: folder, knownImages: knownByFolder[folder] ?? [])
+        }
     }
 
+    /// Uses lightweight `FolderContentsRequest` (code 36) ONLY — never triggers a massive full share list transfer.
     private func fetchCover(username: String, folder: String, knownImages: [SharedFile]) {
+        guard !folder.isEmpty else { return }
         let key = username + "|" + folder
         guard !coverRequested.contains(key) else { return }
         coverRequested.insert(key)
 
         client.browseFolder(username: username, folder: folder) { [weak self] files in
             guard let self else { return }
-            if let files {
-                if !files.isEmpty {
-                    self.mergeIntoCache(username: username, newFiles: files)
-                }
+            if let files, !files.isEmpty {
+                self.searchStore.mergeIntoCache(username: username, newFiles: files)
                 self.completeness?.recordListing(username: username, remoteFolder: folder, files: files)
             }
             let images = (files ?? []).filter { $0.folder == folder && LibraryStore.imageExtensions.contains($0.fileExtension) }
@@ -730,25 +566,32 @@ final class SoulseekModel: ObservableObject {
         return usable.count <= 3 ? usable.max { $0.size < $1.size } : nil
     }
 
+    func pause(_ item: DownloadItem) {
+        client.pause(item.id)
+    }
+
+    func pause(_ ids: Set<DownloadID>) {
+        for id in ids { client.pause(id) }
+    }
+
     func retry(_ item: DownloadItem) {
         client.retry(item.id, size: item.size)
     }
 
-    func cancel(_ item: DownloadItem) {
-        remove([item.id], deletePartial: true)
+    func cancel(_ item: DownloadItem, deletePartial: Bool = true) {
+        remove([item.id], deletePartial: deletePartial)
     }
 
     func remove(_ ids: Set<DownloadID>, deletePartial: Bool = false) {
         for id in ids { client.cancel(id, deletePartial: deletePartial) }
-        downloads.removeAll { ids.contains($0.id) }
-        saveHistory()
+        transfers.removeDownloads(ids)
     }
 
     @discardableResult
     func retry(_ ids: Set<DownloadID>) -> Int {
         var count = 0
-        for item in downloads where ids.contains(item.id) {
-            if case .failed = item.state {
+        for item in transfers.downloads where ids.contains(item.id) {
+            if item.isFailed || item.isPaused {
                 client.retry(item.id, size: item.size)
                 count += 1
             }
@@ -757,84 +600,183 @@ final class SoulseekModel: ObservableObject {
     }
 
     func clearFinished() {
-        remove(Set(downloads.filter { !$0.isActive }.map(\.id)))
-        uploads.removeAll { !$0.isActive }
+        remove(Set(transfers.downloads.filter { $0.isCompleted || $0.isFailed }.map(\.id)))
+        transfers.clearFinishedUploads()
     }
 
     func clearCompleted() {
-        remove(Set(downloads.filter { if case .completed = $0.state { return true } else { return false } }.map(\.id)))
+        remove(Set(transfers.downloads.filter(\.isCompleted).map(\.id)))
+    }
+
+    func clearCompleted(in ids: Set<DownloadID>) {
+        remove(Set(transfers.downloads.filter { ids.contains($0.id) && $0.isCompleted }.map(\.id)))
     }
 
     func clearFailed() {
-        remove(Set(downloads.filter { if case .failed = $0.state { return true } else { return false } }.map(\.id)), deletePartial: true)
+        remove(Set(transfers.downloads.filter(\.isFailed).map(\.id)), deletePartial: true)
+    }
+
+    func retryOnlyFailed() {
+        retry(Set(transfers.downloads.filter(\.isFailed).map(\.id)))
     }
 
     func retryAllFailed() {
-        retry(Set(downloads.map(\.id)))
+        retry(Set(transfers.downloads.filter { $0.isFailed || $0.isPaused }.map(\.id)))
+    }
+
+    func pauseAllActive() {
+        pause(Set(transfers.downloads.filter(\.isActive).map(\.id)))
     }
 
     func cancelAllActive() {
-        remove(Set(downloads.filter(\.isActive).map(\.id)), deletePartial: true)
+        remove(Set(transfers.downloads.filter(\.isActive).map(\.id)), deletePartial: true)
+    }
+
+    func abortUpload(_ item: UploadItem) {
+        client.abortUpload(item.id)
+    }
+
+    func clearFinishedUploads() {
+        transfers.clearFinishedUploads()
     }
 
     func libraryTracks(for ids: Set<DownloadID>) -> [Track] {
-        downloads.compactMap { item -> Track? in
-            guard ids.contains(item.id), case let .completed(url) = item.state else { return nil }
-            return library.track(at: url)
+        transfers.downloads.compactMap { item -> Track? in
+            guard ids.contains(item.id) else { return nil }
+            if let libURL = item.libraryURL, let track = library.track(at: libURL) { return track }
+            if case let .completed(url) = item.state { return library.track(at: url) }
+            return nil
         }
     }
 
     func cancelAll(from username: String) {
-        remove(Set(downloads.filter { $0.id.username == username }.map(\.id)), deletePartial: true)
+        remove(Set(transfers.downloads.filter { $0.id.username == username }.map(\.id)), deletePartial: true)
     }
 
-    func retryFailed(from username: String) {
-        for item in downloads where item.id.username == username {
-            if case .failed = item.state { client.retry(item.id, size: item.size) }
-        }
+    // MARK: - Storage Inspection & Orphan Partial Cleanup
+
+    func computeStorageBreakdown() async -> StorageBreakdown {
+        let musicRoot = library.root
+        let downloadsRoot = otherDownloadsDirectory
+        let incompleteRoot = incompleteDirectory
+        let artworkRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Artwork", isDirectory: true)
+
+        return await Task.detached(priority: .utility) {
+            func dirStats(_ url: URL) -> (UInt64, Int) {
+                var total: UInt64 = 0
+                var count = 0
+                let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+                guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys) else {
+                    return (0, 0)
+                }
+                for case let fileURL as URL in enumerator {
+                    guard let vals = try? fileURL.resourceValues(forKeys: Set(keys)), vals.isRegularFile == true else { continue }
+                    total += UInt64(max(0, vals.fileSize ?? 0))
+                    count += 1
+                }
+                return (total, count)
+            }
+            let music = dirStats(musicRoot).0
+            let downloads = downloadsRoot.canonicalPath == musicRoot.canonicalPath ? 0 : dirStats(downloadsRoot).0
+            let incomplete = dirStats(incompleteRoot)
+            let artwork = dirStats(artworkRoot).0
+            return StorageBreakdown(
+                musicBytes: music,
+                downloadsBytes: downloads,
+                incompleteBytes: incomplete.0,
+                incompleteCount: incomplete.1,
+                artworkCacheBytes: artwork
+            )
+        }.value
     }
 
-    var activeUploadCount: Int { uploads.filter(\.isActive).count }
-
-    func state(of file: SharedFile, from username: String) -> DownloadState? {
-        downloads.first { $0.id == DownloadID(username: username, path: file.path) }?.state
+    func cleanOrphanedPartials() async -> Int {
+        let activeHashes = Set(
+            transfers.downloads
+                .filter { !$0.isCompleted }
+                .map { MD5.hex($0.id.username + "\n" + $0.id.path) + ".part" }
+        )
+        let incompleteRoot = incompleteDirectory
+        return await Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            guard let files = try? fm.contentsOfDirectory(at: incompleteRoot, includingPropertiesForKeys: nil) else { return 0 }
+            var removed = 0
+            for file in files where file.pathExtension == "part" {
+                if !activeHashes.contains(file.lastPathComponent) {
+                    if (try? fm.removeItem(at: file)) != nil { removed += 1 }
+                }
+            }
+            return removed
+        }.value
     }
 
-    private func relocateToTargetDownloadsFolder(fileURL: URL, remotePath: String, isAudioOrSidecar: Bool) -> URL {
+    // MARK: - Background File Relocation (off MainActor)
+
+    private nonisolated static func cleanPathComponent(_ raw: String) -> String {
+        let cleaned = String(raw.map { "/:\0\\".contains($0) ? "_" : $0 })
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty || cleaned == "." || cleaned == ".." ? "Misc" : cleaned
+    }
+
+    private nonisolated static func relocateCompletedFile(
+        fileURL: URL,
+        username: String,
+        remotePath: String,
+        isAudioOrSidecar: Bool,
+        saveAllToCustomFolder: Bool,
+        keepAudioInLibrary: Bool,
+        structure: DownloadFolderStructure,
+        customDownloadDirectory: URL?,
+        targetBase: URL,
+        libraryRoot: URL
+    ) -> (displayURL: URL, libraryURL: URL?) {
         if isAudioOrSidecar && (!saveAllToCustomFolder || customDownloadDirectory == nil) {
-            return fileURL
+            return (fileURL, fileURL)
         }
         let fm = FileManager.default
-        let targetBase = otherDownloadsDirectory
-        _ = targetBase.startAccessingSecurityScopedResource()
+        let scoped = targetBase.startAccessingSecurityScopedResource()
+        defer { if scoped { targetBase.stopAccessingSecurityScopedResource() } }
 
         let shared = SharedFile(path: remotePath, size: 0)
         let rawFolderName = shared.folder.split(separator: "\\").last.map(String.init) ?? "Misc"
-        let cleanFolderName = String(rawFolderName.map { "/:\0".contains($0) ? "_" : $0 })
-        let targetSubfolder = targetBase.appendingPathComponent(cleanFolderName, isDirectory: true)
+        let cleanFolderName = cleanPathComponent(rawFolderName)
+        let cleanUser = cleanPathComponent(username)
+
+        let targetSubfolder: URL
+        switch structure {
+        case .album:
+            targetSubfolder = targetBase.appendingPathComponent(cleanFolderName, isDirectory: true)
+        case .userAndAlbum:
+            targetSubfolder = targetBase
+                .appendingPathComponent(cleanUser, isDirectory: true)
+                .appendingPathComponent(cleanFolderName, isDirectory: true)
+        case .flat:
+            targetSubfolder = targetBase
+        }
         try? fm.createDirectory(at: targetSubfolder, withIntermediateDirectories: true)
 
         let destinationURL = targetSubfolder.appendingPathComponent(fileURL.lastPathComponent)
-        if fileURL.standardizedFileURL == destinationURL.standardizedFileURL {
-            return fileURL
+        if fileURL.canonicalPath == destinationURL.canonicalPath {
+            return (fileURL, isAudioOrSidecar ? fileURL : nil)
         }
         try? fm.removeItem(at: destinationURL)
         do {
-            if isAudioOrSidecar {
+            if isAudioOrSidecar && keepAudioInLibrary {
                 try fm.copyItem(at: fileURL, to: destinationURL)
-                return destinationURL
+                return (destinationURL, fileURL)
             } else {
                 try fm.moveItem(at: fileURL, to: destinationURL)
                 let parentDir = fileURL.deletingLastPathComponent()
-                if parentDir.standardizedFileURL != library.root.standardizedFileURL,
+                if parentDir.canonicalPath != libraryRoot.canonicalPath,
                    let contents = try? fm.contentsOfDirectory(atPath: parentDir.path),
                    contents.isEmpty {
                     try? fm.removeItem(at: parentDir)
                 }
-                return destinationURL
+                return (destinationURL, nil)
             }
         } catch {
-            return fileURL
+            return (fileURL, isAudioOrSidecar ? fileURL : nil)
         }
     }
 
@@ -845,16 +787,21 @@ final class SoulseekModel: ObservableObject {
         case let .state(state):
             connection = state
             if state == .loggedIn {
-                resumeInterruptedDownloadsOnLogin()
+                for user in favoriteUsers { client.watchUser(user) }
             } else if case let .failed(message) = state {
                 appendLog(message)
             }
 
+        case let .listeningPort(port):
+            listeningPort = port
+
+        case let .wishlistInterval(seconds):
+            wishlistIntervalSeconds = max(seconds, 60)
+
+        case let .userStatus(username, status):
+            userStatuses[username.lowercased()] = status
+
         case let .searchResponse(response):
-            if response.token == trackSearchToken {
-                addTrackCandidates(from: response)
-                return
-            }
             if let wishQuery = wishlistTokens[response.token] {
                 if !isBlockedUser(response.username) && !response.files.isEmpty {
                     if let idx = wishlist.firstIndex(where: { $0.query.caseInsensitiveCompare(wishQuery) == .orderedSame }) {
@@ -863,81 +810,83 @@ final class SoulseekModel: ObservableObject {
                         saveWishlist()
                     }
                 }
-                if response.token != searchToken { return }
             }
-            guard response.token == searchToken else { return }
-            pendingResponses.append(response)
-            if !flushScheduled {
-                flushScheduled = true
-                Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                    self?.flushResponses()
-                }
-            }
+            _ = searchStore.ingestSearchResponse(response)
 
         case let .download(update):
-            var finalState = update.state
             let ext = SharedFile(path: update.id.path, size: 0).fileExtension.lowercased()
             let isAudio = LibraryStore.audioExtensions.contains(ext)
             let isSidecar = LibraryStore.sidecarExtensions.contains(ext)
 
             if case let .completed(url) = update.state {
-                let wasCompleted: Bool = {
-                    guard let old = downloads.first(where: { $0.id == update.id }), case .completed = old.state else { return false }
-                    return true
-                }()
+                let wasCompleted = transfers.item(for: update.id)?.isCompleted ?? false
                 if !wasCompleted { stats?.recordDownload(bytes: update.size, from: update.id.username) }
 
-                let movedURL = relocateToTargetDownloadsFolder(fileURL: url, remotePath: update.id.path, isAudioOrSidecar: isAudio || isSidecar)
-                finalState = .completed(movedURL)
-            }
-
-            if let index = downloads.firstIndex(where: { $0.id == update.id }) {
-                downloads[index].state = finalState
-                downloads[index].received = update.received
-                downloads[index].size = update.size
-                saveHistory()
-            } else {
-                downloads.insert(DownloadItem(id: update.id, state: finalState,
-                                              received: update.received, size: update.size), at: 0)
-                saveHistory()
-            }
-
-            if case .completed = finalState {
-                if ext == "lrc" {
-                    // Sidecar lyrics
-                } else if LibraryStore.imageExtensions.contains(ext) {
-                    let library = self.library
-                    Task {
-                        await ArtworkStore.shared.invalidateFolders()
-                        library.bumpArtwork()
+                let needsRelocate = !(isAudio || isSidecar) || (saveAllToCustomFolder && customDownloadDirectory != nil)
+                if needsRelocate {
+                    let targetBase = otherDownloadsDirectory
+                    let customDir = customDownloadDirectory
+                    let saveAll = saveAllToCustomFolder
+                    let keepInLib = AppSettings.keepAudioInLibrary
+                    let structure = AppSettings.downloadFolderStructure
+                    let libRoot = library.root
+                    Task { [weak self] in
+                        let relocated = await Task.detached(priority: .userInitiated) {
+                            Self.relocateCompletedFile(
+                                fileURL: url,
+                                username: update.id.username,
+                                remotePath: update.id.path,
+                                isAudioOrSidecar: isAudio || isSidecar,
+                                saveAllToCustomFolder: saveAll,
+                                keepAudioInLibrary: keepInLib,
+                                structure: structure,
+                                customDownloadDirectory: customDir,
+                                targetBase: targetBase,
+                                libraryRoot: libRoot
+                            )
+                        }.value
+                        guard let self else { return }
+                        self.transfers.applyDownloadUpdate(update, finalState: .completed(relocated.displayURL), libraryURL: relocated.libraryURL)
+                        self.handleCompletedSideEffects(ext: ext, isAudio: isAudio && relocated.libraryURL != nil)
                     }
-                } else if isAudio {
-                    library.rescan()
+                } else {
+                    transfers.applyDownloadUpdate(update, finalState: .completed(url), libraryURL: url)
+                    handleCompletedSideEffects(ext: ext, isAudio: isAudio)
                 }
+            } else {
+                transfers.applyDownloadUpdate(update, finalState: update.state)
             }
 
         case let .upload(update):
-            if update.state == .completed, uploads.first(where: { $0.id == update.id })?.state != .completed {
+            if update.state == .completed,
+               transfers.uploads.first(where: { $0.id == update.id })?.state != .completed {
                 stats?.recordUpload(bytes: update.size, to: update.id.username)
             }
-            if let index = uploads.firstIndex(where: { $0.id == update.id }) {
-                uploads[index].state = update.state
-                uploads[index].sent = update.sent
-                uploads[index].size = update.size
-            } else {
-                uploads.insert(UploadItem(id: update.id, state: update.state, sent: update.sent, size: update.size), at: 0)
-                if uploads.count > 100 { uploads.removeLast(uploads.count - 100) }
-            }
+            transfers.applyUploadUpdate(update)
 
         case let .log(line):
             appendLog(line)
         }
     }
 
+    private func handleCompletedSideEffects(ext: String, isAudio: Bool) {
+        if ext == "lrc" {
+            // Sidecar lyrics
+        } else if LibraryStore.imageExtensions.contains(ext) {
+            let library = self.library
+            Task {
+                await ArtworkStore.shared.invalidateFolders()
+                library.bumpArtwork()
+            }
+        } else if isAudio {
+            library.rescan()
+        }
+    }
+
     private func appendLog(_ line: String) {
         let stamp = Formatting.time.string(from: Date())
-        logLines.append("\(stamp)  \(line)")
+        logLines.append(SoulseekLogEntry(id: nextLogID, text: "\(stamp)  \(line)"))
+        nextLogID += 1
         if logLines.count > 500 { logLines.removeFirst(logLines.count - 500) }
         Diagnostics.shared.log(line, category: "soulseek")
     }

@@ -4,7 +4,6 @@ import SwiftUI
 struct StatsView: View {
     @EnvironmentObject private var stats: StatsStore
     @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var soulseek: SoulseekModel
     @State private var range = 14
     @State private var confirmReset = false
 
@@ -12,6 +11,7 @@ struct StatsView: View {
         // Read revision so the view refreshes when stats are saved.
         let _ = stats.revision
         let days = stats.lastDays(range)
+        let periodSeconds = days.reduce(0.0) { $0 + $1.minutes * 60 }
         let totals = stats.totals
         List {
             Section {
@@ -39,8 +39,8 @@ struct StatsView: View {
                 }
                 .chartYAxisLabel("min")
                 .frame(height: 170)
-                LabeledContent("This period", value: Formatting.hours(days.reduce(0) { $0 + $1.minutes * 60 }))
-                LabeledContent("Daily average", value: Formatting.hours(days.reduce(0) { $0 + $1.minutes * 60 } / Double(max(range, 1))))
+                LabeledContent("This period", value: Formatting.hours(periodSeconds))
+                LabeledContent("Daily average", value: Formatting.hours(periodSeconds / Double(max(range, 1))))
             } header: {
                 Text("Listening")
             }
@@ -54,7 +54,7 @@ struct StatsView: View {
                 LabeledContent("Songs uploaded", value: "\(totals.uploadedFiles)")
                 LabeledContent("People you've shared with", value: "\(totals.peers.count)")
                 LabeledContent("Share ratio", value: ratio(totals))
-                LabeledContent("Shared right now", value: "\(library.tracks.count) songs")
+                LabeledContent("Shared right now", value: "\(library.tracks.count) song\(library.tracks.count == 1 ? "" : "s")")
                 LabeledContent("Uploaded this session", value: Formatting.bytes(stats.sessionUploadedBytes))
                 LabeledContent("Counting since", value: totals.since.formatted(date: .abbreviated, time: .omitted))
             } header: {
@@ -93,7 +93,7 @@ struct StatsView: View {
     private func ranked(_ title: String, _ items: [StatsStore.Ranked], detail: Bool) -> some View {
         if !items.isEmpty {
             Section(title) {
-                ForEach(Array(items.enumerated()), id: \.offset) { index, item in
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
                     HStack(spacing: 12) {
                         Text("\(index + 1)")
                             .font(.subheadline.monospacedDigit().weight(.semibold))
@@ -107,7 +107,7 @@ struct StatsView: View {
                         }
                         Spacer()
                         VStack(alignment: .trailing, spacing: 1) {
-                            Text("\(item.plays) plays").font(.caption.monospacedDigit())
+                            Text("\(item.plays) play\(item.plays == 1 ? "" : "s")").font(.caption.monospacedDigit())
                             Text(Formatting.hours(item.seconds)).font(.caption2).foregroundStyle(.secondary)
                         }
                     }

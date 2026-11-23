@@ -1,17 +1,24 @@
 import AVFoundation
 import Combine
 import MediaPlayer
+import QuartzCore
 import SwiftUI
 import UIKit
 
-@MainActor
-protocol Scrobbler: AnyObject {
-    func nowPlaying(_ track: Track)
-    func scrobble(_ track: Track, startedAt: Date)
-}
-
 enum RepeatMode: CaseIterable {
     case off, all, one
+}
+
+/// Stable wrapper for queue items so SwiftUI `ForEach` / `.onMove` / `.onDelete` never corrupt
+/// row identity even when duplicate tracks exist in the queue.
+struct QueueEntry: Identifiable, Hashable {
+    let id: UUID
+    let track: Track
+
+    init(id: UUID = UUID(), track: Track) {
+        self.id = id
+        self.track = track
+    }
 }
 
 /// Playback position, split out of Player so its 5-per-second updates only redraw the views
@@ -23,7 +30,7 @@ final class PlaybackClock: ObservableObject {
 
 @MainActor
 final class Player: ObservableObject {
-    @Published private(set) var queue: [Track] = []
+    @Published private(set) var entries: [QueueEntry] = []
     @Published private(set) var index = 0
     @Published private(set) var isPlaying = false
     let clock: PlaybackClock
@@ -43,29 +50,30 @@ final class Player: ObservableObject {
         }
     }
     @Published private(set) var output = OutputInfo()
-    /// Fires whenever what's playing, play/pause or the position jumps (Discord, widgets).
     let stateChanged = PassthroughSubject<Void, Never>()
 
-    var current: Track? { queue.indices.contains(index) ? queue[index] : nil }
-    var upNext: ArraySlice<Track> { queue.indices.contains(index) ? queue[(index + 1)...] : [] }
+    var queue: [Track] { entries.map(\.track) }
+    var current: Track? { entries.indices.contains(index) ? entries[index].track : nil }
+    var upNextEntries: ArraySlice<QueueEntry> { entries.indices.contains(index) ? entries[(index + 1)...] : [] }
+    var upNext: [Track] { upNextEntries.map(\.track) }
 
     let equalizer: Equalizer
     weak var library: LibraryStore?
-    weak var scrobbler: Scrobbler?
     weak var stats: StatsStore?
 
     private let engine: EngineBackend
     private let avPlayer: AVPlayerBackend
     private var backend: PlaybackBackend?
-    private var unshuffledQueue: [Track] = []
+    private var unshuffledEntries: [QueueEntry] = []
     private var timer: Timer?
-    private var observers: [NSObjectProtocol] = []
+    nonisolated(unsafe) private var observers: [NSObjectProtocol] = []
 
-    // Scrobbling: count real listening time, not position, so seeking doesn't cheat.
+    // Real monotonic listening time tracking (survives iOS background Timer throttling).
     private var listened: Double = 0
-    private var startedAt = Date()
-    private var scrobbled = false
+    private var pendingStatsSeconds: Double = 0
+    private var lastTickMediaTime: CFTimeInterval?
     private var countedPlay = false
+    private var wasPlayingBeforeInterruption = false
 
     init(equalizer: Equalizer) {
         self.equalizer = equalizer
@@ -74,16 +82,29 @@ final class Player: ObservableObject {
         avPlayer = AVPlayerBackend()
         bitPerfect = UserDefaults.standard.bool(forKey: AppSettings.bitPerfectKey)
         engine.bitPerfect = bitPerfect
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, policy: .longFormAudio)
-        try? session.setSupportsMultichannelContent(true)
 
         equalizer.onChange = { [weak self] in self?.applyEqualizer() }
         applyEqualizer()
         engine.onOutputChange = { [weak self] in self?.refreshOutputInfo() }
 
+        AudioSessionCoordinator.shared.onMediaServicesReset = { [weak self] in
+            self?.engine.rebuildAfterMediaServicesReset()
+            self?.applyEqualizer()
+            self?.refreshOutputInfo()
+        }
+
         for backend in [engine, avPlayer] as [PlaybackBackend] {
             backend.onFinish = { [weak self] in self?.trackFinished() }
+            backend.onPlaybackStateChanged = { [weak self] playing in
+                guard let self, self.backend === backend else { return }
+                if self.isPlaying != playing {
+                    self.flushListeningTime()
+                    self.isPlaying = playing
+                    self.lastTickMediaTime = playing ? CACurrentMediaTime() : nil
+                    AudioSessionCoordinator.shared.updatePlaybackState(isPlaying: playing, hasTrack: self.current != nil)
+                    self.updateNowPlaying()
+                }
+            }
         }
         configureRemoteCommands()
 
@@ -97,26 +118,34 @@ final class Player: ObservableObject {
                                             queue: .main) { [weak self] note in
             let reason = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
             MainActor.assumeIsolated {
-                // Headphones unplugged: pause, like every music app.
                 if reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue { self?.pause() }
                 self?.refreshOutputInfo()
             }
         })
     }
 
+    deinit {
+        timer?.invalidate()
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
     // MARK: Queue
 
     func play(_ tracks: [Track], startAt startIndex: Int = 0, shuffled: Bool = false) {
         guard tracks.indices.contains(startIndex) else { return }
+        flushListeningTime()
+        let wrapped = tracks.map { QueueEntry(track: $0) }
         if shuffled {
-            var rest = tracks
+            var rest = wrapped
             let first = rest.remove(at: Int.random(in: 0..<rest.count))
-            unshuffledQueue = tracks
-            queue = [first] + rest.shuffled()
+            unshuffledEntries = wrapped
+            entries = [first] + rest.shuffled()
             shuffle = true
         } else {
-            unshuffledQueue = tracks
-            queue = tracks
+            unshuffledEntries = wrapped
+            entries = wrapped
             shuffle = false
         }
         index = shuffled ? 0 : startIndex
@@ -125,54 +154,66 @@ final class Player: ObservableObject {
 
     func playNext(_ tracks: [Track]) {
         guard !tracks.isEmpty else { return }
-        if queue.isEmpty { return play(tracks) }
-        queue.insert(contentsOf: tracks, at: index + 1)
-        unshuffledQueue += tracks
+        if entries.isEmpty { return play(tracks) }
+        let wrapped = tracks.map { QueueEntry(track: $0) }
+        entries.insert(contentsOf: wrapped, at: index + 1)
+        if let currentEntry = entries.indices.contains(index) ? entries[index] : nil,
+           let unshuffledPos = unshuffledEntries.firstIndex(where: { $0.id == currentEntry.id }) {
+            unshuffledEntries.insert(contentsOf: wrapped, at: unshuffledPos + 1)
+        } else {
+            unshuffledEntries += wrapped
+        }
     }
 
     func addToQueue(_ tracks: [Track]) {
         guard !tracks.isEmpty else { return }
-        if queue.isEmpty { return play(tracks) }
-        queue += tracks
-        unshuffledQueue += tracks
+        if entries.isEmpty { return play(tracks) }
+        let wrapped = tracks.map { QueueEntry(track: $0) }
+        entries += wrapped
+        unshuffledEntries += wrapped
     }
 
     func jump(to queueIndex: Int) {
-        guard queue.indices.contains(queueIndex) else { return }
+        guard entries.indices.contains(queueIndex) else { return }
+        flushListeningTime()
         index = queueIndex
         loadCurrent(autoplay: true)
     }
 
     func removeFromQueue(at offsets: IndexSet) {
-        // Offsets are relative to `upNext`.
-        let absolute = IndexSet(offsets.map { $0 + index + 1 })
-        let removed = absolute.compactMap { queue.indices.contains($0) ? queue[$0] : nil }
-        queue.remove(atOffsets: absolute)
-        for track in removed {
-            if let position = unshuffledQueue.firstIndex(of: track) { unshuffledQueue.remove(at: position) }
-        }
+        // Offsets are relative to `upNextEntries`; filter bounds BEFORE removing.
+        let validAbsolute = IndexSet(offsets.map { $0 + index + 1 }.filter { entries.indices.contains($0) })
+        guard !validAbsolute.isEmpty else { return }
+        let removedIDs = Set(validAbsolute.map { entries[$0].id })
+        entries.remove(atOffsets: validAbsolute)
+        unshuffledEntries.removeAll { removedIDs.contains($0.id) }
     }
 
     func moveInQueue(from offsets: IndexSet, to destination: Int) {
-        var upcoming = Array(upNext)
+        guard entries.indices.contains(index) else { return }
+        var upcoming = Array(upNextEntries)
         upcoming.move(fromOffsets: offsets, toOffset: destination)
-        queue = Array(queue[...index]) + upcoming
+        entries = Array(entries[...index]) + upcoming
+        if !shuffle {
+            unshuffledEntries = entries
+        }
     }
 
     func toggleShuffle() {
-        guard let current else {
+        guard entries.indices.contains(index) else {
             shuffle.toggle()
             return
         }
+        let currentEntry = entries[index]
         if shuffle {
-            queue = unshuffledQueue
-            index = queue.firstIndex(of: current) ?? 0
+            entries = unshuffledEntries
+            index = entries.firstIndex(where: { $0.id == currentEntry.id }) ?? 0
             shuffle = false
         } else {
-            unshuffledQueue = queue
-            var rest = queue
+            unshuffledEntries = entries
+            var rest = entries
             rest.remove(at: index)
-            queue = [current] + rest.shuffled()
+            entries = [currentEntry] + rest.shuffled()
             index = 0
             shuffle = true
         }
@@ -187,14 +228,14 @@ final class Player: ObservableObject {
     func remove(_ tracks: [Track]) {
         let doomed = Set(tracks.map(\.id))
         let wasCurrent = current.map { doomed.contains($0.id) } ?? false
-        let before = queue[..<min(index, queue.count)].filter { doomed.contains($0.id) }.count
-        queue.removeAll { doomed.contains($0.id) }
-        unshuffledQueue.removeAll { doomed.contains($0.id) }
+        let before = entries[..<min(index, entries.count)].filter { doomed.contains($0.track.id) }.count
+        entries.removeAll { doomed.contains($0.track.id) }
+        unshuffledEntries.removeAll { doomed.contains($0.track.id) }
         index = max(0, index - before)
-        if queue.isEmpty {
+        if entries.isEmpty {
             stop()
         } else if wasCurrent {
-            index = min(index, queue.count - 1)
+            index = min(index, entries.count - 1)
             loadCurrent(autoplay: isPlaying)
         }
     }
@@ -207,29 +248,31 @@ final class Player: ObservableObject {
 
     func resume() {
         guard let backend, current != nil else { return }
-        let session = AVAudioSession.sharedInstance()
-        // The background keeper may have switched the session to mix-with-others; take it back.
-        try? session.setCategory(.playback, mode: .default, policy: .longFormAudio)
-        try? session.setActive(true)
+        AudioSessionCoordinator.shared.updatePlaybackState(isPlaying: true, hasTrack: true)
         backend.play()
-        isPlaying = backend.isPlaying || backend === avPlayer
-        startTimer()
+        isPlaying = backend.isPlaying
+        lastTickMediaTime = isPlaying ? CACurrentMediaTime() : nil
+        if isPlaying { startTimer() }
         updateNowPlaying()
         refreshOutputInfo()
     }
 
     func pause() {
+        flushListeningTime()
         backend?.pause()
         isPlaying = false
+        lastTickMediaTime = nil
         clock.position = backend?.currentTime ?? position
+        AudioSessionCoordinator.shared.updatePlaybackState(isPlaying: false, hasTrack: current != nil)
         updateNowPlaying()
     }
 
     func next() {
-        if index + 1 < queue.count {
+        flushListeningTime()
+        if index + 1 < entries.count {
             index += 1
             loadCurrent(autoplay: true)
-        } else if repeatMode == .all, !queue.isEmpty {
+        } else if repeatMode == .all, !entries.isEmpty {
             index = 0
             loadCurrent(autoplay: true)
         } else {
@@ -239,32 +282,40 @@ final class Player: ObservableObject {
     }
 
     func previous() {
-        if position > 3 || index == 0 {
+        let livePosition = backend?.currentTime ?? position
+        if livePosition > 3 || index == 0 {
             seek(to: 0)
         } else {
+            flushListeningTime()
             index -= 1
             loadCurrent(autoplay: isPlaying)
         }
     }
 
     func seek(to seconds: Double) {
-        backend?.seek(to: seconds)
-        clock.position = seconds
+        let clamped = min(max(seconds.isFinite ? seconds : 0, 0), max(duration, 0))
+        backend?.seek(to: clamped)
+        clock.position = clamped
         updateNowPlaying()
     }
 
     func stop() {
+        flushListeningTime()
         backend?.stop()
         backend = nil
-        queue = []
-        unshuffledQueue = []
+        entries = []
+        unshuffledEntries = []
         index = 0
         isPlaying = false
+        lastTickMediaTime = nil
         clock.position = 0
         duration = 0
         artwork = nil
         timer?.invalidate()
+        timer = nil
+        AudioSessionCoordinator.shared.updatePlaybackState(isPlaying: false, hasTrack: false)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        stateChanged.send()
     }
 
     var artworkSource: ArtworkSource? {
@@ -282,17 +333,16 @@ final class Player: ObservableObject {
         do {
             try chosen.load(track.url)
         } catch {
-            // AVAudioFile can't open everything AVPlayer can; fall back rather than fail.
             chosen = avPlayer
             try? chosen.load(track.url)
         }
         backend = chosen
-        isSpatialPlayback = chosen === avPlayer
+        isSpatialPlayback = track.isSpatial && chosen === avPlayer
         clock.position = 0
         duration = chosen.duration > 0 ? chosen.duration : track.duration
         listened = 0
-        startedAt = Date()
-        scrobbled = false
+        pendingStatsSeconds = 0
+        lastTickMediaTime = nil
         countedPlay = false
         artwork = nil
         refreshOutputInfo()
@@ -301,9 +351,9 @@ final class Player: ObservableObject {
             resume()
         } else {
             isPlaying = false
+            AudioSessionCoordinator.shared.updatePlaybackState(isPlaying: false, hasTrack: true)
             updateNowPlaying()
         }
-        scrobbler?.nowPlaying(track)
 
         reloadArtwork()
     }
@@ -311,9 +361,9 @@ final class Player: ObservableObject {
     /// Reloads the current cover (after a new one was downloaded or picked).
     func reloadArtwork() {
         guard let id = current?.id, let source = artworkSource else { return }
-        Task {
+        Task { [weak self] in
             let image = await ArtworkStore.shared.image(for: source, maxPixel: 1200)
-            guard self.current?.id == id, image !== self.artwork else { return }
+            guard let self, self.current?.id == id, image !== self.artwork else { return }
             self.artwork = image
             self.updateNowPlaying()
         }
@@ -342,8 +392,12 @@ final class Player: ObservableObject {
     }
 
     private func trackFinished() {
-        maybeScrobble(force: true)
+        flushListeningTime()
         if repeatMode == .one {
+            // Reset listening counters so repeated listens count properly in Stats.
+            listened = 0
+            pendingStatsSeconds = 0
+            countedPlay = false
             seek(to: 0)
             resume()
         } else {
@@ -361,15 +415,33 @@ final class Player: ObservableObject {
     private func tick() {
         guard let backend else { return }
         if isPlaying {
+            // Sync with real backend playback so failed files never count fake listening time.
+            guard backend.isPlaying else {
+                lastTickMediaTime = nil
+                return
+            }
+            let now = CACurrentMediaTime()
+            let delta: Double
+            if let last = lastTickMediaTime {
+                delta = min(max(now - last, 0), 30)
+            } else {
+                delta = 0.2
+            }
+            lastTickMediaTime = now
+
             clock.position = backend.currentTime
-            listened += 0.2
-            maybeScrobble(force: false)
+            listened += delta
+            pendingStatsSeconds += delta
+
             if let track = current {
-                let album = library?.album(containing: track)?.title ?? track.album
-                stats?.addListening(track, album: album, seconds: 0.2)
-                // A play counts after 30 s, or half of a shorter song.
+                if pendingStatsSeconds >= 2.0 {
+                    let album = library?.album(containing: track)?.title ?? track.album
+                    stats?.addListening(track, album: album, seconds: pendingStatsSeconds)
+                    pendingStatsSeconds = 0
+                }
                 if !countedPlay, listened >= min(30, max(duration, 1) * 0.5) {
                     countedPlay = true
+                    let album = library?.album(containing: track)?.title ?? track.album
                     stats?.recordPlay(track, album: album)
                 }
             }
@@ -380,13 +452,23 @@ final class Player: ObservableObject {
         }
     }
 
-    /// Last.fm rules: tracks over 30 s count after half their length or 4 minutes.
-    private func maybeScrobble(force: Bool) {
-        guard !scrobbled, let track = current, duration > 30 else { return }
-        let threshold = min(duration / 2, 240)
-        if listened >= threshold || (force && listened >= threshold * 0.9) {
-            scrobbled = true
-            scrobbler?.scrobble(track, startedAt: startedAt)
+    private func flushListeningTime() {
+        if let last = lastTickMediaTime, isPlaying, backend?.isPlaying == true {
+            let extra = min(max(CACurrentMediaTime() - last, 0), 30)
+            listened += extra
+            pendingStatsSeconds += extra
+            lastTickMediaTime = CACurrentMediaTime()
+        }
+        guard pendingStatsSeconds > 0, let track = current else {
+            pendingStatsSeconds = 0
+            return
+        }
+        let album = library?.album(containing: track)?.title ?? track.album
+        stats?.addListening(track, album: album, seconds: pendingStatsSeconds)
+        pendingStatsSeconds = 0
+        if !countedPlay, listened >= min(30, max(duration, 1) * 0.5) {
+            countedPlay = true
+            stats?.recordPlay(track, album: album)
         }
     }
 
@@ -395,12 +477,21 @@ final class Player: ObservableObject {
               let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
         switch type {
         case .began:
-            backend?.pause()
-            isPlaying = false
-            updateNowPlaying()
+            wasPlayingBeforeInterruption = isPlaying
+            if isPlaying {
+                flushListeningTime()
+                backend?.pause()
+                isPlaying = false
+                lastTickMediaTime = nil
+                updateNowPlaying()
+            }
         case .ended:
             let optionsRaw = info?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
-            if AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume) { resume() }
+            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
+            if wasPlayingBeforeInterruption && shouldResume {
+                resume()
+            }
+            wasPlayingBeforeInterruption = false
         @unknown default:
             break
         }
@@ -408,44 +499,73 @@ final class Player: ObservableObject {
 
     private func configureRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
-        center.playCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.resume() }
-            return .success
+        func runSync(_ action: @escaping @MainActor (Player) -> MPRemoteCommandHandlerStatus) -> (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus {
+            return { [weak self] _ in
+                guard let self else { return .commandFailed }
+                if Thread.isMainThread {
+                    return MainActor.assumeIsolated { action(self) }
+                } else {
+                    return DispatchQueue.main.sync {
+                        MainActor.assumeIsolated { action(self) }
+                    }
+                }
+            }
         }
-        center.pauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.pause() }
+        center.playCommand.addTarget(handler: runSync { player in
+            guard player.current != nil else { return .noActionableNowPlayingItem }
+            player.resume()
             return .success
-        }
-        center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.togglePlayPause() }
+        })
+        center.pauseCommand.addTarget(handler: runSync { player in
+            player.pause()
             return .success
-        }
-        center.nextTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.next() }
+        })
+        center.togglePlayPauseCommand.addTarget(handler: runSync { player in
+            guard player.current != nil else { return .noActionableNowPlayingItem }
+            player.togglePlayPause()
             return .success
-        }
-        center.previousTrackCommand.addTarget { [weak self] _ in
-            Task { @MainActor in self?.previous() }
+        })
+        center.nextTrackCommand.addTarget(handler: runSync { player in
+            guard player.current != nil else { return .noActionableNowPlayingItem }
+            player.next()
             return .success
-        }
+        })
+        center.previousTrackCommand.addTarget(handler: runSync { player in
+            guard player.current != nil else { return .noActionableNowPlayingItem }
+            player.previous()
+            return .success
+        })
         center.changePlaybackPositionCommand.addTarget { [weak self] event in
-            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             let target = event.positionTime
-            Task { @MainActor in self?.seek(to: target) }
-            return .success
+            if Thread.isMainThread {
+                return MainActor.assumeIsolated {
+                    self.seek(to: target)
+                    return .success
+                }
+            } else {
+                return DispatchQueue.main.sync {
+                    MainActor.assumeIsolated {
+                        self.seek(to: target)
+                        return .success
+                    }
+                }
+            }
         }
     }
 
     private func updateNowPlaying() {
         guard let track = current else {
             MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            stateChanged.send()
             return
         }
+        let elapsed = backend?.currentTime ?? position
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPMediaItemPropertyPlaybackDuration: duration,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
         ]
@@ -505,7 +625,8 @@ struct OutputInfo: Equatable {
         case .bluetooth: return "Bluetooth re-encodes audio"
         case .airPlay: return "AirPlay resamples audio"
         case .builtIn: return "Built-in speaker"
-        case .other, .wired: break
+        case .other: return "Non-wired output"
+        case .wired: break
         }
         if fileRate > 0, !ratesMatch {
             return "Resampled \(Formatting.sampleRate(fileRate)) → \(Formatting.sampleRate(hardwareRate))"

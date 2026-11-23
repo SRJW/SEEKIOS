@@ -11,6 +11,24 @@ public enum TransferDirection: UInt32, Sendable {
     case upload = 1
 }
 
+public enum UserStatus: UInt32, Equatable, Sendable {
+    case offline = 0
+    case away = 1
+    case online = 2
+}
+
+public struct DistributedParent: Equatable, Sendable {
+    public let username: String
+    public let ip: String
+    public let port: UInt32
+
+    public init(username: String, ip: String, port: UInt32) {
+        self.username = username
+        self.ip = ip
+        self.port = port
+    }
+}
+
 public struct FileAttributes: Equatable, Hashable, Sendable {
     public var bitrate: UInt32?
     public var duration: UInt32?

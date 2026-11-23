@@ -1,26 +1,71 @@
 import SoulseekKit
 import SwiftUI
 
+private enum SearchViewMode: String, CaseIterable, Identifiable {
+    case folders = "Folders"
+    case files = "Files"
+    var id: String { rawValue }
+}
+
 struct SearchView: View {
     @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var searchStore: SearchStore
+    @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var router: AppRouter
+
+    @State private var path = NavigationPath()
     @State private var query = ""
     @State private var keywordFilter = ""
     @State private var isSearchFocused = false
     @State private var showFilters = false
     @State private var showPeersSheet = false
+    @State private var viewMode: SearchViewMode = .folders
 
     private var displayedResults: [FolderResult] {
         let trimmed = keywordFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard !trimmed.isEmpty else { return soulseek.results }
-        let terms = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
-        return soulseek.results.filter { folder in
-            let folderText = "\(folder.folder) \(folder.username)".lowercased()
-            return terms.allSatisfy { term in
+        guard !trimmed.isEmpty else { return searchStore.results }
+        let rawTerms = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        let includeTerms = rawTerms.filter { !$0.hasPrefix("-") }
+        let excludeTerms = rawTerms.filter { $0.hasPrefix("-") && $0.count > 1 }.map { String($0.dropFirst()) }
+
+        return searchStore.results.filter { folder in
+            let folderText = "\(folder.folderLowercased) \(folder.username.lowercased())"
+            if excludeTerms.contains(where: { ex in
+                folderText.contains(ex) || folder.files.contains { $0.filename.lowercased().contains(ex) }
+            }) {
+                return false
+            }
+            return includeTerms.allSatisfy { term in
                 if folderText.contains(term) { return true }
                 return folder.files.contains { $0.filename.lowercased().contains(term) }
             }
         }
+    }
+
+    private func flatFiles(from folders: [FolderResult]) -> [FlatFileResult] {
+        let trimmed = keywordFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let includeTerms = trimmed.split(whereSeparator: \.isWhitespace).map(String.init).filter { !$0.hasPrefix("-") }
+        var out: [FlatFileResult] = []
+        out.reserveCapacity(min(folders.count * 4, 400))
+        for folder in folders {
+            for file in folder.files {
+                if !includeTerms.isEmpty {
+                    let hay = "\(folder.folderLowercased) \(folder.username.lowercased()) \(file.filename.lowercased())"
+                    if !includeTerms.allSatisfy({ hay.contains($0) }) { continue }
+                }
+                out.append(FlatFileResult(
+                    id: "\(folder.username)|\(file.path)",
+                    username: folder.username,
+                    file: file,
+                    folderImages: folder.images,
+                    slotFree: folder.slotFree,
+                    speed: folder.speed,
+                    queueLength: folder.queueLength
+                ))
+                if out.count >= 400 { return out }
+            }
+        }
+        return out
     }
 
     private var matchingHistory: [String] {
@@ -30,17 +75,63 @@ struct SearchView: View {
     }
 
     private var shouldShowHomeSections: Bool {
-        isSearchFocused || soulseek.currentQuery.isEmpty
+        isSearchFocused || searchStore.currentQuery.isEmpty
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
+            let shownFolders = displayedResults
             List {
                 if !soulseek.isLoggedIn {
                     Section { ConnectionBanner() }
                 }
 
-                // 1. Sección de Wishlist (Búsquedas Guardadas / Auto-Search)
+                // Multi-tab bar for concurrent / recent in-memory searches (Nicotine+-style)
+                if !searchStore.tabs.isEmpty && !isSearchFocused {
+                    Section {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                ForEach(searchStore.tabs) { tab in
+                                    let isSelected = tab.id == searchStore.activeTabID
+                                    HStack(spacing: 6) {
+                                        Button {
+                                            query = tab.query
+                                            keywordFilter = ""
+                                            searchStore.selectTab(tab.id)
+                                        } label: {
+                                            HStack(spacing: 5) {
+                                                if tab.isActive {
+                                                    ProgressView().controlSize(.mini)
+                                                }
+                                                Text(tab.query)
+                                                    .lineLimit(1)
+                                            }
+                                            .font(.caption.weight(.semibold))
+                                        }
+                                        .buttonStyle(.plain)
+
+                                        Button {
+                                            soulseek.closeSearchTab(tab.id)
+                                        } label: {
+                                            Image(systemName: "xmark")
+                                                .font(.caption2.weight(.bold))
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
+                                    .background(isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(Color.secondary.opacity(0.15)), in: Capsule())
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                        .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 4, trailing: 12))
+                        .listRowBackground(Color.clear)
+                    }
+                }
+
+                // 1. Wishlist
                 if shouldShowHomeSections && !soulseek.wishlist.isEmpty {
                     Section {
                         ForEach(soulseek.wishlist) { item in
@@ -103,18 +194,28 @@ struct SearchView: View {
                     }
                 }
 
-                // 2. Sección de Usuarios Favoritos (Acceso directo a sus carpetas)
+                // 2. Favorite Users (direct browse)
                 if shouldShowHomeSections && !soulseek.favoriteUsers.isEmpty {
                     Section("Favorite Users (Tap to Browse)") {
                         ScrollView(.horizontal, showsIndicators: false) {
                             HStack(spacing: 8) {
                                 ForEach(soulseek.favoriteUsers, id: \.self) { user in
-                                    NavigationLink(value: BrowseTarget(username: user, folder: "")) {
-                                        Label(user, systemImage: "person.crop.circle.badge.checkmark")
-                                            .font(.caption.weight(.semibold))
-                                            .padding(.horizontal, 12)
-                                            .padding(.vertical, 7)
-                                            .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    Button {
+                                        path.append(BrowseTarget(username: user, folder: ""))
+                                    } label: {
+                                        HStack(spacing: 5) {
+                                            if let status = soulseek.userStatuses[user.lowercased()] {
+                                                Circle()
+                                                    .fill(status == .online ? Color.green : (status == .away ? Color.orange : Color.gray))
+                                                    .frame(width: 7, height: 7)
+                                            }
+                                            Label(user, systemImage: "person.crop.circle.badge.checkmark")
+                                        }
+                                        .font(.caption.weight(.semibold))
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 7)
+                                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                                        .foregroundStyle(.tint)
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -124,31 +225,36 @@ struct SearchView: View {
                     }
                 }
 
-                // 3. Historial de búsqueda desplegable
+                // 3. Recent Search History (sibling buttons — no nested Button hit-testing bug)
                 if shouldShowHomeSections && !matchingHistory.isEmpty {
                     Section {
                         ForEach(matchingHistory, id: \.self) { item in
-                            Button {
-                                query = item
-                                keywordFilter = ""
-                                isSearchFocused = false
-                                soulseek.search(item)
-                            } label: {
-                                HStack(spacing: 10) {
-                                    Image(systemName: "clock.arrow.circlepath")
-                                        .foregroundStyle(.secondary)
-                                    Text(item)
-                                        .foregroundStyle(.primary)
-                                        .lineLimit(1)
-                                    Spacer()
-                                    Button {
-                                        soulseek.toggleWishlist(item)
-                                    } label: {
-                                        Image(systemName: soulseek.isInWishlist(item) ? "star.fill" : "star")
-                                            .foregroundStyle(soulseek.isInWishlist(item) ? .yellow : .secondary)
+                            HStack(spacing: 10) {
+                                Button {
+                                    query = item
+                                    keywordFilter = ""
+                                    isSearchFocused = false
+                                    soulseek.search(item)
+                                } label: {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "clock.arrow.circlepath")
+                                            .foregroundStyle(.secondary)
+                                        Text(item)
+                                            .foregroundStyle(.primary)
+                                            .lineLimit(1)
+                                        Spacer()
                                     }
-                                    .buttonStyle(.plain)
+                                    .contentShape(Rectangle())
                                 }
+                                .buttonStyle(.plain)
+
+                                Button {
+                                    soulseek.toggleWishlist(item)
+                                } label: {
+                                    Image(systemName: soulseek.isInWishlist(item) ? "star.fill" : "star")
+                                        .foregroundStyle(soulseek.isInWishlist(item) ? .yellow : .secondary)
+                                }
+                                .buttonStyle(.borderless)
                             }
                             .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) {
@@ -171,20 +277,20 @@ struct SearchView: View {
                     }
                 }
 
-                // 4. Resultados de búsqueda activa
-                if !soulseek.currentQuery.isEmpty && !isSearchFocused {
+                // 4. Active Search Results
+                if !searchStore.currentQuery.isEmpty && !isSearchFocused {
                     Section {
-                        FilterChips(showAll: $showFilters)
+                        FilterChips(showAll: $showFilters, viewMode: $viewMode)
                             .listRowInsets(EdgeInsets())
                             .listRowBackground(Color.clear)
                     }
 
-                    // Mini-buscador por palabras clave y botón para guardar en Wishlist
+                    // Live keyword filter (supports -exclude terms) + Wishlist button
                     Section {
                         HStack(spacing: 8) {
                             Image(systemName: "line.3.horizontal.decrease")
                                 .foregroundStyle(.secondary)
-                            TextField("Filter results by keyword, file or user…", text: $keywordFilter)
+                            TextField("Filter (supports -exclude, user, ext)…", text: $keywordFilter)
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                             if !keywordFilter.isEmpty {
@@ -198,30 +304,42 @@ struct SearchView: View {
                             }
                             Divider().frame(height: 18)
                             Button {
-                                soulseek.toggleWishlist(soulseek.currentQuery)
+                                soulseek.toggleWishlist(searchStore.currentQuery)
                             } label: {
-                                Label(soulseek.isInWishlist(soulseek.currentQuery) ? "Saved" : "Wishlist",
-                                      systemImage: soulseek.isInWishlist(soulseek.currentQuery) ? "star.fill" : "star")
+                                let saved = soulseek.isInWishlist(searchStore.currentQuery)
+                                Label(saved ? "Saved" : "Wishlist", systemImage: saved ? "star.fill" : "star")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(soulseek.isInWishlist(soulseek.currentQuery) ? .yellow : .accentColor)
+                                    .foregroundStyle(saved ? AnyShapeStyle(.yellow) : AnyShapeStyle(.tint))
                             }
                             .buttonStyle(.plain)
                         }
                         .padding(.vertical, 2)
                     }
 
+                    // Status + Stop Search + Clear Filters
                     Section {
-                        HStack {
-                            Text("\(soulseek.responseCount) users · \(displayedResults.count) folders")
-                            if soulseek.hiddenCount > 0 {
-                                Text("· \(soulseek.hiddenCount) filtered out")
+                        HStack(spacing: 8) {
+                            if searchStore.isSearching {
+                                ProgressView().controlSize(.mini)
+                            }
+                            let keywordHidden = max(0, searchStore.results.count - shownFolders.count)
+                            let totalHidden = searchStore.hiddenCount + keywordHidden
+                            Text("\(searchStore.responseCount) users · \(shownFolders.count) folders")
+                            if totalHidden > 0 {
+                                Text("· \(totalHidden) hidden")
                             }
                             Spacer()
-                            if soulseek.filters.activeCount > 0 || soulseek.audioOnly || !keywordFilter.isEmpty {
+                            if searchStore.isSearching {
+                                Button("Stop") {
+                                    soulseek.stopActiveSearch()
+                                }
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.orange)
+                            } else if searchStore.filters.activeCount > 0 || searchStore.audioOnly || !keywordFilter.isEmpty {
                                 Button("Clear Filters") {
-                                    soulseek.audioOnly = false
+                                    searchStore.audioOnly = false
                                     keywordFilter = ""
-                                    soulseek.filters = ResultFilters(sort: soulseek.filters.sort)
+                                    searchStore.filters = ResultFilters(sort: searchStore.filters.sort)
                                 }
                                 .font(.footnote.weight(.semibold))
                             }
@@ -230,42 +348,65 @@ struct SearchView: View {
                         .foregroundStyle(.secondary)
                     }
 
-                    ForEach(displayedResults) { folder in
-                        NavigationLink(value: folder.id) {
-                            FolderRow(
-                                folder: folder,
-                                isFavorite: soulseek.isFavoriteUser(folder.username)
-                            )
-                        }
-                        .contextMenu {
-                            NavigationLink(value: BrowseTarget(username: folder.username, folder: folder.folder)) {
-                                Label("Browse Full Folder", systemImage: "folder")
+                    if viewMode == .folders {
+                        ForEach(shownFolders) { folder in
+                            NavigationLink(value: folder.id) {
+                                FolderRow(
+                                    folder: folder,
+                                    isFavorite: soulseek.isFavoriteUser(folder.username),
+                                    inLibrary: library.ownsFolder(named: folder.name)
+                                )
                             }
-                            if let parent = folder.parentFolderPath {
-                                NavigationLink(value: BrowseTarget(username: folder.username, folder: parent)) {
-                                    Label("Browse Parent Folder", systemImage: "folder.badge.gearshape")
+                            .contextMenu {
+                                Button {
+                                    path.append(BrowseTarget(username: folder.username, folder: folder.folder))
+                                } label: {
+                                    Label("Browse Full Folder", systemImage: "folder")
+                                }
+                                if let parent = folder.parentFolderPath {
+                                    Button {
+                                        path.append(BrowseTarget(username: folder.username, folder: parent))
+                                    } label: {
+                                        Label("Browse Parent Folder", systemImage: "folder.badge.gearshape")
+                                    }
+                                }
+                                Button {
+                                    path.append(BrowseTarget(username: folder.username, folder: ""))
+                                } label: {
+                                    Label("Browse All User Files (\(folder.username))", systemImage: "externaldrive.fill.badge.person.crop")
+                                }
+                                Button {
+                                    soulseek.downloadFolder(folder)
+                                } label: {
+                                    Label("Download Folder", systemImage: "arrow.down.circle")
+                                }
+                                Divider()
+                                Button {
+                                    soulseek.toggleFavoriteUser(folder.username)
+                                } label: {
+                                    Label(soulseek.isFavoriteUser(folder.username) ? "Remove Favorite User" : "Favorite User (\(folder.username))",
+                                          systemImage: soulseek.isFavoriteUser(folder.username) ? "star.slash" : "star")
+                                }
+                                Button(role: .destructive) {
+                                    soulseek.toggleBlockedUser(folder.username)
+                                } label: {
+                                    Label("Block User (\(folder.username))", systemImage: "hand.raised.fill")
                                 }
                             }
-                            NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
-                                Label("Browse All User Files (\(folder.username))", systemImage: "externaldrive.fill.badge.person.crop")
-                            }
-                            Button {
-                                soulseek.downloadFolder(folder)
-                            } label: {
-                                Label("Download Folder", systemImage: "arrow.down.circle")
-                            }
-                            Divider()
-                            Button {
-                                soulseek.toggleFavoriteUser(folder.username)
-                            } label: {
-                                Label(soulseek.isFavoriteUser(folder.username) ? "Remove Favorite User" : "Favorite User (\(folder.username))",
-                                      systemImage: soulseek.isFavoriteUser(folder.username) ? "star.slash" : "star")
-                            }
-                            Button(role: .destructive) {
-                                soulseek.toggleBlockedUser(folder.username)
-                            } label: {
-                                Label("Block User (\(folder.username))", systemImage: "hand.raised.fill")
-                            }
+                        }
+                    } else {
+                        let flat = flatFiles(from: shownFolders)
+                        ForEach(flat) { entry in
+                            FileRow(
+                                file: entry.file,
+                                username: entry.username,
+                                folderImages: entry.folderImages,
+                                showUserBadge: true,
+                                slotFree: entry.slotFree,
+                                speed: entry.speed,
+                                inLibrary: library.ownsFile(named: entry.file.filename),
+                                onBrowseFolder: { target in path.append(target) }
+                            )
                         }
                     }
                 }
@@ -276,7 +417,14 @@ struct SearchView: View {
             .onSubmit(of: .search) {
                 keywordFilter = ""
                 isSearchFocused = false
-                soulseek.search(query)
+                if !soulseek.isLoggedIn {
+                    router.message = soulseek.hasCredentials
+                        ? "Reconnecting to Soulseek… try again in a moment."
+                        : "Log in to Soulseek under Settings to search."
+                    soulseek.reconnectIfNeeded()
+                } else {
+                    soulseek.search(query)
+                }
             }
             .onReceive(router.$pendingSearch) { pending in
                 guard let pending else { return }
@@ -287,7 +435,7 @@ struct SearchView: View {
                 router.pendingSearch = nil
             }
             .navigationDestination(for: String.self) { id in
-                FolderDetailView(folderID: id)
+                FolderDetailView(folderID: id, onBrowse: { target in path.append(target) })
             }
             .navigationDestination(for: BrowseTarget.self) { target in
                 RemoteFolderBrowserView(target: target)
@@ -302,7 +450,7 @@ struct SearchView: View {
                     Button {
                         showFilters = true
                     } label: {
-                        Image(systemName: (soulseek.filters.activeCount > 0 || soulseek.audioOnly)
+                        Image(systemName: (searchStore.filters.activeCount > 0 || searchStore.audioOnly)
                               ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
                     }
                 }
@@ -312,12 +460,15 @@ struct SearchView: View {
                     .presentationDetents([.medium, .large])
             }
             .sheet(isPresented: $showPeersSheet) {
-                PeersManagerSheet()
+                PeersManagerSheet { target in
+                    showPeersSheet = false
+                    path.append(target)
+                }
             }
             .overlay {
-                if soulseek.currentQuery.isEmpty && soulseek.searchHistory.isEmpty && soulseek.wishlist.isEmpty && soulseek.isLoggedIn && !isSearchFocused {
+                if searchStore.currentQuery.isEmpty && soulseek.searchHistory.isEmpty && soulseek.wishlist.isEmpty && soulseek.isLoggedIn && !isSearchFocused {
                     EmptyStateView(title: "Search Soulseek",
-                                   message: "Search for music, videos, archives, books or any file. Results arrive over ~30 seconds.",
+                                   message: "Search for music, videos, archives, books or any file. Results stream in live.",
                                    systemImage: "magnifyingglass")
                 }
             }
@@ -325,8 +476,9 @@ struct SearchView: View {
     }
 }
 
-/// Panel para administrar Usuarios Favoritos y Usuarios Bloqueados (Blacklist)
+/// Manage Favorite and Blocked users (with direct browse & manual block input).
 struct PeersManagerSheet: View {
+    var onBrowseUser: ((BrowseTarget) -> Void)? = nil
     @EnvironmentObject private var soulseek: SoulseekModel
     @Environment(\.dismiss) private var dismiss
     @State private var newUsername = ""
@@ -335,22 +487,33 @@ struct PeersManagerSheet: View {
         NavigationStack {
             List {
                 Section("Add User Manually") {
-                    HStack {
-                        TextField("Soulseek username…", text: $newUsername)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        Button("Favorite") {
-                            let trimmed = newUsername.trimmingCharacters(in: .whitespaces)
+                    TextField("Soulseek username…", text: $newUsername)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    HStack(spacing: 12) {
+                        Button {
+                            let trimmed = newUsername.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !trimmed.isEmpty else { return }
-                            if !soulseek.isFavoriteUser(trimmed) {
-                                soulseek.toggleFavoriteUser(trimmed)
-                            }
+                            if !soulseek.isFavoriteUser(trimmed) { soulseek.toggleFavoriteUser(trimmed) }
                             newUsername = ""
+                        } label: {
+                            Label("Add Favorite", systemImage: "star.fill")
                         }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
-                        .disabled(newUsername.trimmingCharacters(in: .whitespaces).isEmpty)
+
+                        Button(role: .destructive) {
+                            let trimmed = newUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            if !soulseek.isBlockedUser(trimmed) { soulseek.toggleBlockedUser(trimmed) }
+                            newUsername = ""
+                        } label: {
+                            Label("Block User", systemImage: "hand.raised.fill")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
+                    .disabled(newUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
 
                 Section("Favorite Users (\(soulseek.favoriteUsers.count))") {
@@ -361,13 +524,26 @@ struct PeersManagerSheet: View {
                     } else {
                         ForEach(soulseek.favoriteUsers, id: \.self) { user in
                             HStack {
-                                Label(user, systemImage: "star.fill")
-                                    .foregroundStyle(.primary)
+                                Button {
+                                    onBrowseUser?(BrowseTarget(username: user, folder: ""))
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "star.fill").foregroundStyle(.yellow)
+                                        Text(user).foregroundStyle(.primary)
+                                        if let status = soulseek.userStatuses[user.lowercased()] {
+                                            Text(status == .online ? "Online" : (status == .away ? "Away" : "Offline"))
+                                                .font(.caption2)
+                                                .foregroundStyle(status == .online ? .green : .secondary)
+                                        }
+                                    }
+                                }
+                                .buttonStyle(.plain)
                                 Spacer()
                                 Button("Remove", role: .destructive) {
                                     soulseek.toggleFavoriteUser(user)
                                 }
                                 .font(.caption)
+                                .buttonStyle(.borderless)
                             }
                         }
                     }
@@ -388,6 +564,7 @@ struct PeersManagerSheet: View {
                                     soulseek.toggleBlockedUser(user)
                                 }
                                 .font(.caption)
+                                .buttonStyle(.borderless)
                             }
                         }
                     }
@@ -407,14 +584,36 @@ struct PeersManagerSheet: View {
 struct FolderRow: View {
     let folder: FolderResult
     var isFavorite: Bool = false
+    var inLibrary: Bool = false
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            ArtworkView(source: .remote(folder.coverQuery), size: 60, cornerRadius: 6)
+            if folder.isAudioFolder && !folder.coverQuery.isEmpty {
+                ArtworkView(source: .remote(folder.coverQuery), size: 60, cornerRadius: 6)
+            } else {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.secondary.opacity(0.14))
+                    Image(systemName: iconForFolder)
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(width: 60, height: 60)
+            }
             VStack(alignment: .leading, spacing: 3) {
-                Text(folder.name)
-                    .font(.headline)
-                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(folder.name)
+                        .font(.headline)
+                        .lineLimit(2)
+                    if inLibrary {
+                        Text("Owned")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.18), in: Capsule())
+                            .foregroundStyle(.green)
+                    }
+                }
                 if !folder.parentPath.isEmpty {
                     HStack(spacing: 4) {
                         Image(systemName: "folder")
@@ -451,63 +650,48 @@ struct FolderRow: View {
         }
         .padding(.vertical, 2)
     }
+
+    private var iconForFolder: String {
+        if !folder.extensions.isDisjoint(with: ResultFilters.videoSet) { return "film" }
+        if !folder.extensions.isDisjoint(with: ResultFilters.archiveSet) { return "doc.zipper" }
+        if !folder.extensions.isDisjoint(with: ResultFilters.documentSet) { return "book" }
+        if !folder.extensions.isDisjoint(with: ResultFilters.imageSet) { return "photo" }
+        return "folder.fill"
+    }
 }
 
 struct FolderDetailView: View {
     let folderID: String
+    let onBrowse: (BrowseTarget) -> Void
     @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var searchStore: SearchStore
+    @EnvironmentObject private var library: LibraryStore
     @State private var fileFilter = ""
-    @State private var extraFiles: [SharedFile] = []
+    @State private var directoryIndex: RemoteDirectoryIndex = .empty
     @State private var isLoadingFullFolder = false
 
-    private func mergedFiles(for folder: FolderResult) -> [SharedFile] {
-        var seen = Set<String>()
-        var combined: [SharedFile] = []
-        let allKnown = folder.files + extraFiles + soulseek.knownFiles(for: folder.username)
-        for f in allKnown where f.folder.caseInsensitiveCompare(folder.folder) == .orderedSame {
-            if seen.insert(f.path.lowercased()).inserted {
-                combined.append(f)
-            }
-        }
-        return combined.sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
-    }
-
-    private func childSubfolders(for folder: FolderResult) -> [(name: String, fullPath: String, count: Int)] {
-        let prefix = folder.folder + "\\"
-        let prefixLower = prefix.lowercased()
-        var counts: [String: Int] = [:]
-        var names: [String: String] = [:]
-
-        for f in (extraFiles + soulseek.knownFiles(for: folder.username)) {
-            if f.folder.lowercased().hasPrefix(prefixLower) {
-                let rem = f.folder.dropFirst(prefix.count)
-                if let next = rem.split(separator: "\\").first.map(String.init), !next.isEmpty {
-                    let key = next.lowercased()
-                    counts[key, default: 0] += 1
-                    if names[key] == nil { names[key] = next }
-                }
-            }
-        }
-        return counts.keys.compactMap { k in
-            guard let name = names[k], let c = counts[k] else { return nil }
-            return (name: name, fullPath: "\(folder.folder)\\\(name)", count: c)
-        }
-        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
     var body: some View {
-        if let folder = soulseek.folder(withID: folderID) {
-            let allFolderFiles = mergedFiles(for: folder)
-            let subfolders = childSubfolders(for: folder)
-            let filteredFiles = allFolderFiles.filter {
-                fileFilter.trimmingCharacters(in: .whitespaces).isEmpty ||
-                $0.filename.localizedCaseInsensitiveContains(fileFilter.trimmingCharacters(in: .whitespaces))
-            }
+        if let folder = searchStore.folder(withID: folderID) {
+            let direct = directoryIndex.directFiles(in: folder.folder)
+            let allFolderFiles = direct.isEmpty ? folder.files : direct
+            let subfolders = directoryIndex.subfolders(in: folder.folder)
+            let trimmedFilter = fileFilter.trimmingCharacters(in: .whitespaces)
+            let filteredFiles = trimmedFilter.isEmpty
+                ? allFolderFiles
+                : allFolderFiles.filter { $0.filename.localizedCaseInsensitiveContains(trimmedFilter) }
 
             List {
                 Section {
                     HStack(spacing: 16) {
-                        ArtworkView(source: .remote(folder.coverQuery), size: 110, cornerRadius: 10)
+                        if folder.isAudioFolder && !folder.coverQuery.isEmpty {
+                            ArtworkView(source: .remote(folder.coverQuery), size: 110, cornerRadius: 10)
+                        } else {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.14))
+                                Image(systemName: "folder.fill").font(.largeTitle).foregroundStyle(.tint)
+                            }
+                            .frame(width: 90, height: 90)
+                        }
                         VStack(alignment: .leading, spacing: 4) {
                             Text(folder.name).font(.headline)
                             Text(folder.formatSummary).font(.subheadline).foregroundStyle(.secondary)
@@ -517,7 +701,7 @@ struct FolderDetailView: View {
                             if isLoadingFullFolder {
                                 HStack(spacing: 6) {
                                     ProgressView().controlSize(.mini)
-                                    Text("Loading all peer files…")
+                                    Text("Fetching folder listing…")
                                         .font(.caption2)
                                         .foregroundStyle(.secondary)
                                 }
@@ -530,12 +714,15 @@ struct FolderDetailView: View {
                 Section("Container & Root Folders (Tap to Browse)") {
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 6) {
-                            NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
+                            Button {
+                                onBrowse(BrowseTarget(username: folder.username, folder: ""))
+                            } label: {
                                 Label(folder.username, systemImage: "person.crop.square.fill")
                                     .font(.caption.weight(.semibold))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 6)
-                                    .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                    .background(Color.secondary.opacity(0.15), in: Capsule())
+                                    .foregroundStyle(.tint)
                             }
                             .buttonStyle(.plain)
 
@@ -543,7 +730,9 @@ struct FolderDetailView: View {
                                 Image(systemName: "chevron.right")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
-                                NavigationLink(value: BrowseTarget(username: folder.username, folder: level.fullPath)) {
+                                Button {
+                                    onBrowse(BrowseTarget(username: folder.username, folder: level.fullPath))
+                                } label: {
                                     Label(level.name, systemImage: "folder.fill")
                                         .font(.caption.weight(.medium))
                                         .padding(.horizontal, 10)
@@ -557,35 +746,39 @@ struct FolderDetailView: View {
                     }
 
                     if let parent = folder.parentFolderPath {
-                        NavigationLink(value: BrowseTarget(username: folder.username, folder: parent)) {
+                        Button {
+                            onBrowse(BrowseTarget(username: folder.username, folder: parent))
+                        } label: {
                             Label("Go Up to Parent Folder", systemImage: "arrow.turn.left.up")
                         }
                     }
 
-                    NavigationLink(value: BrowseTarget(username: folder.username, folder: folder.folder)) {
-                        Label("Explore Full Container Folder from Peer", systemImage: "folder.badge.magnifyingglass")
-                    }
-
-                    NavigationLink(value: BrowseTarget(username: folder.username, folder: "")) {
+                    Button {
+                        onBrowse(BrowseTarget(username: folder.username, folder: ""))
+                    } label: {
                         Label("Browse All Shared Folders of \(folder.username)", systemImage: "externaldrive.fill.badge.person.crop")
                     }
                 }
 
                 if !subfolders.isEmpty {
                     Section("Subfolders Inside (\(subfolders.count))") {
-                        ForEach(subfolders, id: \.fullPath) { sub in
-                            NavigationLink(value: BrowseTarget(username: folder.username, folder: sub.fullPath)) {
+                        ForEach(subfolders) { sub in
+                            Button {
+                                onBrowse(BrowseTarget(username: folder.username, folder: sub.fullPath))
+                            } label: {
                                 HStack(spacing: 12) {
                                     Image(systemName: "folder.fill")
                                         .foregroundStyle(.tint)
                                     Text(sub.name)
                                         .font(.subheadline.weight(.medium))
+                                        .foregroundStyle(.primary)
                                     Spacer()
-                                    Text("\(sub.count) files")
+                                    Text("\(sub.totalFileCount) files")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
+                            .buttonStyle(.plain)
                         }
                     }
                 }
@@ -605,7 +798,7 @@ struct FolderDetailView: View {
                               systemImage: soulseek.isFavoriteUser(folder.username) ? "star.slash" : "star")
                     }
                 } footer: {
-                    Text("From \(folder.username) · \(folder.folder). Tap any folder badge above to navigate through its root/parent directories.")
+                    Text("From \(folder.username) · \(folder.folder)")
                 }
 
                 Section("Files in Folder (\(filteredFiles.count))") {
@@ -617,11 +810,8 @@ struct FolderDetailView: View {
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                             if !fileFilter.isEmpty {
-                                Button {
-                                    fileFilter = ""
-                                } label: {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundStyle(.secondary)
+                                Button { fileFilter = "" } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                                 }
                                 .buttonStyle(.plain)
                             }
@@ -629,20 +819,24 @@ struct FolderDetailView: View {
                     }
 
                     ForEach(filteredFiles, id: \.path) { file in
-                        FileRow(file: file, username: folder.username, folderImages: folder.images, showBrowseParent: false)
+                        FileRow(
+                            file: file,
+                            username: folder.username,
+                            folderImages: folder.images,
+                            inLibrary: library.ownsFile(named: file.filename),
+                            onBrowseFolder: onBrowse
+                        )
                     }
                 }
             }
             .navigationTitle(folder.name)
             .navigationBarTitleDisplayMode(.inline)
             .task(id: folder.id) {
+                directoryIndex = await searchStore.directoryIndex(for: folder.username)
                 isLoadingFullFolder = true
-                soulseek.browseUserFolder(username: folder.username, folder: folder.folder) { files in
-                    if let files {
-                        extraFiles = files
-                    }
-                    isLoadingFullFolder = false
-                }
+                // Lightweight FolderContentsRequest (code 36) only!
+                directoryIndex = await soulseek.browseUserFolder(username: folder.username, folder: folder.folder)
+                isLoadingFullFolder = false
             }
         } else {
             Text("This result is no longer available.")
@@ -651,14 +845,25 @@ struct FolderDetailView: View {
     }
 }
 
+/// Fast O(1) indexed remote directory browser with in-place path navigation (no infinite NavigationStack push),
+/// recursive folder downloads, and multi-file selection.
 struct RemoteFolderBrowserView: View {
     let target: BrowseTarget
     @EnvironmentObject private var soulseek: SoulseekModel
-    @State private var allPeerFiles: [SharedFile] = []
+    @EnvironmentObject private var searchStore: SearchStore
+    @EnvironmentObject private var library: LibraryStore
+
+    @State private var currentPath: String
+    @State private var directoryIndex: RemoteDirectoryIndex = .empty
     @State private var isLoading = true
     @State private var filterText = ""
+    @State private var selectedPaths = Set<String>()
+    @State private var isSelecting = false
 
-    private var currentPath: String { target.folder }
+    init(target: BrowseTarget) {
+        self.target = target
+        self._currentPath = State(initialValue: target.folder)
+    }
 
     private var folderTitle: String {
         currentPath.split(separator: "\\").last.map(String.init) ?? target.username
@@ -672,70 +877,34 @@ struct RemoteFolderBrowserView: View {
 
     private var pathLevels: [(name: String, fullPath: String)] {
         let parts = currentPath.split(separator: "\\").map(String.init)
-        var current = ""
+        var acc = ""
         return parts.map { part in
-            current = current.isEmpty ? part : "\(current)\\\(part)"
-            return (name: part, fullPath: current)
+            acc = acc.isEmpty ? part : "\(acc)\\\(part)"
+            return (name: part, fullPath: acc)
         }
-    }
-
-    private var subfolders: [(name: String, fullPath: String, fileCount: Int)] {
-        let prefix = currentPath.isEmpty ? "" : currentPath + "\\"
-        let prefixLower = prefix.lowercased()
-        var counts: [String: Int] = [:]
-        var originalNames: [String: String] = [:]
-
-        for file in allPeerFiles {
-            let folder = file.folder
-            if currentPath.isEmpty {
-                if let first = folder.split(separator: "\\").first.map(String.init) {
-                    let key = first.lowercased()
-                    counts[key, default: 0] += 1
-                    if originalNames[key] == nil { originalNames[key] = first }
-                }
-            } else if folder.lowercased().hasPrefix(prefixLower) {
-                let remainder = folder.dropFirst(prefix.count)
-                if let nextSegment = remainder.split(separator: "\\").first.map(String.init), !nextSegment.isEmpty {
-                    let key = nextSegment.lowercased()
-                    counts[key, default: 0] += 1
-                    if originalNames[key] == nil { originalNames[key] = nextSegment }
-                }
-            }
-        }
-
-        let trimmed = filterText.trimmingCharacters(in: .whitespaces).lowercased()
-        return counts.keys.compactMap { key -> (name: String, fullPath: String, fileCount: Int)? in
-            guard let name = originalNames[key], let count = counts[key] else { return nil }
-            if !trimmed.isEmpty && !name.lowercased().contains(trimmed) { return nil }
-            let full = currentPath.isEmpty ? name : "\(currentPath)\\\(name)"
-            return (name: name, fullPath: full, fileCount: count)
-        }
-        .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-    }
-
-    private var directFiles: [SharedFile] {
-        let trimmed = filterText.trimmingCharacters(in: .whitespaces).lowercased()
-        return allPeerFiles.filter { file in
-            guard file.folder.caseInsensitiveCompare(currentPath) == .orderedSame else { return false }
-            if !trimmed.isEmpty {
-                return file.filename.lowercased().contains(trimmed)
-            }
-            return true
-        }
-        .sorted { $0.filename.localizedStandardCompare($1.filename) == .orderedAscending }
     }
 
     var body: some View {
+        let trimmed = filterText.trimmingCharacters(in: .whitespaces).lowercased()
+        let rawSubfolders = directoryIndex.subfolders(in: currentPath)
+        let subfolders = trimmed.isEmpty ? rawSubfolders : rawSubfolders.filter { $0.name.lowercased().contains(trimmed) }
+        let rawFiles = directoryIndex.directFiles(in: currentPath)
+        let directFiles = trimmed.isEmpty ? rawFiles : rawFiles.filter { $0.filename.lowercased().contains(trimmed) }
+        let recursiveFiles = directoryIndex.recursiveFiles(under: currentPath)
+
         List {
-            Section {
+            Section("Path Navigation") {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        NavigationLink(value: BrowseTarget(username: target.username, folder: "")) {
+                        Button {
+                            navigate(to: "")
+                        } label: {
                             Label(target.username, systemImage: "person.crop.square.fill")
                                 .font(.caption.weight(.semibold))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
-                                .background(Color.accentColor.opacity(0.15), in: Capsule())
+                                .background(Color.secondary.opacity(0.15), in: Capsule())
+                                .foregroundStyle(.tint)
                         }
                         .buttonStyle(.plain)
 
@@ -743,7 +912,9 @@ struct RemoteFolderBrowserView: View {
                             Image(systemName: "chevron.right")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
-                            NavigationLink(value: BrowseTarget(username: target.username, folder: level.fullPath)) {
+                            Button {
+                                navigate(to: level.fullPath)
+                            } label: {
                                 Label(level.name, systemImage: "folder.fill")
                                     .font(.caption.weight(.medium))
                                     .padding(.horizontal, 10)
@@ -757,16 +928,18 @@ struct RemoteFolderBrowserView: View {
                 }
 
                 if let parent = parentPath {
-                    NavigationLink(value: BrowseTarget(username: target.username, folder: parent)) {
+                    Button {
+                        navigate(to: parent)
+                    } label: {
                         Label("Up to Parent Folder", systemImage: "arrow.turn.left.up")
                     }
                 } else if !currentPath.isEmpty {
-                    NavigationLink(value: BrowseTarget(username: target.username, folder: "")) {
+                    Button {
+                        navigate(to: "")
+                    } label: {
                         Label("Up to User Root (\(target.username))", systemImage: "arrow.turn.left.up")
                     }
                 }
-            } header: {
-                Text("Path Navigation")
             }
 
             Section {
@@ -777,11 +950,8 @@ struct RemoteFolderBrowserView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                     if !filterText.isEmpty {
-                        Button {
-                            filterText = ""
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .foregroundStyle(.secondary)
+                        Button { filterText = "" } label: {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
                     }
@@ -792,7 +962,9 @@ struct RemoteFolderBrowserView: View {
                 Section {
                     HStack(spacing: 12) {
                         ProgressView()
-                        Text("Requesting folder contents from \(target.username)…")
+                        Text(currentPath.isEmpty
+                             ? "Requesting full share list from \(target.username)…"
+                             : "Requesting folder contents from \(target.username)…")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -801,9 +973,20 @@ struct RemoteFolderBrowserView: View {
             }
 
             if !subfolders.isEmpty {
-                Section("Subfolders (\(subfolders.count))") {
-                    ForEach(subfolders, id: \.fullPath) { sub in
-                        NavigationLink(value: BrowseTarget(username: target.username, folder: sub.fullPath)) {
+                Section {
+                    if recursiveFiles.count > directFiles.count {
+                        Button {
+                            soulseek.downloadFiles(recursiveFiles, from: target.username)
+                        } label: {
+                            Label("Download Entire Tree (\(recursiveFiles.count) files)", systemImage: "arrow.down.doc.fill")
+                        }
+                        .disabled(!soulseek.isLoggedIn)
+                    }
+
+                    ForEach(subfolders) { sub in
+                        Button {
+                            navigate(to: sub.fullPath)
+                        } label: {
                             HStack(spacing: 12) {
                                 Image(systemName: "folder.fill")
                                     .font(.title3)
@@ -811,39 +994,121 @@ struct RemoteFolderBrowserView: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(sub.name)
                                         .font(.body.weight(.medium))
+                                        .foregroundStyle(.primary)
                                         .lineLimit(2)
-                                    Text("\(sub.fileCount) files inside")
+                                    Text("\(sub.totalFileCount) files inside")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
+                                Spacer()
+                                Image(systemName: "chevron.right")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
                             }
                             .padding(.vertical, 2)
                         }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                let subFiles = directoryIndex.recursiveFiles(under: sub.fullPath)
+                                soulseek.downloadFiles(subFiles, from: target.username)
+                            } label: {
+                                Label("Download Subfolder (\(sub.totalFileCount) files)", systemImage: "arrow.down.circle")
+                            }
+                        }
                     }
+                } header: {
+                    Text("Subfolders (\(subfolders.count))")
                 }
             }
 
             if !directFiles.isEmpty {
                 Section {
-                    Button {
-                        soulseek.downloadFiles(directFiles, from: target.username)
-                    } label: {
-                        Label("Download All Files in This Folder (\(directFiles.count))", systemImage: "arrow.down.circle.fill")
+                    if isSelecting {
+                        HStack {
+                            Button(selectedPaths.count == directFiles.count ? "Deselect All" : "Select All") {
+                                if selectedPaths.count == directFiles.count {
+                                    selectedPaths.removeAll()
+                                } else {
+                                    selectedPaths = Set(directFiles.map(\.path))
+                                }
+                            }
+                            .font(.caption.weight(.semibold))
+                            Spacer()
+                            Button("Download Selected (\(selectedPaths.count))") {
+                                let chosen = directFiles.filter { selectedPaths.contains($0.path) }
+                                soulseek.downloadFiles(chosen, from: target.username)
+                                selectedPaths.removeAll()
+                                isSelecting = false
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(selectedPaths.isEmpty || !soulseek.isLoggedIn)
+                        }
+                    } else {
+                        Button {
+                            soulseek.downloadFiles(directFiles, from: target.username)
+                        } label: {
+                            Label("Download All Files in This Folder (\(directFiles.count))", systemImage: "arrow.down.circle.fill")
+                        }
+                        .disabled(!soulseek.isLoggedIn)
                     }
-                    .disabled(!soulseek.isLoggedIn)
 
                     ForEach(directFiles, id: \.path) { file in
-                        FileRow(file: file, username: target.username, folderImages: [], showBrowseParent: false)
+                        if isSelecting {
+                            Button {
+                                if selectedPaths.contains(file.path) {
+                                    selectedPaths.remove(file.path)
+                                } else {
+                                    selectedPaths.insert(file.path)
+                                }
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: selectedPaths.contains(file.path) ? "checkmark.circle.fill" : "circle")
+                                        .foregroundStyle(selectedPaths.contains(file.path) ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(file.filename).foregroundStyle(.primary).lineLimit(2)
+                                        Text(Formatting.bytes(file.size)).font(.caption).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            .buttonStyle(.plain)
+                        } else {
+                            FileRow(
+                                file: file,
+                                username: target.username,
+                                folderImages: [],
+                                inLibrary: library.ownsFile(named: file.filename),
+                                onBrowseFolder: { next in navigate(to: next.folder) }
+                            )
+                        }
                     }
                 } header: {
-                    Text("Files (\(directFiles.count))")
+                    HStack {
+                        Text("Files (\(directFiles.count))")
+                        Spacer()
+                        Button(isSelecting ? "Done" : "Select") {
+                            isSelecting.toggle()
+                            if !isSelecting { selectedPaths.removeAll() }
+                        }
+                        .font(.caption.weight(.semibold))
+                        .textCase(nil)
+                    }
                 }
             }
 
             if !isLoading && subfolders.isEmpty && directFiles.isEmpty {
                 Section {
-                    Text("No files or subfolders found at this level.")
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("No files or subfolders found at this level.")
+                            .foregroundStyle(.secondary)
+                        if !currentPath.isEmpty && !searchStore.hasFullShareList(for: target.username) {
+                            Button("Load Full User Share List") {
+                                Task { await loadFullShareList() }
+                            }
+                            .font(.subheadline.weight(.semibold))
+                        }
+                    }
                 }
             }
         }
@@ -858,32 +1123,41 @@ struct RemoteFolderBrowserView: View {
                         .foregroundStyle(soulseek.isFavoriteUser(target.username) ? .yellow : .primary)
                 }
                 Button {
-                    loadFolder(force: true)
+                    Task { await loadCurrentFolder(force: true) }
                 } label: {
                     Image(systemName: "arrow.clockwise")
                 }
                 .disabled(isLoading)
             }
         }
-        .task(id: target.id) {
-            loadFolder(force: false)
+        .task(id: "\(target.username)|\(currentPath)") {
+            await loadCurrentFolder(force: false)
         }
     }
 
-    private func loadFolder(force: Bool) {
-        let fallback = soulseek.knownFiles(for: target.username)
-        if !fallback.isEmpty {
-            allPeerFiles = fallback
+    private func navigate(to path: String) {
+        selectedPaths.removeAll()
+        isSelecting = false
+        filterText = ""
+        currentPath = path
+    }
+
+    private func loadCurrentFolder(force: Bool) async {
+        directoryIndex = await searchStore.directoryIndex(for: target.username)
+        // If we already have full shares cached and aren't forcing refresh, instant O(1) navigation!
+        if !force && searchStore.hasFullShareList(for: target.username) {
+            isLoading = false
+            return
         }
         isLoading = true
-        soulseek.browseUserFolder(username: target.username, folder: target.folder, forceRefresh: force) { files in
-            if let files, !files.isEmpty {
-                allPeerFiles = files
-            } else if allPeerFiles.isEmpty {
-                allPeerFiles = soulseek.knownFiles(for: target.username)
-            }
-            isLoading = false
-        }
+        directoryIndex = await soulseek.browseUserFolder(username: target.username, folder: currentPath, forceRefresh: force)
+        isLoading = false
+    }
+
+    private func loadFullShareList() async {
+        isLoading = true
+        directoryIndex = await soulseek.browseUserFolder(username: target.username, folder: "", forceRefresh: true)
+        isLoading = false
     }
 }
 
@@ -891,20 +1165,44 @@ struct FileRow: View {
     let file: SharedFile
     let username: String
     let folderImages: [SharedFile]
-    var showBrowseParent: Bool = true
+    var showUserBadge: Bool = false
+    var slotFree: Bool = true
+    var speed: UInt32 = 0
+    var inLibrary: Bool = false
+    var onBrowseFolder: ((BrowseTarget) -> Void)? = nil
     @EnvironmentObject private var soulseek: SoulseekModel
 
     var body: some View {
         HStack {
             VStack(alignment: .leading, spacing: 2) {
-                Text(file.filename)
-                    .lineLimit(2)
+                HStack(spacing: 6) {
+                    Text(file.filename)
+                        .lineLimit(2)
+                    if inLibrary {
+                        Image(systemName: "checkmark.seal.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.green)
+                    }
+                }
                 Text(details)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                if showUserBadge {
+                    HStack(spacing: 6) {
+                        Label(username, systemImage: "person")
+                        if slotFree {
+                            Text("Free").foregroundStyle(.green)
+                        } else {
+                            Text("Queued").foregroundStyle(.orange)
+                        }
+                        Text(Formatting.speed(speed))
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
             }
             Spacer()
-            statusButton
+            FileStatusButton(file: file, username: username, folderImages: folderImages)
         }
         .contextMenu {
             Button {
@@ -912,8 +1210,12 @@ struct FileRow: View {
             } label: {
                 Label("Download File", systemImage: "arrow.down.circle")
             }
-            NavigationLink(value: BrowseTarget(username: username, folder: file.folder)) {
-                Label("Open Container Folder", systemImage: "folder")
+            if let onBrowseFolder {
+                Button {
+                    onBrowseFolder(BrowseTarget(username: username, folder: file.folder))
+                } label: {
+                    Label("Open Container Folder", systemImage: "folder")
+                }
             }
         }
     }
@@ -921,9 +1223,7 @@ struct FileRow: View {
     private var details: String {
         var parts: [String] = []
         let ext = file.fileExtension.uppercased()
-        if !ext.isEmpty {
-            parts.append(ext)
-        }
+        if !ext.isEmpty { parts.append(ext) }
         parts.append(Formatting.bytes(file.size))
         if let duration = file.attributes.duration { parts.append(Formatting.duration(Double(duration))) }
         if let bitrate = file.attributes.bitrate { parts.append("\(bitrate) kbps") }
@@ -932,11 +1232,19 @@ struct FileRow: View {
         }
         return parts.joined(separator: " · ")
     }
+}
 
-    @ViewBuilder
-    private var statusButton: some View {
-        switch soulseek.state(of: file, from: username) {
-        case .none, .some(.failed):
+/// Isolated subview so only individual rows showing active transfer status subscribe to TransfersStore.
+private struct FileStatusButton: View {
+    let file: SharedFile
+    let username: String
+    let folderImages: [SharedFile]
+    @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var transfers: TransfersStore
+
+    var body: some View {
+        switch transfers.state(of: file, from: username) {
+        case .none, .some(.failed), .some(.paused):
             Button {
                 soulseek.download(file, from: username, knownImages: folderImages)
             } label: {
@@ -962,14 +1270,14 @@ struct FileRow: View {
 }
 
 struct SearchFiltersView: View {
-    @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var searchStore: SearchStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("Sort By", selection: $soulseek.filters.sort) {
+                    Picker("Sort By", selection: $searchStore.filters.sort) {
                         ForEach(ResultFilters.Sort.allCases) { sort in
                             Label(sort.rawValue, systemImage: sort.systemImage).tag(sort)
                         }
@@ -977,43 +1285,52 @@ struct SearchFiltersView: View {
                 }
 
                 Section("File Type & Quality") {
-                    Picker("Category", selection: $soulseek.filters.fileType) {
+                    Picker("Category", selection: $searchStore.filters.fileType) {
                         ForEach(ResultFilters.FileType.allCases) { Text($0.rawValue).tag($0) }
                     }
-                    Picker("Minimum Bitrate", selection: $soulseek.filters.minBitrate) {
+                    Picker("Minimum Bitrate", selection: $searchStore.filters.minBitrate) {
                         ForEach(ResultFilters.bitrateChoices, id: \.self) { kbps in
                             Text(kbps == 0 ? "Any" : "\(kbps) kbps").tag(kbps)
                         }
                     }
-                    Toggle("Audio Formats Only", isOn: $soulseek.audioOnly)
+                    Toggle("Hi-Res Audio Only (24-bit / >48 kHz)", isOn: $searchStore.filters.hiResOnly)
+                    Toggle("Audio Formats Only", isOn: $searchStore.audioOnly)
+                    TextField("Exact extension (e.g. flac, epub, mkv)", text: $searchStore.filters.exactExtension)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                 }
 
                 Section {
-                    Toggle("Free Upload Slot Only", isOn: $soulseek.filters.freeSlotOnly)
-                    Stepper(value: $soulseek.filters.minFiles, in: 1...30) {
-                        LabeledContent("Minimum Files", value: soulseek.filters.minFiles == 1 ? "Any" : "\(soulseek.filters.minFiles)")
+                    Toggle("Free Upload Slot Only", isOn: $searchStore.filters.freeSlotOnly)
+                    Picker("Minimum Folder Size", selection: $searchStore.filters.minSizeMB) {
+                        ForEach(ResultFilters.sizeMBChoices, id: \.self) { mb in
+                            Text(mb == 0 ? "Any" : "≥ \(mb) MB").tag(mb)
+                        }
+                    }
+                    Stepper(value: $searchStore.filters.minFiles, in: 1...30) {
+                        LabeledContent("Minimum Files", value: searchStore.filters.minFiles == 1 ? "Any" : "\(searchStore.filters.minFiles)")
                     }
                 } header: {
-                    Text("Availability")
+                    Text("Availability & Size")
                 } footer: {
-                    Text("A minimum of around 6 files skips single files and finds larger folders/packs.")
+                    Text("A minimum of around 6 files skips single files and finds full albums or packs.")
                 }
 
                 Section {
-                    TextField("live, remix, sample", text: $soulseek.filters.excludeWords)
+                    TextField("live, remix, sample", text: $searchStore.filters.excludeWords)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
                     Text("Exclude Words")
                 } footer: {
-                    Text("Hides folders whose path contains any of these.")
+                    Text("Hides folders whose path contains any of these. You can also type -word in the live filter.")
                 }
 
-                if !soulseek.filters.isDefault || soulseek.audioOnly {
+                if !searchStore.filters.isDefault || searchStore.audioOnly {
                     Section {
                         Button("Reset Filters", role: .destructive) {
-                            soulseek.audioOnly = false
-                            soulseek.filters = ResultFilters()
+                            searchStore.audioOnly = false
+                            searchStore.filters = ResultFilters()
                         }
                     }
                 }
@@ -1029,47 +1346,57 @@ struct SearchFiltersView: View {
     }
 }
 
-struct FilterChips: View {
+private struct FilterChips: View {
     @Binding var showAll: Bool
-    @EnvironmentObject private var soulseek: SoulseekModel
+    @Binding var viewMode: SearchViewMode
+    @EnvironmentObject private var searchStore: SearchStore
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
+                Button {
+                    viewMode = (viewMode == .folders) ? .files : .folders
+                } label: {
+                    chip(viewMode == .folders ? "Folders" : "Files",
+                         systemImage: viewMode == .folders ? "folder" : "doc.text",
+                         active: viewMode == .files)
+                }
+
                 Menu {
-                    Picker("Sort By", selection: $soulseek.filters.sort) {
+                    Picker("Sort By", selection: $searchStore.filters.sort) {
                         ForEach(ResultFilters.Sort.allCases) { sort in
                             Label(sort.rawValue, systemImage: sort.systemImage).tag(sort)
                         }
                     }
                 } label: {
-                    chip(soulseek.filters.sort.rawValue, systemImage: "arrow.up.arrow.down", active: true)
+                    chip(searchStore.filters.sort.rawValue, systemImage: "arrow.up.arrow.down", active: true)
                 }
 
                 Menu {
-                    Picker("File Type", selection: $soulseek.filters.fileType) {
+                    Picker("File Type", selection: $searchStore.filters.fileType) {
                         ForEach(ResultFilters.FileType.allCases) { Text($0.rawValue).tag($0) }
                     }
                 } label: {
-                    chip(soulseek.filters.fileType.shortLabel, systemImage: "doc", active: soulseek.filters.fileType != .any)
+                    chip(searchStore.filters.fileType.shortLabel, systemImage: "doc", active: searchStore.filters.fileType != .any)
                 }
 
                 Button {
-                    soulseek.audioOnly.toggle()
+                    searchStore.audioOnly.toggle()
                 } label: {
-                    chip("Audio Only", systemImage: "music.note", active: soulseek.audioOnly)
+                    chip("Audio Only", systemImage: "music.note", active: searchStore.audioOnly)
                 }
 
                 Button {
-                    soulseek.filters.freeSlotOnly.toggle()
+                    searchStore.filters.freeSlotOnly.toggle()
                 } label: {
-                    chip("Free Slot", systemImage: "checkmark.circle", active: soulseek.filters.freeSlotOnly)
+                    chip("Free Slot", systemImage: "checkmark.circle", active: searchStore.filters.freeSlotOnly)
                 }
 
                 Button {
                     showAll = true
                 } label: {
-                    chip("More", systemImage: "slider.horizontal.3", active: false)
+                    let count = searchStore.filters.activeCount
+                    chip(count > 0 ? "More (\(count))" : "More", systemImage: "slider.horizontal.3", active: count > 0)
                 }
             }
             .padding(.horizontal, 16)

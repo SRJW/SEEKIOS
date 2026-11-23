@@ -14,11 +14,30 @@ struct SettingsView: View {
     @AppStorage(AppSettings.showMissingKey) private var showMissing = true
     @AppStorage(AppSettings.musicBrainzKey) private var musicBrainz = true
     @AppStorage(AppSettings.seedingKey) private var seeding = false
+    @AppStorage(AppSettings.sharingEnabledKey) private var sharingEnabled = false
+    @AppStorage(AppSettings.shareOnWiFiOnlyKey) private var shareOnWiFiOnly = true
+    @AppStorage(AppSettings.distributedSearchKey) private var distributedSearch = true
+    @AppStorage(AppSettings.keepAudioInLibraryKey) private var keepAudioInLibrary = true
+    @AppStorage(AppSettings.downloadFolderStructureKey) private var folderStructureRaw = DownloadFolderStructure.album.rawValue
+    @AppStorage(AppSettings.maxConcurrentDownloadsKey) private var maxConcurrentDownloads = 4
+    @AppStorage(AppSettings.maxConcurrentUploadsKey) private var maxConcurrentUploads = 2
+    @AppStorage(AppSettings.maxQueuedPerPeerKey) private var maxQueuedPerPeer = 10
 
     @State private var username = ""
+    @State private var didSeedUsername = false
     @State private var password = ""
     @State private var showFolderPicker = false
     @State private var showDownloadsFolderSheet = false
+    @State private var showPeersSheet = false
+    @State private var storage: StorageBreakdown?
+    @State private var cleanupMessage: String?
+
+    private var folderStructure: Binding<DownloadFolderStructure> {
+        Binding(
+            get: { DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album },
+            set: { folderStructureRaw = $0.rawValue }
+        )
+    }
 
     private var appVersionText: String {
         let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
@@ -57,16 +76,63 @@ struct SettingsView: View {
 
                 soulseekSection
 
+                Section {
+                    LabeledContent("Listen Port") {
+                        Text(soulseek.listeningPort > 0 ? "TCP \(soulseek.listeningPort)" : "Closed")
+                            .foregroundStyle(soulseek.listeningPort > 0 ? .green : .secondary)
+                    }
+                    Stepper(value: $maxConcurrentDownloads, in: 1...16) {
+                        LabeledContent("Max Concurrent Downloads", value: "\(maxConcurrentDownloads)")
+                    }
+                    Stepper(value: $maxQueuedPerPeer, in: 1...50) {
+                        LabeledContent("Max Queued per Peer", value: "\(maxQueuedPerPeer)")
+                    }
+                    Button {
+                        showPeersSheet = true
+                    } label: {
+                        LabeledContent("Favorite & Blocked Users", value: "\(soulseek.favoriteUsers.count) / \(soulseek.blockedUsers.count)")
+                    }
+                } header: {
+                    Text("Soulseek Transfers")
+                } footer: {
+                    Text("Opening a TCP listen port lets Seekios receive indirect transfers from firewalled peers (just like Nicotine+).")
+                }
+                .onChange(of: maxConcurrentDownloads) { _, _ in soulseek.applyClientSettings() }
+                .onChange(of: maxQueuedPerPeer) { _, _ in soulseek.applyClientSettings() }
+
+                Section {
+                    Toggle("Share Music Library", isOn: $sharingEnabled)
+                    LabeledContent("Status") {
+                        Text(soulseek.sharingStatusSummary)
+                            .foregroundStyle(soulseek.isEffectivelySharing ? .green : .secondary)
+                    }
+                    if sharingEnabled {
+                        Toggle("Wi-Fi Only (Protect Cellular Data)", isOn: $shareOnWiFiOnly)
+                        Toggle("Distributed Search Network", isOn: $distributedSearch)
+                        Stepper(value: $maxConcurrentUploads, in: 1...8) {
+                            LabeledContent("Upload Slots", value: "\(maxConcurrentUploads)")
+                        }
+                        Toggle("Seeding Mode (Keep Alive)", isOn: $seeding)
+                    }
+                } header: {
+                    Text("Sharing & Privacy")
+                } footer: {
+                    Text("Off by default to protect your iPhone's battery, mobile data, and privacy. Because of iOS sandboxing, enabling this only ever exposes audio files inside Seekios's own Music folder — never Photos, iCloud, or other apps. Note: some Soulseek peers automatically block users who share 0 files.")
+                }
+                .onChange(of: sharingEnabled) { _, _ in soulseek.applyClientSettings() }
+                .onChange(of: shareOnWiFiOnly) { _, _ in soulseek.applyClientSettings() }
+                .onChange(of: maxConcurrentUploads) { _, _ in soulseek.applyClientSettings() }
+                .onChange(of: distributedSearch) { _, _ in soulseek.applyClientSettings() }
+
                 Section("Accent Colour") {
                     AccentPicker()
                 }
 
                 Section {
                     NavigationLink {
-                        EqualizerView(equalizer: player.equalizer)
+                        EqualizerView(equalizer: player.equalizer, showDone: false)
                     } label: {
-                        LabeledContent("Equalizer", value: player.bitPerfect ? "Bypassed"
-                                       : (player.equalizer.isEnabled ? player.equalizer.displayName : "Off"))
+                        EqualizerSettingsRow(equalizer: player.equalizer, bitPerfect: player.bitPerfect)
                     }
                     Toggle("Bit-Perfect Mode", isOn: $player.bitPerfect)
                     if player.bitPerfect {
@@ -75,7 +141,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Playback")
                 } footer: {
-                    Text("For USB DACs: switches the output to each song's sample rate and skips the EQ and all volume processing, so the DAC gets the file's exact samples. Turn the iPhone volume all the way up and use the DAC's volume. Bluetooth, AirPlay and the speaker can't be bit-perfect.")
+                    Text("For USB DACs: switches the output to each song's sample rate and skips the EQ and all volume processing. Bluetooth, AirPlay and the built-in speaker can't be bit-perfect.")
                 }
 
                 Section {
@@ -92,7 +158,7 @@ struct SettingsView: View {
 
                 Section {
                     HStack {
-                        Label("Download Folder", systemImage: "folder.fill")
+                        Label("Default Folder", systemImage: "folder.fill")
                         Spacer()
                         Text(soulseek.currentDownloadFolderDisplayName)
                             .font(.caption)
@@ -102,15 +168,23 @@ struct SettingsView: View {
                     Button {
                         showFolderPicker = true
                     } label: {
-                        Label("Choose Where to Save Downloads…", systemImage: "folder.badge.gearshape")
+                        Label("Choose Default Download Folder…", systemImage: "folder.badge.gearshape")
                     }
                     Button {
                         showDownloadsFolderSheet = true
                     } label: {
-                        Label("Show Downloads Folder", systemImage: "folder.badge.magnifyingglass")
+                        Label("Browse Download Folder", systemImage: "folder.badge.magnifyingglass")
+                    }
+                    Picker("Subfolder Layout", selection: folderStructure) {
+                        ForEach(DownloadFolderStructure.allCases) { option in
+                            Text(option.label).tag(option)
+                        }
                     }
                     if soulseek.customDownloadDirectory != nil {
-                        Toggle("Also Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
+                        Toggle("Save Music to Chosen Folder", isOn: $soulseek.saveAllToCustomFolder)
+                        if soulseek.saveAllToCustomFolder {
+                            Toggle("Also Keep Copy in Seekios Library", isOn: $keepAudioInLibrary)
+                        }
                         Button("Reset Download Folder to Default", role: .destructive) {
                             soulseek.resetDownloadFolderToDefault()
                         }
@@ -118,13 +192,12 @@ struct SettingsView: View {
                 } header: {
                     Text("Download Location")
                 } footer: {
-                    Text("Choose any folder in On My iPhone or iCloud Drive to automatically store downloaded files.")
+                    Text("Layout: \((DownloadFolderStructure(rawValue: folderStructureRaw) ?? .album).example). iOS grants persistent access to any writable folder you select in On My iPhone or iCloud Drive.")
                 }
 
                 Section {
                     Toggle("Keep Transfers Running in Background", isOn: $backgroundTransfers)
                     Toggle("Show Transfers in Dynamic Island", isOn: $transferActivity)
-                    Toggle("Seeding Mode", isOn: $seeding)
                     Button {
                         router.showWiFiTransfer = true
                     } label: {
@@ -142,25 +215,44 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.plain)
                 } header: {
-                    Text("Transfers")
+                    Text("Background & Transfer Tools")
                 } footer: {
-                    Text("When nothing is playing, Seekios plays silence (mixed under other audio) so iOS doesn't freeze transfers in the background, like iTorrent does. It costs some battery and stops when transfers finish. Seeding Mode keeps it running all the time so people can keep downloading from you, and reconnects if Soulseek drops.")
+                    Text("Plays silent audio when no music is playing so iOS doesn't freeze sideloaded transfers in the background. Lock Screen controls remain intact when music is paused.")
                 }
 
                 Section {
                     LabeledContent("Songs", value: "\(library.tracks.count)")
                     LabeledContent("Albums", value: "\(library.albums.count)")
+                    if let storage {
+                        LabeledContent("Music Library", value: Formatting.bytes(storage.musicBytes))
+                        if storage.downloadsBytes > 0 {
+                            LabeledContent("Other Downloads", value: Formatting.bytes(storage.downloadsBytes))
+                        }
+                        LabeledContent("Incomplete Partials", value: "\(Formatting.bytes(storage.incompleteBytes)) (\(storage.incompleteCount))")
+                        LabeledContent("Artwork Cache", value: Formatting.bytes(storage.artworkCacheBytes))
+                    }
                     Button("Rescan Library") { library.rescan() }
+                    Button("Clean Orphaned Partial Files") {
+                        Task {
+                            let removed = await soulseek.cleanOrphanedPartials()
+                            cleanupMessage = removed == 0 ? "No orphaned partial files found." : "Removed \(removed) orphaned partial file\(removed == 1 ? "" : "s")."
+                            storage = await soulseek.computeStorageBreakdown()
+                        }
+                    }
                     Button("Clear Artwork Cache") {
                         Task {
                             await ArtworkStore.shared.clearDisk()
                             library.bumpArtwork()
+                            storage = await soulseek.computeStorageBreakdown()
                         }
                     }
+                    if let cleanupMessage {
+                        Text(cleanupMessage)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 } header: {
-                    Text("Library")
-                } footer: {
-                    Text("Your music is also shared back on Soulseek while the app runs, so peers don't treat you as a leecher.")
+                    Text("Library & Storage")
                 }
 
                 Section {
@@ -174,13 +266,36 @@ struct SettingsView: View {
                 FolderDocumentPicker { pickedURL in
                     soulseek.setCustomDownloadFolder(pickedURL)
                 }
+                .ignoresSafeArea()
             }
             .sheet(isPresented: $showDownloadsFolderSheet) {
                 NavigationStack {
                     LocalFolderBrowserView(folderURL: soulseek.otherDownloadsDirectory)
                 }
             }
-            .onAppear { username = soulseek.username }
+            .sheet(isPresented: $showPeersSheet) {
+                PeersManagerSheet()
+            }
+            .alert(
+                "Folder Unavailable",
+                isPresented: Binding(
+                    get: { soulseek.downloadLocationError != nil },
+                    set: { if !$0 { soulseek.downloadLocationError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(soulseek.downloadLocationError ?? "")
+            }
+            .onAppear {
+                if !didSeedUsername {
+                    didSeedUsername = true
+                    username = soulseek.username
+                }
+            }
+            .task {
+                storage = await soulseek.computeStorageBreakdown()
+            }
         }
     }
 
@@ -192,11 +307,17 @@ struct SettingsView: View {
             } else {
                 ConnectionBanner()
             }
+            if !soulseek.isLoggedIn && soulseek.hasCredentials {
+                Button("Reconnect as \(soulseek.username)") {
+                    soulseek.reconnectIfNeeded()
+                }
+                .fontWeight(.semibold)
+            }
             TextField("Username", text: $username)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
             SecureField("Password", text: $password)
-            Button(soulseek.isLoggedIn ? "Reconnect" : "Log In") {
+            Button(soulseek.isLoggedIn ? "Switch Account / Reconnect" : "Log In") {
                 soulseek.logIn(username: username, password: password)
                 password = ""
             }
@@ -205,10 +326,22 @@ struct SettingsView: View {
                 Button("Disconnect", role: .destructive) { soulseek.logOut() }
             }
         } header: {
-            Text("Soulseek")
+            Text("Soulseek Account")
         } footer: {
             Text("Logging in with an unused username registers it. There's no password reset, so pick something you'll remember.")
         }
+    }
+}
+
+private struct EqualizerSettingsRow: View {
+    @ObservedObject var equalizer: Equalizer
+    let bitPerfect: Bool
+
+    var body: some View {
+        LabeledContent(
+            "Equalizer",
+            value: bitPerfect ? "Bypassed" : (equalizer.isEnabled ? equalizer.displayName : "Off")
+        )
     }
 }
 
@@ -240,12 +373,12 @@ struct LogView: View {
     @EnvironmentObject private var soulseek: SoulseekModel
 
     var body: some View {
-        List(Array(soulseek.logLines.indices.reversed()), id: \.self) { index in
-            Text(soulseek.logLines[index])
+        List(soulseek.logLines.reversed()) { entry in
+            Text(entry.text)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
         }
-        .navigationTitle("Log")
+        .navigationTitle("Connection Log")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

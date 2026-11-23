@@ -37,6 +37,41 @@ public enum PeerInitMessage: Equatable, Sendable {
     }
 }
 
+/// Messages exchanged over a `D` (distributed) connection or server `EmbeddedMessage` (uint8 code).
+public enum DistributedMessage: Equatable, Sendable {
+    case ping
+    case searchRequest(username: String, token: UInt32, query: String)
+    case branchLevel(UInt32)
+    case branchRoot(String)
+    case unknown(code: UInt8)
+
+    public static func decode(_ body: Data) throws -> DistributedMessage {
+        var reader = ByteReader(body)
+        let code = try reader.u8()
+        return try decodePayload(code: code, payload: reader.rest())
+    }
+
+    public static func decodePayload(code: UInt8, payload: Data) throws -> DistributedMessage {
+        var reader = ByteReader(payload)
+        switch code {
+        case 0:
+            return .ping
+        case 3:
+            _ = try reader.u32()  // Unknown, always 0
+            let username = try reader.string()
+            let token = try reader.u32()
+            let query = try reader.string()
+            return .searchRequest(username: username, token: token, query: query)
+        case 4:
+            return .branchLevel(try reader.u32())
+        case 5:
+            return .branchRoot(try reader.string())
+        default:
+            return .unknown(code: code)
+        }
+    }
+}
+
 /// Messages exchanged over a `P` connection (uint32 code).
 public enum PeerMessage: Sendable {
     case sharedFileListRequest

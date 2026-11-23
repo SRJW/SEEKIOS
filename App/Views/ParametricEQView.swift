@@ -12,6 +12,7 @@ struct ParametricEQEditor: View {
     @State private var message: String?
 
     var body: some View {
+        let curve = PEQMath.curve(equalizer.peqBands, preamp: equalizer.peqPreamp, points: 140)
         VStack(alignment: .leading, spacing: 18) {
             HStack {
                 Text("Profile")
@@ -19,10 +20,10 @@ struct ParametricEQEditor: View {
                 profileMenu
             }
 
-            PEQCurveView(bands: equalizer.peqBands, preamp: equalizer.peqPreamp, enabled: equalizer.isEnabled)
+            PEQCurveView(bands: equalizer.peqBands, preamp: equalizer.peqPreamp, points: curve, enabled: equalizer.isEnabled)
                 .frame(height: 150)
 
-            preampRow
+            preampRow(curve: curve)
 
             ForEach($equalizer.peqBands) { $band in
                 let number = (equalizer.peqBands.firstIndex { $0.id == band.id } ?? 0) + 1
@@ -80,8 +81,8 @@ struct ParametricEQEditor: View {
         }
     }
 
-    private var preampRow: some View {
-        let peak = PEQMath.curve(equalizer.peqBands, preamp: equalizer.peqPreamp).map { $0.gain }.max() ?? 0
+    private func preampRow(curve: [(frequency: Double, gain: Double)]) -> some View {
+        let peak = curve.map(\.gain).max() ?? 0
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Preamp")
@@ -89,9 +90,15 @@ struct ParametricEQEditor: View {
                 Text(String(format: "%+.1f dB", equalizer.peqPreamp))
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
-                Button("Auto") { equalizer.peqPreamp = PEQMath.safePreamp(equalizer.peqBands) }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
+                Button("Auto") {
+                    equalizer.peqPreamp = PEQMath.safePreamp(
+                        equalizer.peqBands,
+                        curvePoints: curve,
+                        currentPreamp: equalizer.peqPreamp
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
             }
             Slider(value: $equalizer.peqPreamp, in: -24...6, step: 0.1)
             if equalizer.isEnabled, peak > 0.1 {
@@ -230,6 +237,7 @@ struct PEQBandCard: View {
 struct PEQCurveView: View {
     let bands: [PEQBand]
     let preamp: Float
+    let points: [(frequency: Double, gain: Double)]
     let enabled: Bool
 
     private let range: Double = 15
@@ -237,7 +245,6 @@ struct PEQCurveView: View {
     var body: some View {
         GeometryReader { geometry in
             let size = geometry.size
-            let points = PEQMath.curve(bands, preamp: preamp, points: 120)
             let x = { (frequency: Double) -> CGFloat in
                 CGFloat(log10(frequency / 20) / 3) * size.width
             }
@@ -309,8 +316,7 @@ struct AutoEqSearchSheet: View {
         let words = query.lowercased().split(separator: " ")
         guard !words.isEmpty else { return Array(entries.prefix(80)) }
         return Array(entries.lazy.filter { entry in
-            let name = entry.name.lowercased()
-            return words.allSatisfy { name.contains($0) }
+            words.allSatisfy { entry.lowercasedName.contains($0) }
         }.prefix(200))
     }
 
@@ -371,6 +377,7 @@ struct AutoEqSearchSheet: View {
     }
 
     private func load(_ entry: AutoEqIndex.Entry) {
+        error = nil
         fetching = entry.id
         Task {
             do {

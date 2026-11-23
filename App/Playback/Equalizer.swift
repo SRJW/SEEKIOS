@@ -39,32 +39,36 @@ final class Equalizer: ObservableObject {
     ]
 
     @Published var isEnabled: Bool {
-        didSet { changed() }
+        didSet { if !isBatching { changed() } }
     }
     @Published var gains: [Float] {
         didSet {
-            if !isApplyingPreset { presetName = matchingPresetName() }
-            changed()
+            if !isBatching {
+                presetName = matchingPresetName()
+                changed()
+            }
         }
     }
     /// dB applied before the bands. Presets set it to leave headroom for boosts, which would clip otherwise.
     @Published var preamp: Float {
-        didSet { changed() }
+        didSet { if !isBatching { changed() } }
     }
     @Published private(set) var presetName: String
     @Published private(set) var customPresets: [EQPreset]
 
     @Published var mode: Mode {
-        didSet { changed() }
+        didSet { if !isBatching { changed() } }
     }
     @Published var peqBands: [PEQBand] {
         didSet {
-            if !isApplyingPreset { peqName = "Custom" }
-            changed()
+            if !isBatching {
+                peqName = "Custom"
+                changed()
+            }
         }
     }
     @Published var peqPreamp: Float {
-        didSet { changed() }
+        didSet { if !isBatching { changed() } }
     }
     @Published private(set) var peqName: String
     @Published private(set) var peqProfiles: [PEQProfile]
@@ -75,18 +79,20 @@ final class Equalizer: ObservableObject {
     /// Called whenever the sound should change.
     var onChange: (() -> Void)?
 
-    private var isApplyingPreset = false
+    private var isBatching = false
+    private var persistTask: Task<Void, Never>?
     private let defaults = UserDefaults.standard
 
     init() {
         let defaults = UserDefaults.standard
         isEnabled = defaults.object(forKey: "eq.enabled") as? Bool ?? false
         let stored = defaults.array(forKey: "eq.gains") as? [Float]
-        gains = stored?.count == Self.frequencies.count ? stored! : Array(repeating: 0, count: Self.frequencies.count)
+        gains = Self.normalizedGains(stored ?? [])
         preamp = defaults.object(forKey: "eq.preamp") as? Float ?? 0
         presetName = defaults.string(forKey: "eq.preset") ?? "Flat"
-        if let data = defaults.data(forKey: "eq.custom"), let decoded = try? JSONDecoder().decode([EQPreset].self, from: data) {
-            customPresets = decoded
+        if let data = defaults.data(forKey: "eq.custom"),
+           let decoded = try? JSONDecoder().decode([EQPreset].self, from: data) {
+            customPresets = decoded.map { EQPreset(name: $0.name, gains: Self.normalizedGains($0.gains)) }
         } else {
             customPresets = []
         }
@@ -97,17 +103,24 @@ final class Equalizer: ObservableObject {
         peqProfiles = defaults.data(forKey: "eq.peqProfiles").flatMap { try? JSONDecoder().decode([PEQProfile].self, from: $0) } ?? []
     }
 
+    private static func normalizedGains(_ raw: [Float]) -> [Float] {
+        let target = Self.frequencies.count
+        if raw.count == target { return raw }
+        if raw.count > target { return Array(raw.prefix(target)) }
+        return raw + Array(repeating: 0, count: target - raw.count)
+    }
+
     // MARK: Parametric
 
     func applyPEQ(_ profile: PEQProfile) {
-        isApplyingPreset = true
+        isBatching = true
         peqBands = Array(profile.bands.prefix(Self.maxBands))
-        isApplyingPreset = false
         peqPreamp = profile.preamp
         peqName = profile.name
         mode = .parametric
         if !isEnabled { isEnabled = true }
-        changed()
+        isBatching = false
+        changed(immediatePersist: true)
     }
 
     func savePEQ(as name: String) {
@@ -121,56 +134,71 @@ final class Equalizer: ObservableObject {
 
     func deletePEQ(_ profile: PEQProfile) {
         peqProfiles.removeAll { $0.id == profile.id }
+        if peqName == profile.name { peqName = "Custom" }
         persist()
     }
 
     func addPEQBand() {
         guard peqBands.count < Self.maxBands else { return }
-        // Drop the new band into the widest gap so it doesn't sit on top of another.
-        let used = peqBands.map(\.frequency).sorted()
-        let edges = [Float(20)] + used + [20_000]
-        var best: (Float, Float) = (20, 20_000)
-        for index in 1..<edges.count where log(edges[index] / edges[index - 1]) > log(best.1 / best.0) {
-            best = (edges[index - 1], edges[index])
+        // Drop the new band into the widest log-frequency gap between 20 Hz and 20 kHz.
+        let used = peqBands.map { min(max($0.frequency, 20), 20_000) }.sorted()
+        let edges = [Float(20)] + used + [Float(20_000)]
+        var best: (Float, Float) = (edges[0], edges[1])
+        var bestRatio = edges[1] / max(edges[0], 1)
+        if edges.count > 2 {
+            for index in 2..<edges.count {
+                let low = edges[index - 1]
+                let high = edges[index]
+                let ratio = high / max(low, 1)
+                if ratio > bestRatio {
+                    bestRatio = ratio
+                    best = (low, high)
+                }
+            }
         }
         let frequency = (sqrt(best.0 * best.1)).roundedTo(1)
         peqBands.append(PEQBand(frequency: frequency))
     }
 
     func resetPEQ() {
-        isApplyingPreset = true
+        isBatching = true
         peqBands = []
-        isApplyingPreset = false
         peqPreamp = 0
         peqName = "Custom"
-        changed()
+        isBatching = false
+        changed(immediatePersist: true)
     }
 
     var allPresets: [EQPreset] { Self.builtIn + customPresets }
 
     func apply(_ preset: EQPreset) {
-        isApplyingPreset = true
-        gains = preset.gains
-        isApplyingPreset = false
+        let normalized = Self.normalizedGains(preset.gains)
+        isBatching = true
+        gains = normalized
         presetName = preset.name
         if mode != .graphic { mode = .graphic }
-        let boost = max(preset.gains.max() ?? 0, 0)
+        let boost = max(normalized.max() ?? 0, 0)
         preamp = -(boost / 2).rounded()
         if !isEnabled, preset.name != "Flat" { isEnabled = true }
-        changed()
+        isBatching = false
+        changed(immediatePersist: true)
     }
 
     func reset() {
         apply(Self.builtIn[0])
     }
 
-    func saveCurrent(as name: String) {
+    @discardableResult
+    func saveCurrent(as name: String) -> Bool {
         let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard !trimmed.isEmpty, !Self.builtIn.contains(where: { $0.name == trimmed }) else { return }
+        guard !trimmed.isEmpty, !Self.builtIn.contains(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) else {
+            return false
+        }
         customPresets.removeAll { $0.name == trimmed }
-        customPresets.append(EQPreset(name: trimmed, gains: gains))
+        customPresets.append(EQPreset(name: trimmed, gains: Self.normalizedGains(gains)))
         presetName = trimmed
         persist()
+        return true
     }
 
     func deletePreset(_ preset: EQPreset) {
@@ -185,7 +213,7 @@ final class Equalizer: ObservableObject {
         case .graphic:
             unit.globalGain = isEnabled ? preamp : 0
             for (index, band) in unit.bands.enumerated() {
-                guard index < Self.frequencies.count else {
+                guard index < Self.frequencies.count, index < gains.count else {
                     band.bypass = true
                     continue
                 }
@@ -216,9 +244,29 @@ final class Equalizer: ObservableObject {
         allPresets.first(where: { $0.gains == gains })?.name ?? "Custom"
     }
 
-    private func changed() {
-        persist()
+    private func changed(immediatePersist: Bool = false) {
         onChange?()
+        if immediatePersist {
+            persistTask?.cancel()
+            persistTask = nil
+            persist()
+        } else {
+            schedulePersist()
+        }
+    }
+
+    private func schedulePersist() {
+        persistTask?.cancel()
+        persistTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 300_000_000)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.persistTask = nil
+            self.persist()
+        }
     }
 
     private func persist() {
@@ -230,10 +278,14 @@ final class Equalizer: ObservableObject {
             defaults.set(data, forKey: "eq.custom")
         }
         defaults.set(mode.rawValue, forKey: "eq.mode")
-        defaults.set(try? JSONEncoder().encode(peqBands), forKey: "eq.peq")
+        if let data = try? JSONEncoder().encode(peqBands) {
+            defaults.set(data, forKey: "eq.peq")
+        }
         defaults.set(peqPreamp, forKey: "eq.peqPreamp")
         defaults.set(peqName, forKey: "eq.peqName")
-        defaults.set(try? JSONEncoder().encode(peqProfiles), forKey: "eq.peqProfiles")
+        if let data = try? JSONEncoder().encode(peqProfiles) {
+            defaults.set(data, forKey: "eq.peqProfiles")
+        }
     }
 
     nonisolated static func label(for frequency: Float) -> String {
