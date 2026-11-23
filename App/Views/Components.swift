@@ -12,7 +12,11 @@ struct ArtworkView: View {
     @State private var image: UIImage?
     @State private var loadedKey: String?
 
-    private var taskID: String { "\(source?.key ?? "none")#\(library.artworkRevision)" }
+    private var taskID: String {
+        guard let source else { return "none" }
+        if case .remote = source { return source.key }
+        return "\(source.key)#\(library.artworkRevision)"
+    }
 
     var body: some View {
         Color.clear
@@ -36,6 +40,7 @@ struct ArtworkView: View {
             .task(id: taskID) {
                 guard let source else {
                     image = nil
+                    loadedKey = nil
                     return
                 }
                 if loadedKey != source.key { image = nil }
@@ -66,10 +71,11 @@ struct ArtworkPlaceholder: View {
 
 /// Contacts-style A–Z scrubber. Drag or tap to jump between sections.
 struct SectionIndexBar: View {
-    let available: [String]
+    let available: Set<String>
     let onSelect: (String) -> Void
 
     @State private var current: String?
+    @State private var selectionTick = 0
     private let rowHeight: CGFloat = 14
 
     var body: some View {
@@ -88,7 +94,7 @@ struct SectionIndexBar: View {
                 .onChanged { value in select(at: value.location.y) }
                 .onEnded { _ in current = nil }
         )
-        .sensoryFeedback(.selection, trigger: current)
+        .sensoryFeedback(.selection, trigger: selectionTick)
         .accessibilityHidden(true)
     }
 
@@ -100,6 +106,7 @@ struct SectionIndexBar: View {
             ?? letters[..<index].last(where: { available.contains($0) })
         guard let target, target != current else { return }
         current = target
+        selectionTick += 1
         onSelect(target)
     }
 }
@@ -285,8 +292,12 @@ struct DeleteConfirmation: ViewModifier {
         ) {
             Button("Delete", role: .destructive) {
                 guard let tracks = pending else { return }
+                let doomedIDs = Set(tracks.map(\.id))
+                let remainingAlbumIDs = Set(library.albums.compactMap { album in
+                    album.tracks.contains(where: { !doomedIDs.contains($0.id) }) ? album.id : nil
+                })
                 player.remove(tracks)
-                favorites.forget(tracks)
+                favorites.forget(tracks, keepingAlbumIDs: remainingAlbumIDs)
                 playlists.forget(tracks)
                 library.delete(tracks)
                 pending = nil

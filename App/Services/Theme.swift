@@ -38,8 +38,17 @@ extension Color {
     }
 
     var hexString: String {
+        let uiColor = UIColor(self)
+        if let srgb = CGColorSpace(name: CGColorSpace.sRGB),
+           let converted = uiColor.cgColor.converted(to: srgb, intent: .defaultIntent, options: nil),
+           let components = converted.components, components.count >= 3 {
+            func byte(_ component: CGFloat) -> Int { Int((min(max(component, 0), 1) * 255).rounded()) }
+            return String(format: "#%02X%02X%02X", byte(components[0]), byte(components[1]), byte(components[2]))
+        }
         var red: CGFloat = 0, green: CGFloat = 0, blue: CGFloat = 0, alpha: CGFloat = 0
-        _ = UIColor(self).getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        guard uiColor.getRed(&red, green: &green, blue: &blue, alpha: &alpha) else {
+            return AccentPalette.defaultHex
+        }
         func byte(_ component: CGFloat) -> Int { Int((min(max(component, 0), 1) * 255).rounded()) }
         return String(format: "#%02X%02X%02X", byte(red), byte(green), byte(blue))
     }

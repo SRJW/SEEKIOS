@@ -1,31 +1,38 @@
 import AVFoundation
 import Foundation
 
-/// Keeps the app alive in the background while transfers run and no music is playing, by playing
-/// silence that mixes with other apps' audio — the same trick iTorrent uses. Without it iOS
-/// suspends the app a few seconds after you leave it and Soulseek transfers freeze.
-/// App Store review would reject this; it's fine for a sideloaded app. Costs some battery.
+/// Keeps the sideloaded app alive in the background while Soulseek transfers or Seeding Mode run
+/// and no music is playing, by looping an in-memory silent WAV. Session category/activation is owned
+/// by `AudioSessionCoordinator` so Lock Screen controls stay intact.
 @MainActor
 final class BackgroundKeeper {
     private var silence: AVAudioPlayer?
     private(set) var isRunning = false
 
-    func start() {
-        guard !isRunning else { return }
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-        try? session.setActive(true)
+    var isActivelyPlaying: Bool {
+        silence?.isPlaying ?? false
+    }
+
+    func start(forceRestart: Bool = false) {
+        if isRunning && !forceRestart && isActivelyPlaying { return }
         if silence == nil {
             silence = try? AVAudioPlayer(data: Self.silentWAV())
             silence?.numberOfLoops = -1
             silence?.volume = 0
+            silence?.prepareToPlay()
         }
         isRunning = silence?.play() ?? false
     }
 
     func stop() {
-        guard isRunning else { return }
+        guard isRunning || isActivelyPlaying else { return }
         silence?.stop()
+        isRunning = false
+    }
+
+    func resetAfterMediaServicesReset() {
+        silence?.stop()
+        silence = nil
         isRunning = false
     }
 

@@ -73,7 +73,7 @@ enum PEQMath {
         let q = Double(max(band.q, 0.05))
         let alpha = sinW0 / (2 * q)
         let a = pow(10, Double(band.gain) / 40)
-        let shelfAlpha = sinW0 / 2 * sqrt(2)  // iOS shelves have a fixed slope (Q ≈ 0.707)
+        let shelfAlpha = sinW0 / 2 * sqrt(2)
         let root = 2 * sqrt(a) * shelfAlpha
 
         let b0, b1, b2, a0, a1, a2: Double
@@ -116,16 +116,22 @@ enum PEQMath {
 
     /// Total response (bands + preamp) at log-spaced points from 20 Hz to 20 kHz.
     static func curve(_ bands: [PEQBand], preamp: Float, points: Int = 160) -> [(frequency: Double, gain: Double)] {
-        (0..<points).map { index in
-            let frequency = 20 * pow(1000, Double(index) / Double(points - 1))
+        let count = max(points, 2)
+        return (0..<count).map { index in
+            let frequency = 20 * pow(1000, Double(index) / Double(count - 1))
             let gain = bands.reduce(Double(preamp)) { $0 + response(of: $1, at: frequency) }
             return (frequency, gain)
         }
     }
 
     /// The preamp that keeps the loudest boost at 0 dB, so nothing clips.
-    static func safePreamp(_ bands: [PEQBand]) -> Float {
-        let peak = curve(bands, preamp: 0).map { $0.gain }.max() ?? 0
+    static func safePreamp(_ bands: [PEQBand], curvePoints: [(frequency: Double, gain: Double)]? = nil, currentPreamp: Float = 0) -> Float {
+        let peak: Double
+        if let curvePoints {
+            peak = (curvePoints.map(\.gain).max() ?? 0) - Double(currentPreamp)
+        } else {
+            peak = curve(bands, preamp: 0).map(\.gain).max() ?? 0
+        }
         return Float(-max(peak, 0)).roundedTo(0.1)
     }
 }
@@ -134,13 +140,19 @@ enum PEQMath {
 ///     Preamp: -6.3 dB
 ///     Filter 1: ON LSC Fc 105 Hz Gain 6.5 dB Q 0.70
 enum PEQText {
+    private static let posix = Locale(identifier: "en_US_POSIX")
+    private static let filterRegex = try! NSRegularExpression(
+        pattern: #"Filter\s*\d*\s*:\s*(ON|OFF)\s+([A-Za-z]+)(?:\s+\d+\s*dB)?\s+Fc\s+([\d.]+)\s*Hz(?:\s+Gain\s+([-+\d.]+)\s*dB)?(?:\s+Q\s+([\d.]+))?"#,
+        options: [.caseInsensitive]
+    )
+    private static let preampRegex = try! NSRegularExpression(
+        pattern: #"Preamp\s*:\s*([-+\d.]+)\s*dB"#,
+        options: [.caseInsensitive]
+    )
+
     static func parse(_ text: String, name: String) -> PEQProfile? {
         var preamp: Float = 0
         var bands: [PEQBand] = []
-        let filterRegex = try! NSRegularExpression(
-            pattern: #"Filter\s*\d*\s*:\s*(ON|OFF)\s+([A-Za-z]+)(?:\s+\d+\s*dB)?\s+Fc\s+([\d.]+)\s*Hz(?:\s+Gain\s+([-+\d.]+)\s*dB)?(?:\s+Q\s+([\d.]+))?"#,
-            options: [.caseInsensitive])
-        let preampRegex = try! NSRegularExpression(pattern: #"Preamp\s*:\s*([-+\d.]+)\s*dB"#, options: [.caseInsensitive])
 
         for line in text.components(separatedBy: .newlines) {
             let range = NSRange(line.startIndex..., in: line)
@@ -176,11 +188,26 @@ enum PEQText {
     }
 
     static func export(_ bands: [PEQBand], preamp: Float) -> String {
-        var lines = [String(format: "Preamp: %.1f dB", preamp)]
+        var lines = [String(format: "Preamp: %.1f dB", locale: posix, preamp)]
         for (index, band) in bands.enumerated() {
-            lines.append(String(format: "Filter %d: %@ %@ Fc %.0f Hz Gain %.1f dB Q %.2f",
-                                index + 1, band.isOn ? "ON" : "OFF", band.filter.short,
-                                band.frequency, band.gain, band.q))
+            let freqStr = band.frequency == band.frequency.rounded()
+                ? String(format: "%.0f", locale: posix, band.frequency)
+                : String(format: "%.1f", locale: posix, band.frequency)
+            if band.filter.usesGain {
+                lines.append(String(
+                    format: "Filter %d: %@ %@ Fc %@ Hz Gain %.1f dB Q %.2f",
+                    locale: posix,
+                    index + 1, band.isOn ? "ON" : "OFF", band.filter.short,
+                    freqStr, band.gain, band.q
+                ))
+            } else {
+                lines.append(String(
+                    format: "Filter %d: %@ %@ Fc %@ Hz Q %.2f",
+                    locale: posix,
+                    index + 1, band.isOn ? "ON" : "OFF", band.filter.short,
+                    freqStr, band.q
+                ))
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -192,42 +219,66 @@ actor AutoEqIndex {
 
     struct Entry: Identifiable, Hashable, Sendable {
         let name: String
+        let lowercasedName: String
         /// Path under results/, still percent-encoded as in the index.
         let path: String
         let source: String
         var id: String { path }
+
+        init(name: String, path: String, source: String) {
+            self.name = name
+            self.lowercasedName = name.lowercased()
+            self.path = path
+            self.source = source
+        }
     }
 
     private static let base = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results/"
+    private static let indexRegex = try! NSRegularExpression(pattern: #"^-\s*\[(.+?)\]\(\./([^\)]+)\)\s*(?:by\s+(.*))?$"#)
     private var cached: [Entry]?
+    private var inFlightTask: Task<[Entry], Error>?
     private let cacheFile = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("autoeq-index.md")
 
     func entries() async throws -> [Entry] {
-        if let cached { return cached }
-        var text: String?
-        if let attributes = try? FileManager.default.attributesOfItem(atPath: cacheFile.path),
-           let date = attributes[.modificationDate] as? Date, Date().timeIntervalSince(date) < 7 * 86_400 {
-            text = try? String(contentsOf: cacheFile, encoding: .utf8)
+        if let cached, !cached.isEmpty { return cached }
+        if let inFlightTask { return try await inFlightTask.value }
+
+        let task = Task<[Entry], Error> {
+            var text: String?
+            if let attributes = try? FileManager.default.attributesOfItem(atPath: self.cacheFile.path),
+               let date = attributes[.modificationDate] as? Date, Date().timeIntervalSince(date) < 7 * 86_400 {
+                text = try? String(contentsOf: self.cacheFile, encoding: .utf8)
+            }
+            if text == nil || text?.isEmpty == true {
+                guard let url = URL(string: Self.base + "INDEX.md") else { throw URLError(.badURL) }
+                let (data, response) = try await URLSession.shared.data(from: url)
+                guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+                try? data.write(to: self.cacheFile, options: .atomic)
+                text = String(decoding: data, as: UTF8.self)
+            }
+            let parsed = Self.parseIndex(text ?? "")
+            guard !parsed.isEmpty else { throw URLError(.cannotParseResponse) }
+            return parsed
         }
-        if text == nil {
-            let (data, response) = try await URLSession.shared.data(from: URL(string: Self.base + "INDEX.md")!)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            try? data.write(to: cacheFile, options: .atomic)
-            text = String(decoding: data, as: UTF8.self)
+        inFlightTask = task
+        do {
+            let parsed = try await task.value
+            cached = parsed
+            inFlightTask = nil
+            return parsed
+        } catch {
+            inFlightTask = nil
+            throw error
         }
-        let parsed = Self.parseIndex(text ?? "")
-        cached = parsed
-        return parsed
     }
 
     /// Lines look like: - [Sennheiser HD 600](./oratory1990/over-ear/Sennheiser%20HD%20600) by oratory1990
     static func parseIndex(_ text: String) -> [Entry] {
-        let regex = try! NSRegularExpression(pattern: #"^-\s*\[(.+)\]\(\./(.+)\)\s*(?:by\s+(.*))?$"#)
         var result: [Entry] = []
         for line in text.components(separatedBy: .newlines) {
             let range = NSRange(line.startIndex..., in: line)
-            guard let match = regex.firstMatch(in: line, range: range),
+            guard let match = indexRegex.firstMatch(in: line, range: range),
                   let name = Range(match.range(at: 1), in: line).map({ String(line[$0]) }),
                   let path = Range(match.range(at: 2), in: line).map({ String(line[$0]) }) else { continue }
             let source = Range(match.range(at: 3), in: line).map { String(line[$0]) } ?? ""
@@ -237,7 +288,6 @@ actor AutoEqIndex {
     }
 
     func profile(for entry: Entry) async throws -> PEQProfile {
-        // The file is named after the folder: "<folder> ParametricEQ.txt".
         let folder = entry.path.split(separator: "/").last.map(String.init) ?? ""
         let fileName = (folder.removingPercentEncoding ?? folder) + " ParametricEQ.txt"
         guard let encoded = fileName.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),

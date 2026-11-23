@@ -47,6 +47,10 @@ jobs:
           if [ -n "$latest" ]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
           xcodebuild -version
 
+      - name: Run SoulseekKit tests
+        working-directory: Packages/SoulseekKit
+        run: swift test
+
       - name: Install XcodeGen
         run: brew install xcodegen
 

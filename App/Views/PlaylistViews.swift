@@ -206,36 +206,58 @@ struct PlaylistDetailView: View {
         }
     }
 
+    private struct IndexedTrack: Identifiable {
+        let id: String
+        let offset: Int
+        let track: Track
+    }
+
+    private func indexed(_ tracks: [Track]) -> [IndexedTrack] {
+        var counts: [String: Int] = [:]
+        return tracks.enumerated().map { offset, track in
+            let occurrence = counts[track.id, default: 0]
+            counts[track.id] = occurrence + 1
+            return IndexedTrack(id: "\(track.id)#\(occurrence)", offset: offset, track: track)
+        }
+    }
+
     var body: some View {
         let tracks = self.tracks
+        let rows = indexed(tracks)
         List {
             header(tracks)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 8, leading: 20, bottom: 12, trailing: 20))
 
-            ForEach(Array(tracks.enumerated()), id: \.offset) { offset, track in
-                Button {
-                    player.play(tracks, startAt: offset)
-                } label: {
-                    HStack(spacing: 10) {
-                        if case .mostPlayed = route {
-                            Text("\(offset + 1)")
-                                .font(.subheadline.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                                .frame(minWidth: 22, alignment: .trailing)
+            if rows.isEmpty {
+                EmptyStateView(title: "No Songs",
+                               message: emptyMessage,
+                               systemImage: "music.note.list")
+                    .padding(.vertical, 24)
+                    .listRowSeparator(.hidden)
+            } else {
+                ForEach(rows) { row in
+                    Button {
+                        player.play(tracks, startAt: row.offset)
+                    } label: {
+                        HStack(spacing: 10) {
+                            if case .mostPlayed = route {
+                                Text("\(row.offset + 1)")
+                                    .font(.subheadline.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .frame(minWidth: 22, alignment: .trailing)
+                            }
+                            TrackRow(track: row.track, subtitle: subtitle(for: row.track))
                         }
-                        TrackRow(track: track, subtitle: subtitle(for: track))
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu {
+                        TrackMenuItems(tracks: [row.track]) { pendingDelete = $0 }
                     }
                 }
-                .buttonStyle(.plain)
-                .contextMenu {
-                    TrackMenuItems(tracks: [track]) { pendingDelete = $0 }
-                }
-            }
-            .onMove(perform: moveAction)
-            .onDelete(perform: deleteAction)
+                .onMove(perform: moveAction)
+                .onDelete(perform: deleteAction)
 
-            if !tracks.isEmpty {
                 Text("\(tracks.count) song\(tracks.count == 1 ? "" : "s"), \(Formatting.longDuration(tracks.reduce(0) { $0 + $1.duration }))")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
@@ -244,14 +266,6 @@ struct PlaylistDetailView: View {
         }
         .listStyle(.plain)
         .navigationBarTitleDisplayMode(.inline)
-        .overlay {
-            if tracks.isEmpty {
-                EmptyStateView(title: "No Songs",
-                               message: emptyMessage,
-                               systemImage: "music.note.list")
-                    .padding(.top, 200)
-            }
-        }
         .toolbar {
             if let playlist {
                 ToolbarItemGroup(placement: .topBarTrailing) {
@@ -383,6 +397,7 @@ struct AddToPlaylistSheet: View {
                     Label("New Playlist…", systemImage: "plus")
                 }
                 ForEach(playlists.playlists) { playlist in
+                    let idSet = Set(playlist.trackIDs)
                     Button {
                         playlists.add(request.tracks, to: playlist)
                         dismiss()
@@ -391,10 +406,12 @@ struct AddToPlaylistSheet: View {
                             PlaylistArtwork(tracks: playlists.tracks(of: playlist, in: library), size: 48)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(playlist.name).foregroundStyle(.primary)
-                                Text("\(playlist.trackIDs.count) songs").font(.caption).foregroundStyle(.secondary)
+                                Text("\(playlist.trackIDs.count) song\(playlist.trackIDs.count == 1 ? "" : "s")")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                             Spacer()
-                            if request.tracks.allSatisfy({ playlist.trackIDs.contains($0.id) }) {
+                            if request.tracks.allSatisfy({ idSet.contains($0.id) }) {
                                 Image(systemName: "checkmark").foregroundStyle(.secondary)
                             }
                         }
@@ -427,24 +444,36 @@ struct SongPickerSheet: View {
     @EnvironmentObject private var library: LibraryStore
     @Environment(\.dismiss) private var dismiss
     @State private var query = ""
-    @State private var chosen: [String] = []
+    @State private var chosenOrder: [String] = []
+    @State private var chosenSet = Set<String>()
+    @State private var sortedTracks: [Track] = []
+
+    private var livePlaylist: Playlist {
+        playlists.playlist(id: playlist.id) ?? playlist
+    }
 
     private var results: [Track] {
-        let sorted = library.tracks.sorted { SortKey.less($0.title, $1.title) }
-        guard !query.isEmpty else { return sorted }
-        return sorted.filter {
+        guard !query.isEmpty else { return sortedTracks }
+        return sortedTracks.filter {
             $0.title.localizedCaseInsensitiveContains(query) || $0.artist.localizedCaseInsensitiveContains(query)
                 || ($0.album ?? "").localizedCaseInsensitiveContains(query)
         }
     }
 
     var body: some View {
+        let currentPlaylist = livePlaylist
+        let alreadySet = Set(currentPlaylist.trackIDs)
         NavigationStack {
             List(results) { track in
-                let picked = chosen.contains(track.id)
-                let already = playlist.trackIDs.contains(track.id)
+                let picked = chosenSet.contains(track.id)
+                let already = alreadySet.contains(track.id)
                 Button {
-                    if let index = chosen.firstIndex(of: track.id) { chosen.remove(at: index) } else { chosen.append(track.id) }
+                    if chosenSet.remove(track.id) != nil {
+                        chosenOrder.removeAll { $0 == track.id }
+                    } else {
+                        chosenSet.insert(track.id)
+                        chosenOrder.append(track.id)
+                    }
                 } label: {
                     TrackRow(track: track, subtitle: track.artist, isSelected: picked || already)
                 }
@@ -458,12 +487,18 @@ struct SongPickerSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(chosen.isEmpty ? "Add" : "Add \(chosen.count)") {
-                        playlists.add(chosen.compactMap { library.track(id: $0) }, to: playlist)
+                    Button(chosenOrder.isEmpty ? "Add" : "Add \(chosenOrder.count)") {
+                        playlists.add(chosenOrder.compactMap { library.track(id: $0) }, to: currentPlaylist)
                         dismiss()
                     }
-                    .disabled(chosen.isEmpty)
+                    .disabled(chosenOrder.isEmpty)
                 }
+            }
+            .onAppear {
+                sortedTracks = library.tracks.sorted { SortKey.less($0.title, $1.title) }
+            }
+            .onChange(of: library.tracks) { _, newTracks in
+                sortedTracks = newTracks.sorted { SortKey.less($0.title, $1.title) }
             }
         }
     }

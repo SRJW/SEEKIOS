@@ -35,6 +35,13 @@ final class AlbumCompletenessStore: ObservableObject {
     @Published private(set) var loading: Set<String> = []
 
     private let listings = FolderListingStore()
+    private static let titleRegexes: [NSRegularExpression] = [
+        #"\([^)]*\)"#,
+        #"\[[^\]]*\]"#,
+        #"\b(feat|ft|featuring)\.?\s.*$"#,
+        #"\s-\s.*(remaster|version|edit|mix).*$"#,
+    ].compactMap { try? NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
+    private static let duplicateSuffixRegex = try! NSRegularExpression(pattern: #" \(\d+\)(?=\.[^.]+$)"#)
 
     init() {
         hiddenAlbums = Set(UserDefaults.standard.stringArray(forKey: "missing.hiddenAlbums") ?? [])
@@ -52,7 +59,12 @@ final class AlbumCompletenessStore: ObservableObject {
 
     /// Remember a peer's full folder listing when downloading from it.
     func recordListing(username: String, remoteFolder: String, files: [SharedFile]) {
-        let audio = files.filter { LibraryStore.audioExtensions.contains($0.fileExtension) && $0.folder == remoteFolder }
+        let prefix = remoteFolder.lowercased() + "\\"
+        let audio = files.filter { file in
+            guard LibraryStore.audioExtensions.contains(file.fileExtension) else { return false }
+            let f = file.folder.lowercased()
+            return f == remoteFolder.lowercased() || f.hasPrefix(prefix)
+        }
         guard !audio.isEmpty else { return }
         let local = SoulseekClient.libraryFolderName(forRemoteFolder: SharedFile(path: remoteFolder + "\\x", size: 0).folderName)
         listings.save(FolderListing(username: username, remoteFolder: remoteFolder, files: audio), forLocalFolder: local)
@@ -75,51 +87,104 @@ final class AlbumCompletenessStore: ObservableObject {
             loading.remove(album.id)
             return
         }
-        let mbid = album.tracks.compactMap(\.musicBrainzAlbumID).first
+        let mbid = album.tracks.compactMap(\.musicBrainzAlbumID).first(where: { UUID(uuidString: $0) != nil })
         let title = album.title, artist = album.artist, count = album.tracks.count
-        Task {
-            let tracklist = await MusicBrainz.shared.tracklist(albumID: album.id, releaseID: mbid,
-                                                               title: title, artist: artist, localCount: count, force: force)
+        let albumSnapshot = album
+        Task { [weak self] in
+            let tracklist = await MusicBrainz.shared.tracklist(
+                albumID: albumSnapshot.id,
+                releaseID: mbid,
+                title: title,
+                artist: artist,
+                localCount: count,
+                force: force
+            )
+            guard let self else { return }
             if let tracklist {
-                self.results[album.id] = Self.compare(album, expected: tracklist.tracks, source: "MusicBrainz: \(tracklist.title)")
+                self.results[albumSnapshot.id] = Self.compare(
+                    albumSnapshot,
+                    expected: tracklist.tracks,
+                    source: "MusicBrainz: \(tracklist.title)"
+                )
+            } else {
+                self.results[albumSnapshot.id] = AlbumCompleteness(
+                    missing: [],
+                    expectedCount: albumSnapshot.tracks.count,
+                    sourceDescription: "",
+                    localCount: albumSnapshot.tracks.count
+                )
             }
-            self.loading.remove(album.id)
+            self.loading.remove(albumSnapshot.id)
         }
     }
 
     private static func compare(_ album: Album, expected: [ExpectedTrack], source: String) -> AlbumCompleteness {
-        let localFiles = Set(album.tracks.map { normalizeFilename($0.url.lastPathComponent) })
-        let localTitles = album.tracks.map { normalizeTitle($0.title) }.filter { !$0.isEmpty }
-        let localNumbers = Set(album.tracks.compactMap { track in track.trackNumber.map { "\(track.discNumber ?? 1)-\($0)" } })
+        var remainingLocals = album.tracks.map { track in
+            (
+                filename: normalizeFilename(track.url.lastPathComponent),
+                title: normalizeTitle(track.title),
+                discTrack: track.trackNumber.map { "\(track.discNumber ?? 1)-\($0)" }
+            )
+        }
 
         var missing: [MissingTrack] = []
-        for entry in expected {
-            if let filename = entry.filename, localFiles.contains(normalizeFilename(filename)) { continue }
+        for (offset, entry) in expected.enumerated() {
+            // 1-to-1 matching prevents one local track from hiding two similar expected tracks.
+            if let filename = entry.filename {
+                let normFile = normalizeFilename(filename)
+                if let idx = remainingLocals.firstIndex(where: { $0.filename == normFile }) {
+                    remainingLocals.remove(at: idx)
+                    continue
+                }
+            }
             let title = normalizeTitle(entry.title)
-            if !title.isEmpty, localTitles.contains(where: { local in
-                local == title || (min(local.count, title.count) >= 5 && (local.hasPrefix(title) || title.hasPrefix(local)))
-            }) { continue }
-            // Same disc/track number and no title to go on: assume it's there.
-            if title.isEmpty, let number = entry.number, localNumbers.contains("\(entry.disc)-\(number)") { continue }
-            missing.append(MissingTrack(id: "\(entry.disc)-\(entry.number ?? 0)-\(entry.title)", disc: entry.disc,
-                                        number: entry.number, title: entry.title, duration: entry.duration,
-                                        source: entry.source))
+            if !title.isEmpty {
+                if let idx = remainingLocals.firstIndex(where: { local in
+                    guard !local.title.isEmpty else { return false }
+                    if local.title == title { return true }
+                    return min(local.title.count, title.count) >= 6
+                        && (local.title.hasPrefix(title) || title.hasPrefix(local.title))
+                }) {
+                    remainingLocals.remove(at: idx)
+                    continue
+                }
+            } else if let number = entry.number {
+                let key = "\(entry.disc)-\(number)"
+                if let idx = remainingLocals.firstIndex(where: { $0.discTrack == key }) {
+                    remainingLocals.remove(at: idx)
+                    continue
+                }
+            }
+            missing.append(MissingTrack(
+                id: "\(offset)-\(entry.disc)-\(entry.number ?? 0)-\(entry.title)",
+                disc: entry.disc,
+                number: entry.number,
+                title: entry.title,
+                duration: entry.duration,
+                source: entry.source
+            ))
         }
-        return AlbumCompleteness(missing: missing, expectedCount: max(expected.count, album.tracks.count),
-                                 sourceDescription: source, localCount: album.tracks.count)
+        return AlbumCompleteness(
+            missing: missing,
+            expectedCount: max(expected.count, album.tracks.count),
+            sourceDescription: source,
+            localCount: album.tracks.count
+        )
     }
 
     static func normalizeTitle(_ title: String) -> String {
         var text = title.lowercased().folding(options: [.diacriticInsensitive], locale: nil)
-        for pattern in [#"\([^)]*\)"#, #"\[[^\]]*\]"#, #"\b(feat|ft|featuring)\.?\s.*$"#, #"\s-\s.*(remaster|version|edit|mix).*$"#] {
-            text = text.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        for regex in titleRegexes {
+            let range = NSRange(text.startIndex..., in: text)
+            text = regex.stringByReplacingMatches(in: text, range: range, withTemplate: "")
         }
         return text.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(String.init).joined()
     }
 
     private static func normalizeFilename(_ name: String) -> String {
-        // Library copies may have gained " (1)" when a name was taken.
-        name.lowercased().replacingOccurrences(of: #" \(\d+\)(?=\.[^.]+$)"#, with: "", options: .regularExpression)
+        let lower = name.lowercased()
+        let range = NSRange(lower.startIndex..., in: lower)
+        return duplicateSuffixRegex.stringByReplacingMatches(in: lower, range: range, withTemplate: "")
     }
 }
 
@@ -134,8 +199,8 @@ struct ExpectedTrack {
 
 // MARK: - Soulseek folder listings
 
-struct FolderListing: Codable {
-    struct File: Codable {
+struct FolderListing: Codable, Sendable {
+    struct File: Codable, Sendable {
         let path: String
         let size: UInt64
         let duration: UInt32?
@@ -155,22 +220,28 @@ struct FolderListing: Codable {
         files.map { file in
             let shared = SharedFile(path: file.path, size: file.size, attributes: FileAttributes(duration: file.duration))
             let parsed = MetadataReader.parseFilename((shared.filename as NSString).deletingPathExtension)
-            return ExpectedTrack(disc: 1, number: parsed.number, title: parsed.title,
-                                 duration: file.duration.map(Double.init), filename: shared.filename,
-                                 source: .soulseek(username: username, file: shared))
+            return ExpectedTrack(
+                disc: parsed.disc ?? 1,
+                number: parsed.number,
+                title: parsed.title,
+                duration: file.duration.map(Double.init),
+                filename: shared.filename,
+                source: .soulseek(username: username, file: shared)
+            )
         }
-        .sorted { ($0.number ?? 999, $0.title) < ($1.number ?? 999, $1.title) }
+        .sorted { ($0.disc, $0.number ?? 999, $0.title) < ($1.disc, $1.number ?? 999, $1.title) }
     }
 }
 
 /// Folder listings keyed by the local folder name the album landed in.
 final class FolderListingStore {
     private var listings: [String: FolderListing]
-    private let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("album-sources.json")
+    private let saveQueue = DispatchQueue(label: "seekios.folder-listings")
+    private let url = AppDirectories.applicationSupport.appendingPathComponent("album-sources.json")
 
     init() {
-        if let data = try? Data(contentsOf: url), let decoded = try? JSONDecoder().decode([String: FolderListing].self, from: data) {
+        if let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode([String: FolderListing].self, from: data) {
             listings = decoded
         } else {
             listings = [:]
@@ -181,19 +252,24 @@ final class FolderListingStore {
 
     func save(_ listing: FolderListing, forLocalFolder name: String) {
         listings[name] = listing
-        if let data = try? JSONEncoder().encode(listings) {
-            try? data.write(to: url, options: .atomic)
+        let snapshot = listings
+        let targetURL = url
+        saveQueue.async {
+            AppDirectories.ensureParentDirectory(for: targetURL)
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: targetURL, options: .atomic)
+            }
         }
     }
 }
 
 // MARK: - MusicBrainz
 
-struct Tracklist: Codable {
+struct Tracklist: Codable, Sendable {
     let title: String
     let tracks: [Entry]
 
-    struct Entry: Codable {
+    struct Entry: Codable, Sendable {
         let disc: Int
         let number: Int?
         let title: String
@@ -212,7 +288,7 @@ extension Tracklist {
 actor MusicBrainz {
     static let shared = MusicBrainz()
 
-    private var lastRequest = Date.distantPast
+    private var lastRequest: ContinuousClock.Instant?
     private let directory: URL = {
         let url = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Tracklists", isDirectory: true)
@@ -236,31 +312,46 @@ actor MusicBrainz {
 
         var found: Tracklist?
         do {
-            let id: String?
-            if let releaseID {
-                id = releaseID
-            } else {
-                id = try await searchRelease(title: title, artist: artist, localCount: localCount)
+            if let releaseID, UUID(uuidString: releaseID) != nil {
+                found = try await fetchRelease(releaseID)
             }
-            if let id { found = try await fetchRelease(id) }
+            if found == nil {
+                if let searchedID = try await searchRelease(title: title, artist: artist, localCount: localCount),
+                   UUID(uuidString: searchedID) != nil {
+                    found = try await fetchRelease(searchedID)
+                }
+            }
         } catch {
-            return nil  // Network trouble: don't cache, try again later
+            return nil
         }
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(Cached(tracklist: found, fetched: Date())) {
             try? data.write(to: file, options: .atomic)
         }
         return found.map { ($0.title, $0.expected()) }
     }
 
+    private func escapeLucene(_ text: String) -> String {
+        text.replacingOccurrences(of: "\\", with: " ")
+            .replacingOccurrences(of: "\"", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func searchRelease(title: String, artist: String, localCount: Int) async throws -> String? {
-        let escapedTitle = title.replacingOccurrences(of: "\"", with: "")
-        let escapedArtist = artist.replacingOccurrences(of: "\"", with: "")
+        let escapedTitle = escapeLucene(title)
+        let escapedArtist = escapeLucene(artist)
+        guard !escapedTitle.isEmpty else { return nil }
         var query = "release:\"\(escapedTitle)\""
-        if artist != "Various Artists", artist != "Unknown Artist" { query += " AND artist:\"\(escapedArtist)\"" }
-        var components = URLComponents(string: "https://musicbrainz.org/ws/2/release/")!
-        components.queryItems = [URLQueryItem(name: "query", value: query),
-                                 URLQueryItem(name: "fmt", value: "json"),
-                                 URLQueryItem(name: "limit", value: "10")]
+        if artist != "Various Artists", artist != "Unknown Artist", !escapedArtist.isEmpty {
+            query += " AND artist:\"\(escapedArtist)\""
+        }
+        guard var components = URLComponents(string: "https://musicbrainz.org/ws/2/release/") else { return nil }
+        components.queryItems = [
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "fmt", value: "json"),
+            URLQueryItem(name: "limit", value: "10"),
+        ]
+        guard let url = components.url else { return nil }
         struct Response: Decodable {
             struct Release: Decodable {
                 let id: String
@@ -274,11 +365,10 @@ actor MusicBrainz {
             }
             let releases: [Release]
         }
-        let response: Response = try await get(components.url!)
+        guard let response: Response = try await get(url) else { return nil }
         let wanted = AlbumCompletenessStoreNormalizer.title(title)
         let candidates = response.releases.filter { ($0.score ?? 0) >= 80 }
             .filter { AlbumCompletenessStoreNormalizer.title($0.title) == wanted || ($0.score ?? 0) >= 95 }
-        // Prefer the edition with at least as many tracks as we have, and the fewest extras.
         let best = candidates.min { lhs, rhs in
             func cost(_ release: Response.Release) -> Int {
                 let count = release.trackCount ?? 0
@@ -290,8 +380,10 @@ actor MusicBrainz {
     }
 
     private func fetchRelease(_ id: String) async throws -> Tracklist? {
-        var components = URLComponents(string: "https://musicbrainz.org/ws/2/release/\(id)")!
+        guard UUID(uuidString: id) != nil,
+              var components = URLComponents(string: "https://musicbrainz.org/ws/2/release/\(id)") else { return nil }
         components.queryItems = [URLQueryItem(name: "inc", value: "recordings"), URLQueryItem(name: "fmt", value: "json")]
+        guard let url = components.url else { return nil }
         struct Response: Decodable {
             struct Medium: Decodable {
                 struct Track: Decodable {
@@ -306,38 +398,51 @@ actor MusicBrainz {
             let title: String
             let media: [Medium]?
         }
-        let response: Response = try await get(components.url!)
+        guard let response: Response = try await get(url) else { return nil }
         let entries = (response.media ?? []).flatMap { medium in
             (medium.tracks ?? []).map { track in
-                Tracklist.Entry(disc: medium.position ?? 1,
-                                number: track.position ?? Int(track.number ?? ""),
-                                title: track.title,
-                                duration: track.length.map { Double($0) / 1000 })
+                Tracklist.Entry(
+                    disc: medium.position ?? 1,
+                    number: track.position ?? Int(track.number ?? ""),
+                    title: track.title,
+                    duration: track.length.map { Double($0) / 1000 }
+                )
             }
         }
         return entries.isEmpty ? nil : Tracklist(title: response.title, tracks: entries)
     }
 
-    private func get<T: Decodable>(_ url: URL) async throws -> T {
-        let wait = 1.1 - Date().timeIntervalSince(lastRequest)
-        lastRequest = Date().addingTimeInterval(max(wait, 0))
-        if wait > 0 { try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000)) }
+    /// Returns `nil` on HTTP 404/400 so callers can fall back cleanly; throws on transient/network errors.
+    private func get<T: Decodable>(_ url: URL) async throws -> T? {
+        let clock = ContinuousClock()
+        while let last = lastRequest {
+            let elapsed = last.duration(to: clock.now)
+            let target = Duration.milliseconds(1100)
+            if elapsed >= target { break }
+            try await Task.sleep(for: target - elapsed)
+        }
+        lastRequest = clock.now
 
         var request = URLRequest(url: url)
         request.setValue(HTTP.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 20
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 || status == 400 { return nil }
+        guard status == 200 else { throw URLError(.badServerResponse) }
         return try JSONDecoder().decode(T.self, from: data)
     }
 }
 
 /// Title normalisation usable off the main actor.
 enum AlbumCompletenessStoreNormalizer {
+    private static let bracketRegex = try! NSRegularExpression(pattern: #"\([^)]*\)|\[[^\]]*\]"#)
+
     static func title(_ text: String) -> String {
-        text.lowercased().folding(options: [.diacriticInsensitive], locale: nil)
-            .replacingOccurrences(of: #"\([^)]*\)|\[[^\]]*\]"#, with: "", options: .regularExpression)
-            .unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(String.init).joined()
+        let folded = text.lowercased().folding(options: [.diacriticInsensitive], locale: nil)
+        let range = NSRange(folded.startIndex..., in: folded)
+        let stripped = bracketRegex.stringByReplacingMatches(in: folded, range: range, withTemplate: "")
+        return stripped.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(String.init).joined()
     }
 }

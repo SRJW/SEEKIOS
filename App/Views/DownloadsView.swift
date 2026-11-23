@@ -9,72 +9,103 @@ struct LocalFolderItem: Identifiable {
     var id: String { url.path }
 }
 
+private struct DownloadFolderGroup: Identifiable {
+    let id: String
+    let folderName: String
+    let folderPath: String
+    let username: String
+    let items: [DownloadItem]
+}
+
+private enum TransferFilter: String, CaseIterable, Identifiable {
+    case all = "All"
+    case active = "Active"
+    case paused = "Paused"
+    case failed = "Failed"
+    case done = "Done"
+    var id: String { rawValue }
+}
+
 struct DownloadsView: View {
     @EnvironmentObject private var soulseek: SoulseekModel
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var player: Player
+    @EnvironmentObject private var transfers: TransfersStore
     @EnvironmentObject private var router: AppRouter
 
     @State private var selection = Set<DownloadID>()
     @State private var editMode: EditMode = .inactive
-    @State private var previewURL: URL?
+    @State private var previewItem: QuickLookPreviewItem?
     @State private var folderToBrowse: LocalFolderItem?
+    @State private var browsePeerTarget: BrowseTarget?
     @State private var showFolderPicker = false
     @State private var showNewFolderAlert = false
     @State private var newFolderName = ""
-
-    private var activeDownloads: [DownloadItem] {
-        soulseek.visibleDownloads.filter(\.isActive)
-    }
-
-    private var failedDownloads: [DownloadItem] {
-        soulseek.visibleDownloads.filter {
-            if case .failed = $0.state { return true }
-            return false
-        }
-    }
-
-    private var completedDownloads: [DownloadItem] {
-        soulseek.visibleDownloads.filter {
-            if case .completed = $0.state { return true }
-            return false
-        }
-    }
-
-    private var groupedByFolder: [(folderName: String, username: String, items: [DownloadItem])] {
-        var groups: [String: (folderName: String, username: String, items: [DownloadItem])] = [:]
-        var order: [String] = []
-        for item in soulseek.visibleDownloads {
-            let folder = item.folderPath.split(separator: "\\").last.map(String.init) ?? item.id.username
-            let key = "\(item.id.username)|\(folder)"
-            if groups[key] == nil {
-                order.append(key)
-                groups[key] = (folderName: folder, username: item.id.username, items: [])
-            }
-            groups[key]?.items.append(item)
-        }
-        return order.compactMap { groups[$0] }
-    }
-
-    private func localContainerFolder(for group: (folderName: String, username: String, items: [DownloadItem])) -> URL {
-        for item in group.items {
-            if case let .completed(url) = item.state {
-                let parent = url.deletingLastPathComponent()
-                if FileManager.default.fileExists(atPath: parent.path) {
-                    return parent
-                }
-            }
-        }
-        let candidate = soulseek.otherDownloadsDirectory.appendingPathComponent(group.folderName, isDirectory: true)
-        if FileManager.default.fileExists(atPath: candidate.path) {
-            return candidate
-        }
-        return soulseek.otherDownloadsDirectory
-    }
+    @State private var filter: TransferFilter = .all
+    @State private var searchText = ""
 
     var body: some View {
+        let allDownloads = transfers.downloads
+        let activeList = allDownloads.filter(\.isActive)
+        let pausedList = allDownloads.filter(\.isPaused)
+        let failedList = allDownloads.filter(\.isFailed)
+        let completedList = allDownloads.filter(\.isCompleted)
+        let filteredDownloads = applyFilter(allDownloads)
+        let grouped = groupByFolder(filteredDownloads)
+        let totalRemainingBytes = activeList.reduce(UInt64(0)) { $0 + $1.remainingBytes }
+        let globalETA = Formatting.eta(remainingBytes: totalRemainingBytes, bytesPerSecond: transfers.totalDownloadSpeed)
+        let resumableSelectedCount = allDownloads.filter { selection.contains($0.id) && ($0.isFailed || $0.isPaused) }.count
+
         NavigationStack {
             List(selection: $selection) {
+                // 1. Live Speed & ETA summary bar (Nicotine+-style)
+                if !activeList.isEmpty || transfers.activeUploadCount > 0 {
+                    Section {
+                        HStack(spacing: 14) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                HStack(spacing: 10) {
+                                    Label(
+                                        transfers.totalDownloadSpeed > 0 ? Formatting.speed(transfers.totalDownloadSpeed) : "0 KB/s",
+                                        systemImage: "arrow.down.circle.fill"
+                                    )
+                                    .foregroundStyle(.tint)
+                                    if transfers.activeUploadCount > 0 || transfers.totalUploadSpeed > 0 {
+                                        Label(
+                                            transfers.totalUploadSpeed > 0 ? Formatting.speed(transfers.totalUploadSpeed) : "0 KB/s",
+                                            systemImage: "arrow.up.circle.fill"
+                                        )
+                                        .foregroundStyle(.green)
+                                    }
+                                }
+                                .font(.subheadline.weight(.semibold).monospacedDigit())
+
+                                HStack(spacing: 6) {
+                                    Text("\(activeList.count) active")
+                                    if let globalETA {
+                                        Text("· ETA \(globalETA)")
+                                    }
+                                    if totalRemainingBytes > 0 {
+                                        Text("· \(Formatting.bytes(totalRemainingBytes)) left")
+                                    }
+                                }
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if !activeList.isEmpty {
+                                Button {
+                                    soulseek.pauseAllActive()
+                                } label: {
+                                    Label("Pause All", systemImage: "pause.circle")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                }
+
+                // 2. Destination controls
                 Section {
                     HStack(spacing: 12) {
                         Image(systemName: "folder.fill.badge.gearshape")
@@ -89,7 +120,7 @@ struct DownloadsView: View {
                                 .lineLimit(1)
                         }
                         Spacer()
-                        Button("Choose Folder") {
+                        Button("Choose") {
                             showFolderPicker = true
                         }
                         .buttonStyle(.borderedProminent)
@@ -127,95 +158,146 @@ struct DownloadsView: View {
                     }
                 } header: {
                     Text("Download Destination")
-                } footer: {
-                    Text("Tip: In the iOS folder picker, open any subfolder (or tap the New Folder icon at top-right) and tap Open.")
                 }
 
-                if !soulseek.visibleDownloads.isEmpty {
+                // 3. Filter & Quick Actions bar
+                if !allDownloads.isEmpty {
                     Section {
-                        HStack(spacing: 12) {
-                            if !failedDownloads.isEmpty {
-                                Button {
-                                    soulseek.retryAllFailed()
-                                } label: {
-                                    Label("Resume All (\(failedDownloads.count))", systemImage: "arrow.clockwise.circle.fill")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(.orange)
+                        Picker("Filter", selection: $filter) {
+                            ForEach(TransferFilter.allCases) { f in
+                                Text(filterLabel(f, total: allDownloads.count, active: activeList.count, paused: pausedList.count, failed: failedList.count, done: completedList.count))
+                                    .tag(f)
                             }
+                        }
+                        .pickerStyle(.segmented)
 
-                            if !completedDownloads.isEmpty {
-                                Button {
-                                    soulseek.clearCompleted()
-                                } label: {
-                                    Label("Clear Done", systemImage: "checkmark.circle")
-                                        .font(.caption.weight(.semibold))
-                                }
-                                .buttonStyle(.bordered)
-                            }
-
-                            Spacer()
-                            Text("\(activeDownloads.count) active · \(completedDownloads.count) done")
-                                .font(.caption)
+                        HStack(spacing: 8) {
+                            Image(systemName: "magnifyingglass")
                                 .foregroundStyle(.secondary)
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
-
-                if !soulseek.uploads.isEmpty {
-                    Section("Uploads (\(soulseek.uploads.count))") {
-                        ForEach(soulseek.uploads) { upload in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(upload.filename).lineLimit(1)
-                                    Text("To \(upload.id.username) · \(Formatting.bytes(upload.sent)) / \(Formatting.bytes(upload.size))")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    ProgressView(value: upload.progress)
+                            TextField("Filter by filename, folder or peer…", text: $searchText)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                            if !searchText.isEmpty {
+                                Button { searchText = "" } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
                                 }
+                                .buttonStyle(.plain)
+                            }
+                        }
+
+                        if !failedList.isEmpty || !pausedList.isEmpty || !completedList.isEmpty {
+                            HStack(spacing: 10) {
+                                let resumableCount = failedList.count + pausedList.count
+                                if resumableCount > 0 {
+                                    Button {
+                                        soulseek.retryAllFailed()
+                                    } label: {
+                                        Label("Resume All (\(resumableCount))", systemImage: "play.circle.fill")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(.orange)
+                                }
+
+                                if !completedList.isEmpty {
+                                    Button {
+                                        soulseek.clearCompleted()
+                                    } label: {
+                                        Label("Clear Done", systemImage: "checkmark.circle")
+                                            .font(.caption.weight(.semibold))
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+
+                                Spacer()
+                                Text("\(completedList.count) done")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
                             }
                         }
                     }
                 }
 
-                ForEach(groupedByFolder, id: \.folderName) { group in
+                // 4. Uploads section (with state, speed, abort & clear)
+                if !transfers.uploads.isEmpty {
                     Section {
-                        ForEach(group.items) { item in
-                            DownloadRow(
-                                item: item,
-                                onPreview: { url in previewURL = url },
-                                onShowFolder: { folderURL in
-                                    folderToBrowse = LocalFolderItem(url: folderURL)
-                                }
-                            )
-                            .tag(item.id)
+                        ForEach(transfers.uploads) { upload in
+                            UploadRow(upload: upload)
                         }
                     } header: {
                         HStack {
-                            Label(group.folderName, systemImage: "folder.fill")
-                                .font(.subheadline.weight(.semibold))
-                                .lineLimit(1)
+                            Text("Uploads (\(transfers.uploads.count))")
                             Spacer()
-                            Button {
-                                let targetFolder = localContainerFolder(for: group)
-                                folderToBrowse = LocalFolderItem(url: targetFolder)
-                            } label: {
-                                Label("Show Folder", systemImage: "folder.badge.magnifyingglass")
-                                    .font(.caption.weight(.semibold))
-                            }
-                            .textCase(nil)
-                        }
-                    } footer: {
-                        HStack {
-                            Text("From \(group.username)")
-                            Spacer()
-                            if group.items.contains(where: { if case .failed = $0.state { return true } else { return false } }) {
-                                Button("Resume Folder") {
-                                    soulseek.retryFailed(from: group.username)
+                            if transfers.uploads.contains(where: { !$0.isActive }) {
+                                Button("Clear Finished") {
+                                    soulseek.clearFinishedUploads()
                                 }
-                                .font(.caption2.weight(.semibold))
+                                .font(.caption.weight(.semibold))
+                                .textCase(nil)
+                            }
+                        }
+                    }
+                }
+
+                // 5. Grouped Downloads (unique ID per user + full remote folder path)
+                if grouped.isEmpty {
+                    Section {
+                        EmptyStateView(
+                            title: allDownloads.isEmpty ? "No Transfers" : "No Matching Transfers",
+                            message: allDownloads.isEmpty
+                                ? "Files you download from Search appear here. Paused and interrupted transfers keep their partial data on disk for resuming."
+                                : "Try switching the transfer filter or clearing your search.",
+                            systemImage: "arrow.down.circle"
+                        )
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 24)
+                        .listRowBackground(Color.clear)
+                    }
+                } else {
+                    ForEach(grouped) { group in
+                        Section {
+                            ForEach(group.items) { item in
+                                DownloadRow(
+                                    item: item,
+                                    onPreview: { url in previewItem = QuickLookPreviewItem(url: url) },
+                                    onShowFolder: { folderURL in folderToBrowse = LocalFolderItem(url: folderURL) },
+                                    onBrowsePeer: { target in browsePeerTarget = target }
+                                )
+                                .tag(item.id)
+                            }
+                        } header: {
+                            HStack {
+                                Label(group.folderName, systemImage: "folder.fill")
+                                    .font(.subheadline.weight(.semibold))
+                                    .lineLimit(1)
+                                Spacer()
+                                Button {
+                                    folderToBrowse = LocalFolderItem(url: localContainerFolder(for: group))
+                                } label: {
+                                    Label("Folder", systemImage: "folder.badge.magnifyingglass")
+                                        .font(.caption.weight(.semibold))
+                                }
+                                .textCase(nil)
+                            }
+                        } footer: {
+                            HStack {
+                                Button {
+                                    browsePeerTarget = BrowseTarget(username: group.username, folder: group.folderPath)
+                                } label: {
+                                    Label("From \(group.username)", systemImage: "person")
+                                        .font(.caption2)
+                                }
+                                .buttonStyle(.plain)
+
+                                Spacer()
+
+                                let hasResumable = group.items.contains { $0.isFailed || $0.isPaused }
+                                if hasResumable {
+                                    Button("Resume Folder") {
+                                        soulseek.retry(Set(group.items.map(\.id)))
+                                    }
+                                    .font(.caption2.weight(.semibold))
+                                }
                             }
                         }
                     }
@@ -224,9 +306,15 @@ struct DownloadsView: View {
             .listStyle(.insetGrouped)
             .navigationTitle("Downloads")
             .environment(\.editMode, $editMode)
+            .onChange(of: allDownloads.isEmpty) { _, isEmpty in
+                if isEmpty {
+                    editMode = .inactive
+                    selection.removeAll()
+                }
+            }
             .toolbar {
                 ToolbarItemGroup(placement: .topBarTrailing) {
-                    if !soulseek.visibleDownloads.isEmpty {
+                    if !allDownloads.isEmpty {
                         Button(editMode == .active ? "Done" : "Select") {
                             withAnimation {
                                 editMode = (editMode == .active) ? .inactive : .active
@@ -252,32 +340,39 @@ struct DownloadsView: View {
                             Label("Create New Download Folder…", systemImage: "folder.badge.plus")
                         }
                         Divider()
-                        if !failedDownloads.isEmpty {
+                        if !activeList.isEmpty {
+                            Button {
+                                soulseek.pauseAllActive()
+                            } label: {
+                                Label("Pause All Active", systemImage: "pause.circle")
+                            }
+                        }
+                        if !failedList.isEmpty || !pausedList.isEmpty {
                             Button {
                                 soulseek.retryAllFailed()
                             } label: {
-                                Label("Resume / Retry All Interrupted", systemImage: "arrow.clockwise")
+                                Label("Resume All Paused / Failed", systemImage: "arrow.clockwise")
                             }
                         }
-                        if !completedDownloads.isEmpty {
+                        if !completedList.isEmpty {
                             Button {
                                 soulseek.clearCompleted()
                             } label: {
                                 Label("Clear Completed", systemImage: "checkmark.circle")
                             }
                         }
-                        if !failedDownloads.isEmpty {
+                        if !failedList.isEmpty {
                             Button(role: .destructive) {
                                 soulseek.clearFailed()
                             } label: {
                                 Label("Remove Failed", systemImage: "xmark.circle")
                             }
                         }
-                        if !activeDownloads.isEmpty {
+                        if !activeList.isEmpty {
                             Button(role: .destructive) {
                                 soulseek.cancelAllActive()
                             } label: {
-                                Label("Cancel All Active", systemImage: "stop.circle")
+                                Label("Cancel & Delete Active", systemImage: "stop.circle")
                             }
                         }
                     } label: {
@@ -287,12 +382,20 @@ struct DownloadsView: View {
 
                 if editMode == .active && !selection.isEmpty {
                     ToolbarItemGroup(placement: .bottomBar) {
-                        Button("Resume (\(selection.count))") {
-                            soulseek.retry(selection)
+                        Button("Pause") {
+                            soulseek.pause(selection)
                             selection.removeAll()
                             editMode = .inactive
                         }
                         Spacer()
+                        if resumableSelectedCount > 0 {
+                            Button("Resume (\(resumableSelectedCount))") {
+                                soulseek.retry(selection)
+                                selection.removeAll()
+                                editMode = .inactive
+                            }
+                            Spacer()
+                        }
                         Button("Delete (\(selection.count))", role: .destructive) {
                             soulseek.remove(selection, deletePartial: true)
                             selection.removeAll()
@@ -306,14 +409,19 @@ struct DownloadsView: View {
                     LocalFolderBrowserView(folderURL: item.url)
                 }
             }
+            .sheet(item: $browsePeerTarget) { target in
+                NavigationStack {
+                    RemoteFolderBrowserView(target: target)
+                }
+            }
             .sheet(isPresented: $showFolderPicker) {
-                FolderDocumentPicker(isPresented: $showFolderPicker) { pickedURL in
+                FolderDocumentPicker { pickedURL in
                     soulseek.setCustomDownloadFolder(pickedURL)
                 }
                 .ignoresSafeArea()
             }
             .alert("Create New Download Folder", isPresented: $showNewFolderAlert) {
-                TextField("Folder name (e.g. Peliculas, Musica)", text: $newFolderName)
+                TextField("Folder name (e.g. Albums, Archives)", text: $newFolderName)
                 Button("Create & Select") {
                     soulseek.createAndSelectSubfolder(named: newFolderName)
                 }
@@ -321,24 +429,140 @@ struct DownloadsView: View {
             } message: {
                 Text("Creates a folder inside On My iPhone › Seekios and sets it as your active download folder.")
             }
-            .fullScreenCover(isPresented: Binding(
-                get: { previewURL != nil },
-                set: { if !$0 { previewURL = nil } }
-            )) {
-                if let url = previewURL {
-                    QuickLookPreview(url: url)
-                        .ignoresSafeArea()
+            .fullScreenCover(item: $previewItem) { item in
+                QuickLookPreview(url: item.url)
+                    .ignoresSafeArea()
+            }
+        }
+    }
+
+    private func filterLabel(_ filter: TransferFilter, total: Int, active: Int, paused: Int, failed: Int, done: Int) -> String {
+        switch filter {
+        case .all: return "All"
+        case .active: return active > 0 ? "Active (\(active))" : "Active"
+        case .paused: return paused > 0 ? "Paused (\(paused))" : "Paused"
+        case .failed: return failed > 0 ? "Failed (\(failed))" : "Failed"
+        case .done: return done > 0 ? "Done (\(done))" : "Done"
+        }
+    }
+
+    private func applyFilter(_ items: [DownloadItem]) -> [DownloadItem] {
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return items.filter { item in
+            switch filter {
+            case .all: break
+            case .active: if !item.isActive { return false }
+            case .paused: if !item.isPaused { return false }
+            case .failed: if !item.isFailed { return false }
+            case .done: if !item.isCompleted { return false }
+            }
+            if !trimmed.isEmpty {
+                return item.filename.lowercased().contains(trimmed)
+                    || item.leafFolder.lowercased().contains(trimmed)
+                    || item.id.username.lowercased().contains(trimmed)
+            }
+            return true
+        }
+    }
+
+    private func groupByFolder(_ items: [DownloadItem]) -> [DownloadFolderGroup] {
+        var groups: [String: (folderName: String, folderPath: String, username: String, items: [DownloadItem])] = [:]
+        var order: [String] = []
+        for item in items {
+            let key = "\(item.id.username)|\(item.folderPath)"
+            if groups[key] == nil {
+                order.append(key)
+                groups[key] = (folderName: item.leafFolder, folderPath: item.folderPath, username: item.id.username, items: [])
+            }
+            groups[key]?.items.append(item)
+        }
+        return order.compactMap { key in
+            guard let g = groups[key] else { return nil }
+            return DownloadFolderGroup(id: key, folderName: g.folderName, folderPath: g.folderPath, username: g.username, items: g.items)
+        }
+    }
+
+    private func localContainerFolder(for group: DownloadFolderGroup) -> URL {
+        for item in group.items {
+            if case let .completed(url) = item.state {
+                let parent = url.deletingLastPathComponent()
+                if FileManager.default.fileExists(atPath: parent.path) {
+                    return parent
                 }
             }
-            .overlay {
-                if soulseek.visibleDownloads.isEmpty && soulseek.uploads.isEmpty {
-                    EmptyStateView(
-                        title: "No Transfers",
-                        message: "Files you download from Search appear here. Interrupted downloads are saved on disk and resume automatically.",
-                        systemImage: "arrow.down.circle"
-                    )
+        }
+        let candidate = soulseek.otherDownloadsDirectory.appendingPathComponent(group.folderName, isDirectory: true)
+        if FileManager.default.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+        return soulseek.otherDownloadsDirectory
+    }
+}
+
+private struct UploadRow: View {
+    let upload: UploadItem
+    @EnvironmentObject private var soulseek: SoulseekModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(upload.filename)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Spacer()
+                if upload.isActive {
+                    Button {
+                        soulseek.abortUpload(upload)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
                 }
             }
+            HStack(spacing: 6) {
+                Text("To \(upload.id.username)")
+                Text("·")
+                Text(statusText)
+                    .foregroundStyle(statusColor)
+                if upload.state == .transferring, upload.bytesPerSecond > 0 {
+                    Text("· \(Formatting.speed(upload.bytesPerSecond))")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if upload.isActive {
+                ProgressView(value: upload.progress)
+                    .tint(.green)
+            }
+        }
+        .padding(.vertical, 2)
+        .contextMenu {
+            if upload.isActive {
+                Button(role: .destructive) {
+                    soulseek.abortUpload(upload)
+                } label: {
+                    Label("Abort Upload", systemImage: "stop.circle")
+                }
+            }
+        }
+    }
+
+    private var statusText: String {
+        switch upload.state {
+        case .queued: return "Queued"
+        case .transferring: return "\(Formatting.bytes(upload.sent)) / \(Formatting.bytes(upload.size))"
+        case .completed: return "Completed · \(Formatting.bytes(upload.size))"
+        case .failed: return "Failed / Aborted"
+        }
+    }
+
+    private var statusColor: Color {
+        switch upload.state {
+        case .completed: return .green
+        case .failed: return .orange
+        default: return .secondary
         }
     }
 }
@@ -347,18 +571,16 @@ struct DownloadRow: View {
     let item: DownloadItem
     let onPreview: (URL) -> Void
     let onShowFolder: (URL) -> Void
+    let onBrowsePeer: (BrowseTarget) -> Void
     @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
-
-    private var fileExtension: String {
-        (item.filename as NSString).pathExtension.lowercased()
-    }
+    @EnvironmentObject private var router: AppRouter
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(alignment: .top, spacing: 10) {
-                Image(systemName: iconForExtension(fileExtension))
+                Image(systemName: iconForExtension(item.fileExtension))
                     .font(.title3)
                     .foregroundStyle(.tint)
                     .frame(width: 26)
@@ -378,7 +600,7 @@ struct DownloadRow: View {
 
             if item.isActive || (item.received > 0 && item.progress < 1.0) {
                 ProgressView(value: item.progress)
-                    .tint(item.isActive ? .accentColor : .orange)
+                    .tint(item.isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.orange))
             }
         }
         .padding(.vertical, 3)
@@ -401,18 +623,59 @@ struct DownloadRow: View {
                 }
             }
 
-            if case .failed = item.state {
+            if item.isActive {
                 Button {
-                    soulseek.retry(item)
+                    soulseek.pause(item)
                 } label: {
-                    Label("Resume Download", systemImage: "arrow.clockwise")
+                    Label("Pause (Keep Partial)", systemImage: "pause.circle")
                 }
             }
 
-            Button(role: .destructive) {
-                soulseek.cancel(item)
+            if item.isFailed || item.isPaused {
+                Button {
+                    soulseek.retry(item)
+                } label: {
+                    Label("Resume Download", systemImage: "play.circle")
+                }
+            }
+
+            Divider()
+
+            Button {
+                let query = (item.filename as NSString).deletingPathExtension
+                    .replacingOccurrences(of: "_", with: " ")
+                router.openSearch(query)
             } label: {
-                Label("Remove Download", systemImage: "trash")
+                Label("Search Alternative Sources", systemImage: "magnifyingglass")
+            }
+
+            Button {
+                onBrowsePeer(BrowseTarget(username: item.id.username, folder: item.folderPath))
+            } label: {
+                Label("Browse \(item.id.username)'s Folder", systemImage: "folder.badge.person.crop")
+            }
+
+            Button {
+                soulseek.toggleFavoriteUser(item.id.username)
+            } label: {
+                Label(
+                    soulseek.isFavoriteUser(item.id.username) ? "Remove Favorite User" : "Favorite \(item.id.username)",
+                    systemImage: soulseek.isFavoriteUser(item.id.username) ? "star.slash" : "star"
+                )
+            }
+
+            Button(role: .destructive) {
+                soulseek.toggleBlockedUser(item.id.username)
+            } label: {
+                Label("Block \(item.id.username)", systemImage: "hand.raised")
+            }
+
+            Divider()
+
+            Button(role: .destructive) {
+                soulseek.cancel(item, deletePartial: true)
+            } label: {
+                Label("Remove & Delete Partial", systemImage: "trash")
             }
         }
     }
@@ -435,9 +698,16 @@ struct DownloadRow: View {
                 .foregroundStyle(.secondary)
         case .transferring:
             let pct = Int((item.progress * 100).rounded())
-            Text("Downloading \(pct)% · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
-                .font(.caption)
+            let speedStr = item.bytesPerSecond > 0 ? " · \(Formatting.speed(item.bytesPerSecond))" : ""
+            let etaStr = item.etaText.map { " · \($0)" } ?? ""
+            Text("\(pct)%\(speedStr)\(etaStr) · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+        case .paused:
+            let pct = Int((item.progress * 100).rounded())
+            Text("Paused at \(pct)% · \(Formatting.bytes(item.received)) / \(Formatting.bytes(item.size))")
+                .font(.caption)
+                .foregroundStyle(.orange)
         case let .completed(url):
             Text("Completed · \(Formatting.bytes(item.size)) · \(url.deletingLastPathComponent().lastPathComponent)")
                 .font(.caption)
@@ -462,23 +732,24 @@ struct DownloadRow: View {
                 .buttonStyle(.borderless)
 
                 Button {
-                    if let track = library.track(at: url) {
+                    let libTrack = item.libraryURL.flatMap { library.track(at: $0) } ?? library.track(at: url)
+                    if let track = libTrack {
                         player.play([track])
                     } else {
                         onPreview(url)
                     }
                 } label: {
-                    Image(systemName: LibraryStore.audioExtensions.contains(fileExtension) ? "play.circle.fill" : "eye.circle.fill")
+                    Image(systemName: LibraryStore.audioExtensions.contains(item.fileExtension) ? "play.circle.fill" : "eye.circle.fill")
                         .font(.title3)
                 }
                 .buttonStyle(.borderless)
             }
 
-        case .failed:
+        case .failed, .paused:
             Button {
                 soulseek.retry(item)
             } label: {
-                Image(systemName: "arrow.clockwise.circle.fill")
+                Image(systemName: "play.circle.fill")
                     .font(.title2)
                     .foregroundStyle(.orange)
             }
@@ -486,9 +757,9 @@ struct DownloadRow: View {
 
         default:
             Button {
-                soulseek.cancel(item)
+                soulseek.pause(item)
             } label: {
-                Image(systemName: "xmark.circle.fill")
+                Image(systemName: "pause.circle.fill")
                     .font(.title3)
                     .foregroundStyle(.secondary)
             }
@@ -506,14 +777,22 @@ struct DownloadRow: View {
     }
 }
 
+private struct LocalFileEntry: Identifiable, Sendable {
+    let url: URL
+    let name: String
+    let isDirectory: Bool
+    let size: UInt64?
+    var id: String { url.path }
+}
+
 struct LocalFolderBrowserView: View {
     let folderURL: URL
     @Environment(\.dismiss) private var dismiss
     @EnvironmentObject private var soulseek: SoulseekModel
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
-    @State private var contents: [URL] = []
-    @State private var previewURL: URL?
+    @State private var entries: [LocalFileEntry] = []
+    @State private var previewItem: QuickLookPreviewItem?
 
     var body: some View {
         List {
@@ -549,37 +828,36 @@ struct LocalFolderBrowserView: View {
                 }
             }
 
-            Section("Files in Folder (\(contents.count))") {
-                if contents.isEmpty {
+            Section("Files in Folder (\(entries.count))") {
+                if entries.isEmpty {
                     Text("This folder is empty.")
                         .foregroundStyle(.secondary)
                 } else {
-                    ForEach(contents, id: \.path) { itemURL in
-                        let isDir = (try? itemURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                        if isDir {
+                    ForEach(entries) { entry in
+                        if entry.isDirectory {
                             NavigationLink {
-                                LocalFolderBrowserView(folderURL: itemURL)
+                                LocalFolderBrowserView(folderURL: entry.url)
                             } label: {
-                                Label(itemURL.lastPathComponent, systemImage: "folder.fill")
+                                Label(entry.name, systemImage: "folder.fill")
                             }
                         } else {
                             HStack {
                                 Button {
-                                    let ext = itemURL.pathExtension.lowercased()
-                                    if LibraryStore.audioExtensions.contains(ext), let track = library.track(at: itemURL) {
+                                    let ext = entry.url.pathExtension.lowercased()
+                                    if LibraryStore.audioExtensions.contains(ext), let track = library.track(at: entry.url) {
                                         player.play([track])
                                     } else {
-                                        previewURL = itemURL
+                                        previewItem = QuickLookPreviewItem(url: entry.url)
                                     }
                                 } label: {
                                     HStack {
                                         Image(systemName: "doc.fill")
                                             .foregroundStyle(.tint)
                                         VStack(alignment: .leading, spacing: 2) {
-                                            Text(itemURL.lastPathComponent)
+                                            Text(entry.name)
                                                 .foregroundStyle(.primary)
                                                 .lineLimit(2)
-                                            if let size = (try? FileManager.default.attributesOfItem(atPath: itemURL.path)[.size] as? UInt64) {
+                                            if let size = entry.size {
                                                 Text(Formatting.bytes(size))
                                                     .font(.caption)
                                                     .foregroundStyle(.secondary)
@@ -591,15 +869,14 @@ struct LocalFolderBrowserView: View {
 
                                 Spacer()
 
-                                ShareLink(item: itemURL) {
+                                ShareLink(item: entry.url) {
                                     Image(systemName: "square.and.arrow.up")
                                 }
                                 .buttonStyle(.borderless)
                             }
                             .swipeActions(edge: .trailing) {
                                 Button(role: .destructive) {
-                                    try? FileManager.default.removeItem(at: itemURL)
-                                    reloadContents()
+                                    deleteItem(entry.url)
                                 } label: {
                                     Label("Delete", systemImage: "trash")
                                 }
@@ -616,26 +893,44 @@ struct LocalFolderBrowserView: View {
                 Button("Done") { dismiss() }
             }
         }
-        .onAppear { reloadContents() }
-        .fullScreenCover(isPresented: Binding(
-            get: { previewURL != nil },
-            set: { if !$0 { previewURL = nil } }
-        )) {
-            if let url = previewURL {
-                QuickLookPreview(url: url)
-                    .ignoresSafeArea()
-            }
+        .task(id: folderURL) { await reloadContents() }
+        .fullScreenCover(item: $previewItem) { item in
+            QuickLookPreview(url: item.url)
+                .ignoresSafeArea()
         }
     }
 
-    private func reloadContents() {
-        _ = folderURL.startAccessingSecurityScopedResource()
-        let items = (try? FileManager.default.contentsOfDirectory(
-            at: folderURL,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        contents = items.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    private func reloadContents() async {
+        let target = folderURL
+        let loaded = await Task.detached(priority: .userInitiated) { () -> [LocalFileEntry] in
+            let scoped = target.startAccessingSecurityScopedResource()
+            defer { if scoped { target.stopAccessingSecurityScopedResource() } }
+            let keys: Set<URLResourceKey> = [.isDirectoryKey, .fileSizeKey]
+            let items = (try? FileManager.default.contentsOfDirectory(
+                at: target,
+                includingPropertiesForKeys: Array(keys),
+                options: [.skipsHiddenFiles]
+            )) ?? []
+            return items.map { url in
+                let vals = try? url.resourceValues(forKeys: keys)
+                let isDir = vals?.isDirectory ?? false
+                let size = isDir ? nil : vals?.fileSize.map { UInt64(max(0, $0)) }
+                return LocalFileEntry(url: url, name: url.lastPathComponent, isDirectory: isDir, size: size)
+            }
+            .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        }.value
+        entries = loaded
+    }
+
+    private func deleteItem(_ url: URL) {
+        Task {
+            await Task.detached(priority: .userInitiated) {
+                let scoped = folderURL.startAccessingSecurityScopedResource()
+                defer { if scoped { folderURL.stopAccessingSecurityScopedResource() } }
+                try? FileManager.default.removeItem(at: url)
+            }.value
+            await reloadContents()
+        }
     }
 
     private func openInSystemFilesApp(_ url: URL) {
@@ -645,13 +940,12 @@ struct LocalFolderBrowserView: View {
     }
 }
 
-/// Selector nativo de carpetas de iOS con cierre automático al pulsar "Open"
+/// Native iOS folder picker using SwiftUI `@Environment(\.dismiss)` without double-dismiss races.
 struct FolderDocumentPicker: UIViewControllerRepresentable {
-    @Binding var isPresented: Bool
+    @Environment(\.dismiss) private var dismiss
     var onPick: (URL) -> Void
 
-    init(isPresented: Binding<Bool> = .constant(true), onPick: @escaping (URL) -> Void) {
-        self._isPresented = isPresented
+    init(onPick: @escaping (URL) -> Void) {
         self.onPick = onPick
     }
 
@@ -663,38 +957,35 @@ struct FolderDocumentPicker: UIViewControllerRepresentable {
         let picker = UIDocumentPickerViewController(forOpeningContentTypes: [.folder], asCopy: false)
         picker.allowsMultipleSelection = false
         picker.shouldShowFileExtensions = true
-        // Inicia directamente en la carpeta Documents de la app para que el botón Open esté habilitado de inmediato
         picker.directoryURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
         picker.delegate = context.coordinator
         return picker
     }
 
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
+        context.coordinator.parent = self
+    }
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        let parent: FolderDocumentPicker
+        var parent: FolderDocumentPicker
 
         init(parent: FolderDocumentPicker) {
             self.parent = parent
         }
 
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            guard let first = urls.first else {
-                DispatchQueue.main.async { self.parent.isPresented = false }
-                return
-            }
-            DispatchQueue.main.async {
-                self.parent.onPick(first)
-                self.parent.isPresented = false
-                controller.dismiss(animated: true)
+            if let first = urls.first {
+                DispatchQueue.main.async {
+                    self.parent.onPick(first)
+                    self.parent.dismiss()
+                }
+            } else {
+                DispatchQueue.main.async { self.parent.dismiss() }
             }
         }
 
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            DispatchQueue.main.async {
-                self.parent.isPresented = false
-                controller.dismiss(animated: true)
-            }
+            DispatchQueue.main.async { self.parent.dismiss() }
         }
     }
 }

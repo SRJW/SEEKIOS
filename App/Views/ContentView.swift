@@ -1,13 +1,14 @@
+import Combine
 import SwiftUI
 import UIKit
 
 struct ContentView: View {
-    @EnvironmentObject private var soulseek: SoulseekModel
-    @EnvironmentObject private var player: Player
+    let app: AppContainer
     @EnvironmentObject private var router: AppRouter
-    @EnvironmentObject private var library: LibraryStore
-    @EnvironmentObject private var updates: UpdateChecker
     @AppStorage(AccentPalette.storageKey) private var accentHex = AccentPalette.defaultHex
+
+    @State private var activeDownloadCount = 0
+    @State private var hasCurrentTrack = false
 
     var body: some View {
         TabView(selection: $router.tab) {
@@ -20,19 +21,27 @@ struct ContentView: View {
             Tab("Downloads", systemImage: "arrow.down.circle", value: AppTab.downloads) {
                 DownloadsView().modifier(FallbackMiniPlayer(open: openPlayer))
             }
-            .badge(soulseek.activeDownloadCount)
+            .badge(activeDownloadCount)
             Tab("Settings", systemImage: "gearshape", value: AppTab.settings) {
-                SettingsView()
+                SettingsView().modifier(FallbackMiniPlayer(open: openPlayer))
             }
         }
-        .modifier(TabAccessoryMiniPlayer(isVisible: player.current != nil, open: openPlayer))
+        .modifier(TabAccessoryMiniPlayer(isVisible: hasCurrentTrack, open: openPlayer))
         .modifier(RouterPresenters(active: !router.showPlayer))
         .sheet(isPresented: $router.showPlayer) {
             NowPlayingView()
                 .modifier(RouterPresenters(active: true))
                 .tint(Color(hex: accentHex))
         }
-        .onChange(of: library.artworkRevision) { _, _ in player.reloadArtwork() }
+        .onReceive(app.soulseek.transfers.$activeDownloadCount.removeDuplicates()) { count in
+            activeDownloadCount = count
+        }
+        .onReceive(app.player.$entries.map { !$0.isEmpty }.removeDuplicates()) { hasTrack in
+            hasCurrentTrack = hasTrack
+        }
+        .onReceive(app.library.$artworkRevision.dropFirst()) { _ in
+            app.player.reloadArtwork()
+        }
         .onChange(of: accentHex) { _, newHex in
             syncAppIcon(with: newHex)
         }
@@ -40,6 +49,7 @@ struct ContentView: View {
     }
 
     private func openPlayer() {
+        guard hasCurrentTrack else { return }
         router.showPlayer = true
     }
 
@@ -47,35 +57,63 @@ struct ContentView: View {
         guard UIApplication.shared.supportsAlternateIcons else { return }
         let cleanHex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted).uppercased()
         let iconName = "AppIcon_\(cleanHex)"
-        if UIApplication.shared.alternateIconName != iconName {
-            UIApplication.shared.setAlternateIconName(iconName) { error in
-                if error != nil {
-                    // Si el color es el predeterminado o no existe variante, vuelve al icono principal
-                    UIApplication.shared.setAlternateIconName(nil, completionHandler: nil)
-                }
+        // Only request alternate icons that actually exist in Info.plist (avoids ColorPicker frame spam).
+        let bundleIcons = Bundle.main.infoDictionary?["CFBundleIcons"] as? [String: Any]
+        let alternates = bundleIcons?["CFBundleAlternateIcons"] as? [String: Any]
+        if alternates?[iconName] != nil {
+            if UIApplication.shared.alternateIconName != iconName {
+                UIApplication.shared.setAlternateIconName(iconName, completionHandler: nil)
             }
+        } else if UIApplication.shared.alternateIconName != nil {
+            UIApplication.shared.setAlternateIconName(nil, completionHandler: nil)
         }
     }
 }
 
-/// Banner shown on screens that need the Soulseek connection.
+/// Banner shown on screens that need the Soulseek connection, with one-tap reconnect or Settings link.
 struct ConnectionBanner: View {
     @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var router: AppRouter
 
     var body: some View {
         switch soulseek.connection {
         case .loggedIn:
             EmptyView()
         case .connecting:
-            Label("Connecting…", systemImage: "antenna.radiowaves.left.and.right")
-                .foregroundStyle(.secondary)
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Connecting to Soulseek…")
+                    .foregroundStyle(.secondary)
+            }
         case let .failed(message):
-            Label(message, systemImage: "exclamationmark.triangle")
-                .foregroundStyle(.orange)
+            HStack {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                    .font(.subheadline)
+                Spacer()
+                if soulseek.hasCredentials {
+                    Button("Retry") { soulseek.reconnectIfNeeded() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
         case .disconnected:
-            Label(soulseek.hasCredentials ? "Disconnected" : "Log in under Settings to search Soulseek",
-                  systemImage: "person.crop.circle.badge.exclamationmark")
-                .foregroundStyle(.secondary)
+            HStack {
+                Label(soulseek.hasCredentials ? "Disconnected" : "Log in under Settings to search Soulseek",
+                      systemImage: "person.crop.circle.badge.exclamationmark")
+                    .foregroundStyle(.secondary)
+                    .font(.subheadline)
+                Spacer()
+                if soulseek.hasCredentials {
+                    Button("Reconnect") { soulseek.reconnectIfNeeded() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                } else {
+                    Button("Settings") { router.tab = .settings }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
         }
     }
 }

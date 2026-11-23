@@ -1,94 +1,97 @@
 import SwiftUI
 
-@main
-struct Colon3App: App {
-    @StateObject private var library: LibraryStore
-    @StateObject private var soulseek: SoulseekModel
-    @StateObject private var player: Player
-    @StateObject private var favorites = FavoritesStore()
-    @StateObject private var playlists = PlaylistStore()
-    @StateObject private var lastfm: LastFM
-    @StateObject private var completeness: AlbumCompletenessStore
-    @StateObject private var stats: StatsStore
-    @StateObject private var router = AppRouter()
-    @StateObject private var discord: DiscordPresence
-    @StateObject private var wifi: WiFiTransferServer
-    @StateObject private var updates = UpdateChecker()
-    @Environment(\.scenePhase) private var scenePhase
-    private let transferMonitor: TransferMonitor
+/// Single owner of the app's service graph, held in `@StateObject` so SwiftUI never recreates
+/// services or leaks `TransferMonitor` across `App` struct re-evaluations.
+@MainActor
+final class AppContainer: ObservableObject {
+    let library: LibraryStore
+    let soulseek: SoulseekModel
+    let player: Player
+    let favorites = FavoritesStore()
+    let playlists = PlaylistStore()
+    let completeness = AlbumCompletenessStore()
+    let stats = StatsStore()
+    let router = AppRouter()
+    let wifi: WiFiTransferServer
+    let transferMonitor: TransferMonitor
 
     init() {
         Diagnostics.shared.start()
         let library = LibraryStore()
         let player = Player(equalizer: Equalizer())
-        let lastfm = LastFM()
-        let stats = StatsStore()
         player.library = library
-        player.scrobbler = lastfm
         player.stats = stats
+
         let soulseek = SoulseekModel(library: library)
-        let completeness = AlbumCompletenessStore()
         soulseek.completeness = completeness
         soulseek.stats = stats
-        let discord = DiscordPresence()
-        discord.attach(player)
+
         let wifi = WiFiTransferServer(root: library.root)
         wifi.onFilesChanged = { [weak library] in library?.rescan() }
-        _completeness = StateObject(wrappedValue: completeness)
-        transferMonitor = TransferMonitor(soulseek: soulseek, player: player, stats: stats)
-        _library = StateObject(wrappedValue: library)
-        _soulseek = StateObject(wrappedValue: soulseek)
-        _player = StateObject(wrappedValue: player)
-        _lastfm = StateObject(wrappedValue: lastfm)
-        _stats = StateObject(wrappedValue: stats)
-        _discord = StateObject(wrappedValue: discord)
-        _wifi = StateObject(wrappedValue: wifi)
+
+        self.library = library
+        self.soulseek = soulseek
+        self.player = player
+        self.wifi = wifi
+        self.transferMonitor = TransferMonitor(soulseek: soulseek, library: library, player: player, stats: stats)
     }
+}
+
+@main
+struct Colon3App: App {
+    @StateObject private var app = AppContainer()
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var wasInBackground = false
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(soulseek)
-                .environmentObject(library)
-                .environmentObject(player)
-                .environmentObject(player.clock)
-                .environmentObject(favorites)
-                .environmentObject(playlists)
-                .environmentObject(lastfm)
-                .environmentObject(completeness)
-                .environmentObject(stats)
-                .environmentObject(router)
-                .environmentObject(discord)
-                .environmentObject(wifi)
-                .environmentObject(updates)
+            ContentView(app: app)
+                .environmentObject(app.soulseek)
+                .environmentObject(app.soulseek.transfers)
+                .environmentObject(app.soulseek.searchStore)
+                .environmentObject(app.library)
+                .environmentObject(app.player)
+                .environmentObject(app.player.clock)
+                .environmentObject(app.favorites)
+                .environmentObject(app.playlists)
+                .environmentObject(app.completeness)
+                .environmentObject(app.stats)
+                .environmentObject(app.router)
+                .environmentObject(app.wifi)
                 .onAppear {
-                    soulseek.start()
-                    lastfm.flush()
-                    updates.checkIfDue()
+                    app.soulseek.start()
                 }
                 .onOpenURL { url in
-                    // colon3:// links (Dynamic Island, Shortcuts, Back Tap) navigate.
-                    if url.scheme?.lowercased() == "colon3" {
-                        router.handle(url)
+                    if let scheme = url.scheme?.lowercased(), scheme == "colon3" || scheme == "seekios" {
+                        app.router.handle(url)
                         return
                     }
-                    // "Open in colon3" / "Copy to colon3" from Files or another app.
+                    guard url.isFileURL else { return }
+                    let inboxURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                        .appendingPathComponent("Inbox", isDirectory: true)
                     Task {
-                        _ = await library.importItems([url])
-                        if url.path.contains("/Documents/Inbox/") { try? FileManager.default.removeItem(at: url) }
+                        let imported = await app.library.importItems([url])
+                        if imported > 0 && url.isContained(in: inboxURL) {
+                            try? FileManager.default.removeItem(at: url)
+                        }
                     }
                 }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
-                soulseek.reconnectIfNeeded()
-                library.rescan()
-                lastfm.flush()
-                discord.resumeIfNeeded()
-                updates.checkIfDue()
+                app.soulseek.reconnectIfNeeded()
+                if wasInBackground {
+                    wasInBackground = false
+                    app.library.rescan()
+                }
             case .background:
-                stats.save()
+                wasInBackground = true
+                app.stats.save()
+                app.soulseek.transfers.persistNow()
+                if app.wifi.isRunning {
+                    app.wifi.stop()
+                }
             default:
                 break
             }

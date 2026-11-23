@@ -15,11 +15,13 @@ public struct DownloadID: Hashable, Sendable {
 public enum DownloadState: Equatable, Sendable {
     /// Connecting to the peer to send QueueUpload.
     case requesting
-    /// Peer accepted the request; waiting for a free upload slot on their side.
+    /// Peer accepted the request (or waiting for a local peer-queue slot).
     case queued(place: UInt32?)
     /// Peer sent TransferRequest; waiting for their file connection.
     case starting
     case transferring
+    /// Paused by the user; partial bytes are preserved on disk for resume.
+    case paused
     case completed(URL)
     case failed(String)
 }
@@ -29,6 +31,15 @@ public struct DownloadUpdate: Sendable {
     public let state: DownloadState
     public let received: UInt64
     public let size: UInt64
+    public let bytesPerSecond: Double
+
+    public init(id: DownloadID, state: DownloadState, received: UInt64, size: UInt64, bytesPerSecond: Double = 0) {
+        self.id = id
+        self.state = state
+        self.received = received
+        self.size = size
+        self.bytesPerSecond = bytesPerSecond
+    }
 }
 
 public enum ClientState: Equatable, Sendable {
@@ -64,10 +75,22 @@ public struct UploadUpdate: Sendable {
     public let state: UploadState
     public let sent: UInt64
     public let size: UInt64
+    public let bytesPerSecond: Double
+
+    public init(id: DownloadID, state: UploadState, sent: UInt64, size: UInt64, bytesPerSecond: Double = 0) {
+        self.id = id
+        self.state = state
+        self.sent = sent
+        self.size = size
+        self.bytesPerSecond = bytesPerSecond
+    }
 }
 
 public enum ClientEvent: Sendable {
     case state(ClientState)
+    case listeningPort(UInt16)
+    case wishlistInterval(UInt32)
+    case userStatus(username: String, status: UserStatus)
     case searchResponse(SearchResponse)
     case download(DownloadUpdate)
     case upload(UploadUpdate)
@@ -84,29 +107,73 @@ public final class SoulseekClient: @unchecked Sendable {
     public var downloadDirectory: URL
     public let incompleteDirectory: URL
 
-    private let queue = DispatchQueue(label: "colon3.soulseek-client")
+    private let queue = DispatchQueue(label: "seekios.soulseek-client")
     private var server: NWConnection?
     private var serverFrames = FrameBuffer()
+    private var listener: NWListener?
+    private var activeListenPort: UInt16 = 0
+    private var incomingConnections: [ObjectIdentifier: IncomingConnection] = [:]
+
     private var username = ""
     private var isLoggedIn = false
-    private var activeSearches = Set<UInt32>()
+    private var activeSearches: [UInt32: Date] = [:]
 
+    // Tunable Nicotine+-style limits
+    private var maxConcurrentDownloads = 4
+    private var maxConcurrentUploads = 2
+    private var maxQueuedPerPeer = 10
+    private var distributedSearchEnabled = true
+
+    // Peer & address management
     private var peers: [String: PeerLink] = [:]
+    private var addressCache: [String: CachedAddress] = [:]
     private var addressWaiters: [String: [(PeerAddress?) -> Void]] = [:]
-    private var fileLinks: [ObjectIdentifier: FileLink] = [:]
+    private var pendingIndirectPeers: [UInt32: PeerLink] = [:]
+    private var pendingIndirectFiles: [UInt32: UploadJob] = [:]
+    private var watchedUsers = Set<String>()
+    private var userStatuses: [String: UserStatus] = [:]
 
+    // Transfers
+    private var fileLinks: [ObjectIdentifier: FileLink] = [:]
     private var downloads: [DownloadID: DownloadRecord] = [:]
     private var downloadsByToken: [String: DownloadID] = [:]
+    private var stagedDownloadQueue: [DownloadID] = []
 
+    // Sharing & uploads
     private var shares: [String: LocalShare] = [:]
+    private var shareWordIndex: [String: [String]] = [:]
     private var uploadQueue: [UploadJob] = []
-    private var activeUpload: UploadJob?
+    private var activeUploads: [UInt32: UploadJob] = [:]
     private var completedUploads: UInt32 = 0
+    private var averageUploadSpeed: UInt32 = 100_000
+
+    // Folder & user share browsing (strictly separated)
     private var folderBrowses: [UInt32: FolderBrowse] = [:]
+    private var shareListBrowses: [String: [([SharedFile]?) -> Void]] = [:]
+
+    // Distributed network (D)
+    private var parentConnection: NWConnection?
+    private var parentFrames = FrameBuffer()
+    private var parentUsername: String?
+    private var lastDistribReplyAt = Date.distantPast
+    private var distribRepliesThisMinute = 0
+
+    // Maintenance & keepalive
+    private var maintenanceTimer: DispatchSourceTimer?
+    private var lastServerPingSent: Date?
+    private var awaitingServerPong = false
+    private var lastQueuePollAt = Date.distantPast
 
     public init(downloadDirectory: URL, incompleteDirectory: URL) {
         self.downloadDirectory = downloadDirectory
         self.incompleteDirectory = incompleteDirectory
+    }
+
+    deinit {
+        maintenanceTimer?.cancel()
+        listener?.cancel()
+        server?.cancel()
+        parentConnection?.cancel()
     }
 
     // MARK: - Public API
@@ -114,6 +181,22 @@ public final class SoulseekClient: @unchecked Sendable {
     public func setDownloadDirectory(_ url: URL) {
         queue.async {
             self.downloadDirectory = url
+        }
+    }
+
+    public func configure(
+        maxConcurrentDownloads: Int,
+        maxConcurrentUploads: Int,
+        maxQueuedPerPeer: Int,
+        distributedSearchEnabled: Bool
+    ) {
+        queue.async {
+            self.maxConcurrentDownloads = max(1, min(maxConcurrentDownloads, 16))
+            self.maxConcurrentUploads = max(1, min(maxConcurrentUploads, 8))
+            self.maxQueuedPerPeer = max(1, min(maxQueuedPerPeer, 50))
+            self.distributedSearchEnabled = distributedSearchEnabled
+            self.pumpDownloads()
+            self.startNextUploads()
         }
     }
 
@@ -127,37 +210,69 @@ public final class SoulseekClient: @unchecked Sendable {
 
     @discardableResult
     public func search(_ query: String) -> UInt32 {
-        let token = UInt32.random(in: 1..<UInt32.max)
+        let token = nextToken()
         queue.async {
             guard self.isLoggedIn else { return }
-            self.activeSearches.insert(token)
+            self.activeSearches[token] = Date()
             self.sendServer(.fileSearch(token: token, query: query))
         }
         return token
     }
 
-    /// Registra una descarga incompleta previa en el motor para poder reanudarla desde el byte donde quedó
-    public func restoreInterruptedDownload(username: String, path: String, size: UInt64) {
+    @discardableResult
+    public func wishlistSearch(_ query: String) -> UInt32 {
+        let token = nextToken()
+        queue.async {
+            guard self.isLoggedIn else { return }
+            self.activeSearches[token] = Date()
+            self.sendServer(.wishlistSearch(token: token, query: query))
+        }
+        return token
+    }
+
+    public func stopSearch(_ token: UInt32) {
+        queue.async {
+            self.activeSearches.removeValue(forKey: token)
+        }
+    }
+
+    public func watchUser(_ username: String) {
+        queue.async {
+            guard self.isLoggedIn, !username.isEmpty else { return }
+            self.ensureWatching(username)
+        }
+    }
+
+    public func requestUserStatus(_ username: String) {
+        queue.async {
+            guard self.isLoggedIn, !username.isEmpty else { return }
+            self.sendServer(.getUserStatus(username: username))
+        }
+    }
+
+    /// Registers a previously incomplete download so it can resume from disk offset.
+    public func restoreInterruptedDownload(username: String, path: String, size: UInt64, folderName: String? = nil) {
         queue.async {
             let id = DownloadID(username: username, path: path)
             guard self.downloads[id] == nil else { return }
             let partURL = self.partialURL(for: id)
             let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
-            let validReceived = min(savedBytes, size)
+            let validReceived = size > 0 ? min(savedBytes, size) : savedBytes
             self.downloads[id] = DownloadRecord(
                 id: id,
-                state: .failed(validReceived > 0 ? "Paused (\(Int(Double(validReceived) / Double(max(1, size)) * 100))%)" : "Paused"),
+                state: .paused,
                 size: size,
                 received: validReceived,
                 token: nil,
                 retries: 0,
-                folderName: nil
+                folderName: folderName,
+                sentToPeer: false
             )
             self.emitDownload(id)
         }
     }
 
-    /// Devuelve cuántos bytes hay guardados en el archivo .part en disco para mostrar el progreso real al abrir la app
+    /// Returns how many partial bytes currently exist on disk for this transfer.
     public func partialBytesOnDisk(username: String, path: String) -> UInt64 {
         let id = DownloadID(username: username, path: path)
         let partURL = partialURL(for: id)
@@ -169,7 +284,7 @@ public final class SoulseekClient: @unchecked Sendable {
             let id = DownloadID(username: username, path: file.path)
             if let existing = self.downloads[id] {
                 switch existing.state {
-                case .failed: break
+                case .failed, .paused: break
                 default: return
                 }
             }
@@ -177,99 +292,376 @@ public final class SoulseekClient: @unchecked Sendable {
             let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
             self.downloads[id] = DownloadRecord(
                 id: id,
-                state: .requesting,
+                state: .queued(place: nil),
                 size: file.size,
-                received: min(savedBytes, file.size),
-                folderName: folderName
+                received: file.size > 0 ? min(savedBytes, file.size) : savedBytes,
+                folderName: folderName,
+                sentToPeer: false
             )
+            if !self.stagedDownloadQueue.contains(id) {
+                self.stagedDownloadQueue.append(id)
+            }
+            self.ensureWatching(username)
             self.emitDownload(id)
-            self.requestQueuePlace(id)
+            self.pumpDownloads()
         }
     }
 
-    public func retry(_ id: DownloadID, size: UInt64 = 0) {
+    /// Pauses an active or queued download while keeping its `.part` file on disk for later resume.
+    public func pause(_ id: DownloadID) {
+        queue.async {
+            guard var record = self.downloads[id] else { return }
+            switch record.state {
+            case .completed, .paused:
+                return
+            default:
+                break
+            }
+            self.stagedDownloadQueue.removeAll { $0 == id }
+            if let token = record.token {
+                self.downloadsByToken[self.tokenKey(id.username, token)] = nil
+                record.token = nil
+            }
+            record.state = .paused
+            record.sentToPeer = false
+            record.bytesPerSecond = 0
+            self.downloads[id] = record
+            for link in Array(self.fileLinks.values) {
+                if case let .downloading(linkID) = link.role, linkID == id {
+                    self.closeFile(link, reason: nil)
+                }
+            }
+            self.emitDownload(id)
+            self.pumpDownloads()
+        }
+    }
+
+    public func retry(_ id: DownloadID, size: UInt64 = 0, folderName: String? = nil) {
         queue.async {
             let partURL = self.partialURL(for: id)
             let savedBytes = (try? FileManager.default.attributesOfItem(atPath: partURL.path)[.size] as? UInt64) ?? 0
             if var record = self.downloads[id] {
-                record.state = .requesting
+                if case .completed = record.state { return }
+                record.state = .queued(place: nil)
                 record.retries = 0
+                record.sentToPeer = false
+                record.bytesPerSecond = 0
                 if size > 0 && record.size == 0 { record.size = size }
-                record.received = min(savedBytes, record.size)
+                if let folderName { record.folderName = folderName }
+                record.received = record.size > 0 ? min(savedBytes, record.size) : savedBytes
                 self.downloads[id] = record
             } else {
                 self.downloads[id] = DownloadRecord(
                     id: id,
-                    state: .requesting,
+                    state: .queued(place: nil),
                     size: size,
-                    received: min(savedBytes, size),
+                    received: size > 0 ? min(savedBytes, size) : savedBytes,
                     token: nil,
                     retries: 0,
-                    folderName: nil
+                    folderName: folderName,
+                    sentToPeer: false
                 )
             }
+            if !self.stagedDownloadQueue.contains(id) {
+                self.stagedDownloadQueue.append(id)
+            }
+            self.ensureWatching(id.username)
             self.emitDownload(id)
-            self.requestQueuePlace(id)
+            self.pumpDownloads()
         }
     }
 
     public func cancel(_ id: DownloadID, deletePartial: Bool = false) {
         queue.async {
+            self.stagedDownloadQueue.removeAll { $0 == id }
             if let token = self.downloads[id]?.token {
                 self.downloadsByToken[self.tokenKey(id.username, token)] = nil
             }
             self.downloads[id] = nil
-            for link in self.fileLinks.values {
-                if case let .downloading(linkID) = link.role, linkID == id { self.closeFile(link, reason: nil) }
+            for link in Array(self.fileLinks.values) {
+                if case let .downloading(linkID) = link.role, linkID == id {
+                    self.closeFile(link, reason: nil)
+                }
             }
             if deletePartial {
                 try? FileManager.default.removeItem(at: self.partialURL(for: id))
             }
+            self.pumpDownloads()
         }
     }
 
-    /// Solicita los archivos de una carpeta y el árbol completo compartido del usuario
+    public func abortUpload(_ id: DownloadID) {
+        queue.async {
+            self.uploadQueue.removeAll { $0.username == id.username && $0.path == id.path }
+            if let (token, job) = self.activeUploads.first(where: { $0.value.username == id.username && $0.value.path == id.path }) {
+                for link in Array(self.fileLinks.values) {
+                    if case let .uploading(linkToken) = link.role, linkToken == token {
+                        self.closeFile(link, reason: nil)
+                    }
+                }
+                self.activeUploads.removeValue(forKey: token)
+                if self.isLoggedIn {
+                    self.sendToPeer(job.username, [.uploadDenied(filename: job.path, reason: "Cancelled")])
+                }
+                self.emitUpload(username: job.username, path: job.path, state: .failed, sent: 0, size: job.share.size, speed: 0)
+                self.startNextUploads()
+            } else {
+                if self.isLoggedIn {
+                    self.sendToPeer(id.username, [.uploadDenied(filename: id.path, reason: "Cancelled")])
+                }
+                self.emitUpload(username: id.username, path: id.path, state: .failed, sent: 0, size: 0, speed: 0)
+            }
+        }
+    }
+
+    /// Requests ONLY a specific folder's contents (`FolderContentsRequest`, code 36),
+    /// matching Nicotine+'s lightweight behavior (never pulls the entire user share list).
     public func browseFolder(username: String, folder: String, completion: @escaping ([SharedFile]?) -> Void) {
+        if folder.isEmpty {
+            browseUserShares(username: username, completion: completion)
+            return
+        }
         queue.async {
             guard self.isLoggedIn else {
                 DispatchQueue.main.async { completion(nil) }
                 return
             }
-            let token = UInt32.random(in: 1..<UInt32.max)
+            let token = self.nextToken()
             self.folderBrowses[token] = FolderBrowse(username: username, folder: folder, completion: completion)
-
-            var requests: [PeerMessage] = [.sharedFileListRequest]
-            if !folder.isEmpty {
-                requests.insert(.folderContentsRequest(token: token, folder: folder), at: 0)
-            }
-
-            self.sendToPeer(username, requests,
-                            onFailure: { [weak self] in self?.finishBrowse(token: token, files: nil) })
-            self.queue.asyncAfter(deadline: .now() + 30) { [weak self] in
-                self?.finishBrowse(token: token, files: nil)
+            self.sendToPeer(
+                username,
+                [.folderContentsRequest(token: token, folder: folder)],
+                onFailure: { [weak self] in self?.finishFolderBrowse(token: token, files: nil) }
+            )
+            self.queue.asyncAfter(deadline: .now() + 20) { [weak self] in
+                self?.finishFolderBrowse(token: token, files: nil)
             }
         }
     }
 
-    private func finishBrowse(token: UInt32, files: [SharedFile]?) {
-        guard let browse = folderBrowses.removeValue(forKey: token) else { return }
-        DispatchQueue.main.async { browse.completion(files) }
+    /// Explicitly requests a user's entire shared tree (`SharedFileListRequest`, code 4).
+    public func browseUserShares(username: String, completion: @escaping ([SharedFile]?) -> Void) {
+        queue.async {
+            guard self.isLoggedIn else {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let key = username.lowercased()
+            let isFirst = self.shareListBrowses[key] == nil
+            self.shareListBrowses[key, default: []].append(completion)
+            guard isFirst else { return }
+
+            self.sendToPeer(
+                username,
+                [.sharedFileListRequest],
+                onFailure: { [weak self] in self?.finishShareListBrowse(usernameKey: key, files: nil) }
+            )
+            self.queue.asyncAfter(deadline: .now() + 35) { [weak self] in
+                self?.finishShareListBrowse(usernameKey: key, files: nil)
+            }
+        }
     }
 
     public func updateShares(_ list: [LocalShare]) {
         queue.async {
             var map: [String: LocalShare] = [:]
-            for share in list { map[share.virtualPath] = share }
+            var index: [String: [String]] = [:]
+            map.reserveCapacity(list.count)
+            for share in list {
+                map[share.virtualPath] = share
+                for token in Self.searchTokens(share.virtualPath) {
+                    index[token, default: []].append(share.virtualPath)
+                }
+            }
             self.shares = map
+            self.shareWordIndex = index
             if self.isLoggedIn { self.sendShareCounts() }
         }
     }
 
-    // MARK: - Server connection
+    // MARK: - Incoming TCP Listener (enables Direct incoming + Indirect PierceFirewall)
+
+    private func startListener() {
+        stopListener()
+        let preferredPort = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: advertisedPort))
+        openListener(on: preferredPort)
+    }
+
+    private func openListener(on port: NWEndpoint.Port?) {
+        let params = Self.tcpParameters(timeout: 12)
+        params.allowLocalEndpointReuse = true
+        let created: NWListener?
+        if let port {
+            created = try? NWListener(using: params, on: port)
+        } else {
+            created = try? NWListener(using: params)
+        }
+        guard let listener = created else {
+            if port != nil {
+                openListener(on: nil)
+            } else {
+                activeListenPort = 0
+                emit(.listeningPort(0))
+                if isLoggedIn { sendServer(.setWaitPort(0)) }
+            }
+            return
+        }
+        self.listener = listener
+        listener.newConnectionHandler = { [weak self] connection in
+            self?.acceptIncoming(connection)
+        }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener, self.listener === listener else { return }
+            switch state {
+            case .ready:
+                let actual = listener.port?.rawValue ?? 0
+                self.activeListenPort = actual
+                self.emit(.listeningPort(actual))
+                if self.isLoggedIn {
+                    self.sendServer(.setWaitPort(UInt32(actual)))
+                }
+                self.log("Listening for peer connections on TCP port \(actual)")
+            case .failed:
+                listener.cancel()
+                self.listener = nil
+                if port != nil {
+                    self.openListener(on: nil)
+                } else {
+                    self.activeListenPort = 0
+                    self.emit(.listeningPort(0))
+                    if self.isLoggedIn { self.sendServer(.setWaitPort(0)) }
+                }
+            default:
+                break
+            }
+        }
+        listener.start(queue: queue)
+    }
+
+    private func stopListener() {
+        listener?.stateUpdateHandler = nil
+        listener?.newConnectionHandler = nil
+        listener?.cancel()
+        listener = nil
+        activeListenPort = 0
+        for incoming in Array(incomingConnections.values) {
+            incoming.cancel()
+        }
+        incomingConnections.removeAll()
+    }
+
+    private func acceptIncoming(_ connection: NWConnection) {
+        let wrapper = IncomingConnection(connection: connection)
+        let key = ObjectIdentifier(wrapper)
+        incomingConnections[key] = wrapper
+
+        connection.stateUpdateHandler = { [weak self, weak wrapper] state in
+            guard let self, let wrapper else { return }
+            switch state {
+            case .ready:
+                self.readIncomingInit(wrapper)
+            case .failed, .cancelled:
+                self.incomingConnections.removeValue(forKey: ObjectIdentifier(wrapper))
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+        queue.asyncAfter(deadline: .now() + 10) { [weak self, weak wrapper] in
+            guard let self, let wrapper, self.incomingConnections.removeValue(forKey: ObjectIdentifier(wrapper)) != nil else { return }
+            wrapper.cancel()
+        }
+    }
+
+    private func readIncomingInit(_ wrapper: IncomingConnection) {
+        wrapper.connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self, weak wrapper] data, _, isComplete, error in
+            guard let self, let wrapper else { return }
+            guard self.incomingConnections[ObjectIdentifier(wrapper)] != nil else { return }
+            if let data, !data.isEmpty { wrapper.frames.append(data) }
+
+            do {
+                if let body = try wrapper.frames.nextFrame() {
+                    let initMsg = try PeerInitMessage.decode(body)
+                    let leftover = wrapper.frames.drain()
+                    self.incomingConnections.removeValue(forKey: ObjectIdentifier(wrapper))
+                    self.routeIncoming(connection: wrapper.connection, initMessage: initMsg, leftover: leftover)
+                    return
+                }
+            } catch {
+                self.incomingConnections.removeValue(forKey: ObjectIdentifier(wrapper))
+                wrapper.cancel()
+                return
+            }
+
+            if isComplete || error != nil {
+                self.incomingConnections.removeValue(forKey: ObjectIdentifier(wrapper))
+                wrapper.cancel()
+            } else {
+                self.readIncomingInit(wrapper)
+            }
+        }
+    }
+
+    private func routeIncoming(connection: NWConnection, initMessage: PeerInitMessage, leftover: Data) {
+        switch initMessage {
+        case let .pierceFirewall(token):
+            if let link = pendingIndirectPeers.removeValue(forKey: token), !link.isClosed {
+                attachReadyPeer(link, connection: connection, sendFirstFrame: nil, leftover: leftover)
+                return
+            }
+            if let job = pendingIndirectFiles.removeValue(forKey: token), activeUploads[job.token] != nil {
+                attachUploadConnection(job: job, connection: connection, sendPeerInit: false, leftover: leftover)
+                return
+            }
+            connection.cancel()
+
+        case let .peerInit(remoteUser, type):
+            switch type {
+            case ConnectionType.peer.rawValue:
+                let link: PeerLink
+                if let existing = peers[remoteUser], !existing.isReady, !existing.isClosed {
+                    link = existing
+                    link.connection?.stateUpdateHandler = nil
+                    link.connection?.cancel()
+                } else {
+                    if let existing = peers[remoteUser] {
+                        closePeer(existing, failed: false)
+                    }
+                    link = PeerLink(username: remoteUser)
+                    peers[remoteUser] = link
+                }
+                attachReadyPeer(link, connection: connection, sendFirstFrame: nil, leftover: leftover)
+
+            case ConnectionType.file.rawValue:
+                let link = FileLink(username: remoteUser, connection: connection, role: .awaitingToken)
+                fileLinks[ObjectIdentifier(link)] = link
+                connection.stateUpdateHandler = { [weak self, weak link] state in
+                    guard let self, let link, !link.isClosed else { return }
+                    if case .failed = state { self.closeFile(link, reason: "File connection failed") }
+                }
+                if !leftover.isEmpty { handleFileData(link, leftover) }
+                if !link.isClosed {
+                    receive(on: connection, onData: { [weak self, weak link] data in
+                        guard let self, let link else { return }
+                        self.handleFileData(link, data)
+                    }, onClose: { [weak self, weak link] _ in
+                        guard let self, let link else { return }
+                        self.closeFile(link, reason: "Connection closed early")
+                    })
+                }
+
+            default:
+                connection.cancel()
+            }
+        }
+    }
+
+    // MARK: - Server Connection & Maintenance
 
     private func openServer(username: String, password: String) {
         tearDown(.connecting)
         self.username = username
+        startListener()
         guard let port = NWEndpoint.Port(rawValue: serverPort) else { return }
 
         let connection = NWConnection(host: NWEndpoint.Host(serverHost), port: port, using: Self.tcpParameters(timeout: 15))
@@ -300,9 +692,102 @@ public final class SoulseekClient: @unchecked Sendable {
         connection.start(queue: queue)
     }
 
+    private func startMaintenanceTimer() {
+        maintenanceTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 15, repeating: 15)
+        timer.setEventHandler { [weak self] in
+            self?.runMaintenanceTick()
+        }
+        timer.resume()
+        maintenanceTimer = timer
+    }
+
+    private func runMaintenanceTick() {
+        guard isLoggedIn else { return }
+        let now = Date()
+
+        // 1. ServerPing keepalive (60s interval, 25s pong watchdog).
+        if awaitingServerPong, let sent = lastServerPingSent, now.timeIntervalSince(sent) > 25 {
+            log("Server ping timed out; reconnecting")
+            tearDown(.failed("Server connection timed out"))
+            return
+        }
+        if !awaitingServerPong, lastServerPingSent == nil || now.timeIntervalSince(lastServerPingSent!) >= 60 {
+            awaitingServerPong = true
+            lastServerPingSent = now
+            sendServer(.serverPing)
+        }
+
+        // 2. Stall detection on active downloads (45s without bytes).
+        for link in Array(fileLinks.values) {
+            if case let .downloading(id) = link.role, now.timeIntervalSince(link.lastDataAt) > 45 {
+                log("Download stalled for \(id.path), retrying")
+                closeFile(link, reason: "Transfer stalled")
+                if let record = downloads[id], record.retries < 3 {
+                    downloads[id]?.retries += 1
+                    downloads[id]?.state = .queued(place: nil)
+                    downloads[id]?.sentToPeer = false
+                    if !stagedDownloadQueue.contains(id) { stagedDownloadQueue.append(id) }
+                    emitDownload(id)
+                }
+            }
+        }
+
+        // 3. Periodic PlaceInQueueRequest refresh every 45s for remotely queued downloads.
+        if now.timeIntervalSince(lastQueuePollAt) >= 45 {
+            lastQueuePollAt = now
+            for (id, record) in downloads where record.sentToPeer {
+                if case .queued = record.state {
+                    sendToPeer(id.username, [.placeInQueueRequest(filename: id.path)])
+                }
+            }
+        }
+
+        // 4. Expire old search tokens (> 90s) so late responses stop burning CPU/zlib.
+        activeSearches = activeSearches.filter { now.timeIntervalSince($0.value) < 90 }
+
+        // 5. Reap idle PeerLinks (> 120s without traffic and no active transfers/browses).
+        let busyUsers = Set(
+            downloads.values.filter {
+                switch $0.state {
+                case .requesting, .queued, .starting, .transferring: return true
+                default: return false
+                }
+            }.map(\.id.username)
+            + activeUploads.values.map(\.username)
+            + uploadQueue.map(\.username)
+            + folderBrowses.values.map(\.username)
+        )
+        for link in Array(peers.values) where link.isReady && !busyUsers.contains(link.username) {
+            if now.timeIntervalSince(link.lastActivity) > 120 {
+                closePeer(link, failed: false)
+            }
+        }
+
+        // 6. Evict expired PeerAddress cache entries (> 5 min).
+        addressCache = addressCache.filter { now.timeIntervalSince($0.value.cachedAt) < 300 }
+
+        // 7. Pump staged downloads & uploads.
+        pumpDownloads()
+        startNextUploads()
+    }
+
     private func tearDown(_ newState: ClientState) {
         isLoggedIn = false
+        maintenanceTimer?.cancel()
+        maintenanceTimer = nil
+        awaitingServerPong = false
+        lastServerPingSent = nil
         activeSearches.removeAll()
+        watchedUsers.removeAll()
+        userStatuses.removeAll()
+        pendingIndirectPeers.removeAll()
+        pendingIndirectFiles.removeAll()
+
+        closeDistributedParent()
+        stopListener()
+
         if let server {
             server.stateUpdateHandler = nil
             server.cancel()
@@ -313,22 +798,28 @@ public final class SoulseekClient: @unchecked Sendable {
         for link in Array(fileLinks.values) { closeFile(link, reason: "Disconnected") }
         for waiters in addressWaiters.values { waiters.forEach { $0(nil) } }
         addressWaiters.removeAll()
+        addressCache.removeAll()
 
+        stagedDownloadQueue.removeAll()
         for (id, record) in downloads {
             switch record.state {
-            case .requesting, .starting, .transferring:
+            case .requesting, .queued, .starting, .transferring:
                 downloads[id]?.state = .failed("Disconnected")
+                downloads[id]?.sentToPeer = false
+                downloads[id]?.bytesPerSecond = 0
                 emitDownload(id)
             default:
                 break
             }
         }
-        for job in uploadQueue + [activeUpload].compactMap({ $0 }) {
-            emitUpload(username: job.username, path: job.path, state: .failed, sent: 0, size: job.share.size)
+        for job in uploadQueue + Array(activeUploads.values) {
+            emitUpload(username: job.username, path: job.path, state: .failed, sent: 0, size: job.share.size, speed: 0)
         }
         uploadQueue.removeAll()
-        for token in Array(folderBrowses.keys) { finishBrowse(token: token, files: nil) }
-        activeUpload = nil
+        activeUploads.removeAll()
+
+        for token in Array(folderBrowses.keys) { finishFolderBrowse(token: token, files: nil) }
+        for key in Array(shareListBrowses.keys) { finishShareListBrowse(usernameKey: key, files: nil) }
         emit(.state(newState))
     }
 
@@ -357,13 +848,14 @@ public final class SoulseekClient: @unchecked Sendable {
         case let .loginSucceeded(greeting, ownIP):
             isLoggedIn = true
             log("Logged in (public IP \(ownIP)). \(greeting)")
-            sendServer(.setWaitPort(advertisedPort))
+            sendServer(.setWaitPort(UInt32(activeListenPort)))
             sendServer(.setStatus(2))
             sendServer(.haveNoParent(true))
             sendServer(.branchRoot(username))
             sendServer(.branchLevel(0))
             sendServer(.acceptChildren(false))
             sendShareCounts()
+            startMaintenanceTimer()
             emit(.state(.loggedIn))
 
         case let .loginFailed(reason, detail):
@@ -372,7 +864,17 @@ public final class SoulseekClient: @unchecked Sendable {
         case let .peerAddress(username, ip, port):
             let waiters = addressWaiters.removeValue(forKey: username) ?? []
             let address: PeerAddress? = (ip == "0.0.0.0" || port == 0) ? nil : PeerAddress(ip: ip, port: port)
+            if let address {
+                addressCache[username] = CachedAddress(address: address, cachedAt: Date())
+            }
             waiters.forEach { $0(address) }
+
+        case let .watchUser(username, exists, status):
+            let resolved = exists ? (status ?? .offline) : .offline
+            handleUserStatusUpdate(username: username, status: resolved)
+
+        case let .userStatus(username, status):
+            handleUserStatusUpdate(username: username, status: status)
 
         case let .connectToPeer(username, type, ip, port, token):
             switch type {
@@ -384,12 +886,67 @@ public final class SoulseekClient: @unchecked Sendable {
                 sendServer(.cantConnectToPeer(token: token, username: username))
             }
 
+        case .serverPing:
+            awaitingServerPong = false
+
+        case let .embeddedMessage(distribCode, payload):
+            if distributedSearchEnabled,
+               let msg = try? DistributedMessage.decodePayload(code: distribCode, payload: payload) {
+                handleDistributedMessage(msg)
+            }
+
+        case let .possibleParents(parents):
+            if distributedSearchEnabled, !shares.isEmpty, parentConnection == nil, !parents.isEmpty {
+                connectDistributedParent(from: parents)
+            }
+
+        case let .wishlistInterval(seconds):
+            emit(.wishlistInterval(seconds))
+
+        case let .cantConnectToPeer(token):
+            if let link = pendingIndirectPeers.removeValue(forKey: token) {
+                closePeer(link, failed: true)
+            }
+            if let job = pendingIndirectFiles.removeValue(forKey: token) {
+                finishUpload(token: job.token, succeeded: false)
+            }
+
         case .relogged:
             tearDown(.failed("Logged in from somewhere else"))
 
-        case .cantConnectToPeer, .other:
+        case .other:
             break
         }
+    }
+
+    private func handleUserStatusUpdate(username: String, status: UserStatus) {
+        let previous = userStatuses[username]
+        userStatuses[username] = status
+        emit(.userStatus(username: username, status: status))
+
+        // Nicotine+-style: when a peer transitions back online, immediately re-queue failed downloads from them.
+        if status == .online, previous != .online {
+            var requeued = 0
+            for (id, record) in downloads where id.username == username {
+                if case .failed = record.state {
+                    downloads[id]?.state = .queued(place: nil)
+                    downloads[id]?.retries = 0
+                    downloads[id]?.sentToPeer = false
+                    if !stagedDownloadQueue.contains(id) { stagedDownloadQueue.append(id) }
+                    emitDownload(id)
+                    requeued += 1
+                }
+            }
+            if requeued > 0 {
+                log("\(username) came online — re-queuing \(requeued) transfer(s)")
+                pumpDownloads()
+            }
+        }
+    }
+
+    private func ensureWatching(_ username: String) {
+        guard isLoggedIn, !username.isEmpty, watchedUsers.insert(username).inserted else { return }
+        sendServer(.watchUser(username: username))
     }
 
     private static func describeLoginFailure(_ reason: String, _ detail: String?) -> String {
@@ -413,18 +970,147 @@ public final class SoulseekClient: @unchecked Sendable {
         sendServer(.sharedFoldersFiles(folders: UInt32(folders.count), files: UInt32(shares.count)))
     }
 
-    private func resolveAddress(_ username: String, completion: @escaping (PeerAddress?) -> Void) {
+    private func resolveAddress(_ username: String, forceRefresh: Bool = false, completion: @escaping (PeerAddress?) -> Void) {
+        if !forceRefresh, let cached = addressCache[username], Date().timeIntervalSince(cached.cachedAt) < 300 {
+            completion(cached.address)
+            return
+        }
         let isFirst = addressWaiters[username] == nil
         addressWaiters[username, default: []].append(completion)
         guard isFirst else { return }
         sendServer(.getPeerAddress(username: username))
-        queue.asyncAfter(deadline: .now() + 15) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 12) { [weak self] in
             guard let self, let waiters = self.addressWaiters.removeValue(forKey: username) else { return }
             waiters.forEach { $0(nil) }
         }
     }
 
-    // MARK: - Peer (P) connections
+    // MARK: - Distributed Network (D) for Share Search Visibility
+
+    private func connectDistributedParent(from parents: [DistributedParent]) {
+        guard let candidate = parents.first(where: { $0.port > 0 && $0.ip != "0.0.0.0" }),
+              let port = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: candidate.port)) else { return }
+        closeDistributedParent()
+        let connection = NWConnection(host: NWEndpoint.Host(candidate.ip), port: port, using: Self.tcpParameters(timeout: 8))
+        parentConnection = connection
+        parentFrames = FrameBuffer()
+        parentUsername = candidate.username
+
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self, self.parentConnection === connection else { return }
+            switch state {
+            case .ready:
+                connection.send(
+                    content: PeerInitMessage.peerInit(username: self.username, type: ConnectionType.distributed.rawValue).frame,
+                    completion: .contentProcessed { _ in }
+                )
+                self.sendServer(.haveNoParent(false))
+                self.receive(on: connection, onData: { [weak self] data in
+                    guard let self, self.parentConnection === connection else { return }
+                    self.handleParentData(data)
+                }, onClose: { [weak self] _ in
+                    guard let self, self.parentConnection === connection else { return }
+                    self.closeDistributedParent()
+                    if self.isLoggedIn { self.sendServer(.haveNoParent(true)) }
+                })
+            case .waiting, .failed:
+                self.closeDistributedParent()
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    private func closeDistributedParent() {
+        parentConnection?.stateUpdateHandler = nil
+        parentConnection?.cancel()
+        parentConnection = nil
+        parentUsername = nil
+        parentFrames = FrameBuffer()
+    }
+
+    private func handleParentData(_ data: Data) {
+        parentFrames.append(data)
+        while parentConnection != nil {
+            do {
+                guard let body = try parentFrames.nextFrame() else { return }
+                let msg = try DistributedMessage.decode(body)
+                handleDistributedMessage(msg)
+            } catch {
+                closeDistributedParent()
+                if isLoggedIn { sendServer(.haveNoParent(true)) }
+                return
+            }
+        }
+    }
+
+    private func handleDistributedMessage(_ message: DistributedMessage) {
+        switch message {
+        case let .branchLevel(level):
+            sendServer(.branchLevel(level + 1))
+        case let .branchRoot(root):
+            sendServer(.branchRoot(root))
+        case let .searchRequest(requester, token, query):
+            respondToDistributedSearch(requester: requester, token: token, query: query)
+        case .ping, .unknown:
+            break
+        }
+    }
+
+    private func respondToDistributedSearch(requester: String, token: UInt32, query: String) {
+        guard distributedSearchEnabled, !shares.isEmpty, requester != username else { return }
+        let now = Date()
+        if now.timeIntervalSince(lastDistribReplyAt) > 60 {
+            distribRepliesThisMinute = 0
+            lastDistribReplyAt = now
+        }
+        // Protect mobile battery & bandwidth: cap outgoing distributed replies to 15/min.
+        guard distribRepliesThisMinute < 15 else { return }
+
+        let terms = Self.searchTokens(query)
+        guard !terms.isEmpty else { return }
+
+        // Intersect inverted word index starting from the smallest posting list.
+        var lists: [[String]] = []
+        for term in terms {
+            guard let paths = shareWordIndex[term], !paths.isEmpty else { return }
+            lists.append(paths)
+        }
+        lists.sort { $0.count < $1.count }
+        var matches = Set(lists[0])
+        for list in lists.dropFirst() {
+            matches.formIntersection(list)
+            if matches.isEmpty { return }
+        }
+
+        let matchedFiles: [SharedFile] = matches.prefix(50).compactMap { path in
+            guard let share = shares[path] else { return nil }
+            return SharedFile(path: share.virtualPath, size: share.size)
+        }
+        guard !matchedFiles.isEmpty else { return }
+
+        distribRepliesThisMinute += 1
+        let response = SearchResponse(
+            username: username,
+            token: token,
+            files: matchedFiles,
+            slotFree: activeUploads.count < maxConcurrentUploads,
+            averageSpeed: averageUploadSpeed,
+            queueLength: UInt32(uploadQueue.count)
+        )
+        sendToPeer(requester, [.fileSearchResponse(response)])
+    }
+
+    private static func searchTokens(_ text: String) -> [String] {
+        text.lowercased()
+            .folding(options: [.diacriticInsensitive], locale: nil)
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+            .map(String.init)
+            .filter { $0.count >= 2 }
+    }
+
+    // MARK: - Peer (P) Connections (Direct + Indirect ConnectToPeer Fallback)
 
     private func sendToPeer(_ username: String, _ messages: [PeerMessage],
                             onSent: (() -> Void)? = nil, onFailure: (() -> Void)? = nil) {
@@ -433,10 +1119,12 @@ public final class SoulseekClient: @unchecked Sendable {
             for message in messages { frames.append(try message.frame()) }
         } catch {
             log("Couldn't encode message for \(username): \(error)")
+            onFailure?()
             return
         }
 
-        if let link = peers[username] {
+        if let link = peers[username], !link.isClosed {
+            link.lastActivity = Date()
             if link.isReady, let connection = link.connection {
                 frames.forEach { connection.send(content: $0, completion: .contentProcessed { _ in }) }
                 onSent?()
@@ -461,59 +1149,69 @@ public final class SoulseekClient: @unchecked Sendable {
                 self.closePeer(link, failed: true)
                 return
             }
-            self.startPeerConnection(link, address: address, firstFrame: PeerInitMessage.peerInit(username: self.username, type: "P").frame)
+            self.startPeerConnection(
+                link,
+                address: address,
+                firstFrame: PeerInitMessage.peerInit(username: self.username, type: "P").frame,
+                allowIndirectFallback: true
+            )
         }
     }
 
     private func openPiercedPeer(username: String, ip: String, port: UInt32, token: UInt32) {
         let link = PeerLink(username: username)
-        if let existing = peers[username], !existing.isReady {
-            link.outbox = existing.outbox
-            link.sentHandlers = existing.sentHandlers
-            link.failureHandlers = existing.failureHandlers
-            existing.outbox.removeAll()
-            existing.sentHandlers.removeAll()
-            existing.failureHandlers.removeAll()
+        if let existing = peers[username] {
+            if !existing.isReady {
+                link.outbox = existing.outbox
+                link.sentHandlers = existing.sentHandlers
+                link.failureHandlers = existing.failureHandlers
+                existing.outbox.removeAll()
+                existing.sentHandlers.removeAll()
+                existing.failureHandlers.removeAll()
+            }
             closePeer(existing, failed: false)
         }
         peers[username] = link
-        startPeerConnection(link, address: PeerAddress(ip: ip, port: port),
-                            firstFrame: PeerInitMessage.pierceFirewall(token: token).frame,
-                            pierceToken: token)
+        startPeerConnection(
+            link,
+            address: PeerAddress(ip: ip, port: port),
+            firstFrame: PeerInitMessage.pierceFirewall(token: token).frame,
+            pierceToken: token,
+            allowIndirectFallback: false
+        )
     }
 
-    private func startPeerConnection(_ link: PeerLink, address: PeerAddress, firstFrame: Data, pierceToken: UInt32? = nil) {
+    private func startPeerConnection(
+        _ link: PeerLink,
+        address: PeerAddress,
+        firstFrame: Data,
+        pierceToken: UInt32? = nil,
+        allowIndirectFallback: Bool
+    ) {
         guard let port = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: address.port)) else {
-            closePeer(link, failed: true)
+            attemptIndirectPeerOrFail(link, allowIndirectFallback: allowIndirectFallback)
             return
         }
-        let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 8))
+        let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 6))
         link.connection = connection
 
         connection.stateUpdateHandler = { [weak self, weak link] state in
-            guard let self, let link, !link.isClosed else { return }
+            guard let self, let link, !link.isClosed, link.connection === connection else { return }
             switch state {
             case .ready:
-                connection.send(content: firstFrame, completion: .contentProcessed { _ in })
-                link.isReady = true
-                link.outbox.forEach { connection.send(content: $0, completion: .contentProcessed { _ in }) }
-                link.outbox.removeAll()
-                link.failureHandlers.removeAll()
-                let sent = link.sentHandlers
-                link.sentHandlers.removeAll()
-                sent.forEach { $0() }
-                self.receive(on: connection, onData: { [weak self, weak link] data in
-                    guard let self, let link else { return }
-                    self.handlePeerData(link, data)
-                }, onClose: { [weak self, weak link] _ in
-                    guard let self, let link else { return }
-                    self.closePeer(link, failed: false)
-                })
+                self.attachReadyPeer(link, connection: connection, sendFirstFrame: firstFrame, leftover: Data())
             case .waiting, .failed:
                 if let pierceToken {
                     self.sendServer(.cantConnectToPeer(token: pierceToken, username: link.username))
+                    self.closePeer(link, failed: true)
+                } else {
+                    // Direct failed: invalidate cached address and try indirect ConnectToPeer if possible.
+                    self.addressCache.removeValue(forKey: link.username)
+                    connection.stateUpdateHandler = nil
+                    connection.cancel()
+                    link.connection = nil
+                    self.attemptIndirectPeerOrFail(link, allowIndirectFallback: allowIndirectFallback)
                 }
-                self.closePeer(link, failed: true)
             default:
                 break
             }
@@ -521,11 +1219,78 @@ public final class SoulseekClient: @unchecked Sendable {
         connection.start(queue: queue)
     }
 
+    private func attemptIndirectPeerOrFail(_ link: PeerLink, allowIndirectFallback: Bool) {
+        guard allowIndirectFallback, !link.triedIndirect, isLoggedIn, activeListenPort > 0 else {
+            closePeer(link, failed: true)
+            return
+        }
+        link.triedIndirect = true
+        let token = nextToken()
+        link.indirectToken = token
+        pendingIndirectPeers[token] = link
+        sendServer(.connectToPeer(token: token, username: link.username, type: .peer))
+
+        queue.asyncAfter(deadline: .now() + 12) { [weak self, weak link] in
+            guard let self, let link, self.pendingIndirectPeers.removeValue(forKey: token) != nil else { return }
+            if !link.isReady {
+                self.closePeer(link, failed: true)
+            }
+        }
+    }
+
+    private func attachReadyPeer(_ link: PeerLink, connection: NWConnection, sendFirstFrame: Data?, leftover: Data) {
+        guard !link.isClosed else {
+            connection.cancel()
+            return
+        }
+        if let token = link.indirectToken {
+            pendingIndirectPeers.removeValue(forKey: token)
+            link.indirectToken = nil
+        }
+        link.connection = connection
+        link.isReady = true
+        link.lastActivity = Date()
+
+        connection.stateUpdateHandler = { [weak self, weak link] state in
+            guard let self, let link, !link.isClosed, link.connection === connection else { return }
+            if case .failed = state {
+                self.closePeer(link, failed: false)
+            }
+        }
+
+        if let sendFirstFrame {
+            connection.send(content: sendFirstFrame, completion: .contentProcessed { _ in })
+        }
+        link.outbox.forEach { connection.send(content: $0, completion: .contentProcessed { _ in }) }
+        link.outbox.removeAll()
+        link.failureHandlers.removeAll()
+        let sent = link.sentHandlers
+        link.sentHandlers.removeAll()
+        sent.forEach { $0() }
+
+        if !leftover.isEmpty {
+            handlePeerData(link, leftover)
+        }
+        guard !link.isClosed else { return }
+        receive(on: connection, onData: { [weak self, weak link] data in
+            guard let self, let link else { return }
+            self.handlePeerData(link, data)
+        }, onClose: { [weak self, weak link] _ in
+            guard let self, let link else { return }
+            self.closePeer(link, failed: false)
+        })
+    }
+
     private func closePeer(_ link: PeerLink, failed: Bool) {
         guard !link.isClosed else { return }
         link.isClosed = true
+        if let token = link.indirectToken {
+            pendingIndirectPeers.removeValue(forKey: token)
+            link.indirectToken = nil
+        }
         link.connection?.stateUpdateHandler = nil
         link.connection?.cancel()
+        link.connection = nil
         if peers[link.username] === link { peers[link.username] = nil }
         if failed {
             let handlers = link.failureHandlers
@@ -535,8 +1300,9 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func handlePeerData(_ link: PeerLink, _ data: Data) {
+        link.lastActivity = Date()
         link.frames.append(data)
-        while true {
+        while !link.isClosed {
             let body: Data
             do {
                 guard let next = try link.frames.nextFrame() else { return }
@@ -558,7 +1324,7 @@ public final class SoulseekClient: @unchecked Sendable {
     private func handlePeerMessage(from username: String, _ message: PeerMessage) {
         switch message {
         case let .fileSearchResponse(response):
-            guard activeSearches.contains(response.token) else { return }
+            guard activeSearches[response.token] != nil else { return }
             emit(.searchResponse(response))
 
         case let .transferRequest(direction, token, filename, size):
@@ -590,30 +1356,43 @@ public final class SoulseekClient: @unchecked Sendable {
             let id = DownloadID(username: username, path: filename)
             guard downloads[id] != nil else { return }
             downloads[id]?.state = .failed(reason.isEmpty ? "Denied by peer" : reason)
+            downloads[id]?.sentToPeer = false
+            downloads[id]?.bytesPerSecond = 0
             emitDownload(id)
+            pumpDownloads()
 
         case let .uploadFailed(filename):
             let id = DownloadID(username: username, path: filename)
             guard let record = downloads[id] else { return }
-            if case .completed = record.state { return }
+            switch record.state {
+            case .completed, .paused: return
+            default: break
+            }
             if record.retries < 2 {
                 downloads[id]?.retries += 1
-                downloads[id]?.state = .requesting
+                downloads[id]?.state = .queued(place: nil)
+                downloads[id]?.sentToPeer = false
+                if !stagedDownloadQueue.contains(id) { stagedDownloadQueue.append(id) }
                 emitDownload(id)
-                requestQueuePlace(id)
+                pumpDownloads()
             } else {
                 downloads[id]?.state = .failed("Upload failed on \(username)'s side")
+                downloads[id]?.sentToPeer = false
+                downloads[id]?.bytesPerSecond = 0
                 emitDownload(id)
+                pumpDownloads()
             }
 
         case .sharedFileListRequest:
             sendToPeer(username, [.sharedFileListResponse(folders: sharedFolders())])
 
         case .userInfoRequest:
-            sendToPeer(username, [.userInfoResponse(description: "Seekios (iOS)",
-                                                    totalUploads: completedUploads,
-                                                    queueSize: UInt32(uploadQueue.count),
-                                                    slotsFree: activeUpload == nil)])
+            sendToPeer(username, [.userInfoResponse(
+                description: "Seekios (iOS)",
+                totalUploads: completedUploads,
+                queueSize: UInt32(uploadQueue.count),
+                slotsFree: activeUploads.count < maxConcurrentUploads
+            )])
 
         case let .placeInQueueRequest(filename):
             if let index = uploadQueue.firstIndex(where: { $0.username == username && $0.path == filename }) {
@@ -626,22 +1405,28 @@ public final class SoulseekClient: @unchecked Sendable {
 
         case let .folderContentsResponse(token, _, folders):
             let files = Self.flattenSharedFolders(folders)
-            if let browse = folderBrowses[token], browse.username == username {
-                if !files.isEmpty {
-                    let callback = browse.completion
-                    DispatchQueue.main.async { callback(files) }
-                }
+            if let browse = folderBrowses[token], browse.username.caseInsensitiveCompare(username) == .orderedSame {
+                finishFolderBrowse(token: token, files: files)
             }
 
         case let .sharedFileListResponse(folders):
             let files = Self.flattenSharedFolders(folders)
-            let matchingTokens = folderBrowses.filter { $0.value.username.caseInsensitiveCompare(username) == .orderedSame }.map(\.key)
-            for token in matchingTokens {
-                finishBrowse(token: token, files: files)
-            }
+            finishShareListBrowse(usernameKey: username.lowercased(), files: files)
 
         case .userInfoResponse, .unknown:
             break
+        }
+    }
+
+    private func finishFolderBrowse(token: UInt32, files: [SharedFile]?) {
+        guard let browse = folderBrowses.removeValue(forKey: token) else { return }
+        DispatchQueue.main.async { browse.completion(files) }
+    }
+
+    private func finishShareListBrowse(usernameKey: String, files: [SharedFile]?) {
+        guard let callbacks = shareListBrowses.removeValue(forKey: usernameKey) else { return }
+        DispatchQueue.main.async {
+            for cb in callbacks { cb(files) }
         }
     }
 
@@ -657,20 +1442,67 @@ public final class SoulseekClient: @unchecked Sendable {
         }
     }
 
-    // MARK: - Downloads
+    // MARK: - Downloads & Queue Scheduling
+
+    private func pumpDownloads() {
+        guard isLoggedIn, !stagedDownloadQueue.isEmpty else { return }
+
+        let totalRemoteLimit = max(maxConcurrentDownloads * 4, 16)
+        var totalRemoteActive = downloads.values.filter { record in
+            record.sentToPeer && {
+                switch record.state {
+                case .requesting, .queued, .starting, .transferring: return true
+                default: return false
+                }
+            }()
+        }.count
+
+        var perPeerCount: [String: Int] = [:]
+        for record in downloads.values where record.sentToPeer {
+            switch record.state {
+            case .requesting, .queued, .starting, .transferring:
+                perPeerCount[record.id.username, default: 0] += 1
+            default:
+                break
+            }
+        }
+
+        var remaining: [DownloadID] = []
+        for id in stagedDownloadQueue {
+            guard let record = downloads[id], !record.sentToPeer else { continue }
+            guard case .queued = record.state else { continue }
+            let peerCount = perPeerCount[id.username, default: 0]
+            if totalRemoteActive < totalRemoteLimit && peerCount < maxQueuedPerPeer {
+                totalRemoteActive += 1
+                perPeerCount[id.username] = peerCount + 1
+                downloads[id]?.state = .requesting
+                downloads[id]?.sentToPeer = true
+                emitDownload(id)
+                requestQueuePlace(id)
+            } else {
+                remaining.append(id)
+            }
+        }
+        stagedDownloadQueue = remaining
+    }
 
     private func requestQueuePlace(_ id: DownloadID) {
-        sendToPeer(id.username, [.queueUpload(filename: id.path), .placeInQueueRequest(filename: id.path)],
-                   onSent: { [weak self] in
-                       guard let self, self.downloads[id]?.state == .requesting else { return }
-                       self.downloads[id]?.state = .queued(place: nil)
-                       self.emitDownload(id)
-                   },
-                   onFailure: { [weak self] in
-                       guard let self, self.downloads[id]?.state == .requesting else { return }
-                       self.downloads[id]?.state = .failed("Couldn't connect to \(id.username)")
-                       self.emitDownload(id)
-                   })
+        sendToPeer(
+            id.username,
+            [.queueUpload(filename: id.path), .placeInQueueRequest(filename: id.path)],
+            onSent: { [weak self] in
+                guard let self, self.downloads[id]?.state == .requesting else { return }
+                self.downloads[id]?.state = .queued(place: nil)
+                self.emitDownload(id)
+            },
+            onFailure: { [weak self] in
+                guard let self, self.downloads[id]?.state == .requesting else { return }
+                self.downloads[id]?.state = .failed("Couldn't connect to \(id.username)")
+                self.downloads[id]?.sentToPeer = false
+                self.emitDownload(id)
+                self.pumpDownloads()
+            }
+        )
     }
 
     private func acceptIncomingTransfer(from username: String, token: UInt32, filename: String, size: UInt64?) {
@@ -680,31 +1512,51 @@ public final class SoulseekClient: @unchecked Sendable {
             return
         }
         switch record.state {
-        case .completed, .transferring:
+        case .completed, .transferring, .paused:
             sendToPeer(username, [.transferResponse(token: token, allowed: false, reason: "Cancelled", size: nil)])
             return
+        case .failed:
+            // Only accept late offers if the transfer wasn't manually aborted/paused.
+            break
         default:
             break
+        }
+
+        let activeTransferring = downloads.values.filter {
+            $0.state == .transferring || $0.state == .starting
+        }.count
+        if activeTransferring >= maxConcurrentDownloads {
+            // Politely ask the peer to keep us queued until a download slot frees up.
+            sendToPeer(username, [.transferResponse(token: token, allowed: false, reason: "Queued", size: nil)])
+            return
         }
 
         if let size { record.size = size }
         if let oldToken = record.token { downloadsByToken[tokenKey(username, oldToken)] = nil }
         record.token = token
         record.state = .starting
+        record.sentToPeer = true
         downloads[id] = record
         downloadsByToken[tokenKey(username, token)] = id
         sendToPeer(username, [.transferResponse(token: token, allowed: true, reason: nil, size: nil)])
         emitDownload(id)
 
-        queue.asyncAfter(deadline: .now() + 60) { [weak self] in
+        queue.asyncAfter(deadline: .now() + 45) { [weak self] in
             guard let self, let current = self.downloads[id], current.token == token, current.state == .starting else { return }
+            self.downloadsByToken.removeValue(forKey: self.tokenKey(username, token))
+            self.downloads[id]?.token = nil
+            self.downloads[id]?.sentToPeer = false
             self.downloads[id]?.state = .failed("\(username) never opened the file connection")
             self.emitDownload(id)
+            self.pumpDownloads()
         }
     }
 
     private func openPiercedFile(username: String, ip: String, port: UInt32, token: UInt32) {
-        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: port)) else { return }
+        guard let nwPort = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: port)) else {
+            sendServer(.cantConnectToPeer(token: token, username: username))
+            return
+        }
         let connection = NWConnection(host: NWEndpoint.Host(ip), port: nwPort, using: Self.tcpParameters(timeout: 8))
         let link = FileLink(username: username, connection: connection, role: .awaitingToken)
         fileLinks[ObjectIdentifier(link)] = link
@@ -733,6 +1585,7 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func handleFileData(_ link: FileLink, _ data: Data) {
+        link.lastDataAt = Date()
         switch link.role {
         case .awaitingToken:
             link.pending.append(data)
@@ -774,16 +1627,21 @@ public final class SoulseekClient: @unchecked Sendable {
             link.handle = handle
         } catch {
             record.state = .failed("Can't write file: \(error.localizedDescription)")
+            record.sentToPeer = false
             downloads[id] = record
             emitDownload(id)
             closeFile(link, reason: nil)
+            pumpDownloads()
             return
         }
 
         record.received = offset
         record.state = .transferring
+        record.bytesPerSecond = 0
         downloads[id] = record
         link.role = .downloading(id)
+        link.lastSpeedSampleAt = Date()
+        link.bytesSinceSpeedSample = 0
 
         var writer = ByteWriter()
         writer.u64(offset)
@@ -798,25 +1656,53 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     private func writeChunk(_ data: Data, link: FileLink, id: DownloadID) {
-        guard let handle = link.handle, downloads[id] != nil else {
+        guard let handle = link.handle, let currentRecord = downloads[id] else {
             closeFile(link, reason: nil)
             return
         }
+
+        // Clamp incoming bytes to expected file size so rogue peers cannot corrupt/inflate the file.
+        let chunkToWrite: Data
+        if currentRecord.size > 0 {
+            let remaining = currentRecord.size > currentRecord.received ? currentRecord.size - currentRecord.received : 0
+            if remaining == 0 {
+                finishDownload(link, id: id)
+                return
+            }
+            chunkToWrite = UInt64(data.count) > remaining ? data.prefix(Int(remaining)) : data
+        } else {
+            chunkToWrite = data
+        }
+
         do {
-            try handle.write(contentsOf: data)
+            try handle.write(contentsOf: chunkToWrite)
         } catch {
             downloads[id]?.state = .failed("Write failed: \(error.localizedDescription)")
+            downloads[id]?.sentToPeer = false
+            downloads[id]?.bytesPerSecond = 0
             emitDownload(id)
             closeFile(link, reason: nil)
+            pumpDownloads()
             return
         }
-        downloads[id]?.received += UInt64(data.count)
+
+        downloads[id]?.received += UInt64(chunkToWrite.count)
+        link.bytesSinceSpeedSample += UInt64(chunkToWrite.count)
         guard let record = downloads[id] else { return }
 
         if record.size > 0 && record.received >= record.size {
             finishDownload(link, id: id)
-        } else if Date().timeIntervalSince(link.lastProgress) > 0.3 {
-            link.lastProgress = Date()
+            return
+        }
+
+        let now = Date()
+        let dt = now.timeIntervalSince(link.lastSpeedSampleAt)
+        if dt >= 0.4 {
+            let instant = Double(link.bytesSinceSpeedSample) / dt
+            link.ewmaSpeed = link.ewmaSpeed > 0 ? (link.ewmaSpeed * 0.6 + instant * 0.4) : instant
+            link.bytesSinceSpeedSample = 0
+            link.lastSpeedSampleAt = now
+            downloads[id]?.bytesPerSecond = link.ewmaSpeed
             emitDownload(id)
         }
     }
@@ -829,7 +1715,12 @@ public final class SoulseekClient: @unchecked Sendable {
         link.connection.cancel()
         fileLinks[ObjectIdentifier(link)] = nil
 
-        if let token = downloads[id]?.token { downloadsByToken[tokenKey(id.username, token)] = nil }
+        if let token = downloads[id]?.token {
+            downloadsByToken[tokenKey(id.username, token)] = nil
+            downloads[id]?.token = nil
+        }
+        downloads[id]?.sentToPeer = false
+        downloads[id]?.bytesPerSecond = 0
         do {
             let destination = try moveToLibrary(partialURL(for: id), id: id)
             downloads[id]?.state = .completed(destination)
@@ -838,6 +1729,7 @@ public final class SoulseekClient: @unchecked Sendable {
             downloads[id]?.state = .failed("Couldn't save file: \(error.localizedDescription)")
         }
         emitDownload(id)
+        pumpDownloads()
     }
 
     private func closeFile(_ link: FileLink, reason: String?) {
@@ -853,8 +1745,15 @@ public final class SoulseekClient: @unchecked Sendable {
         case let .downloading(id):
             guard let record = downloads[id], record.state == .transferring else { return }
             let percent = record.size > 0 ? Int(Double(record.received) / Double(record.size) * 100) : 0
+            if let token = record.token {
+                downloadsByToken.removeValue(forKey: tokenKey(id.username, token))
+                downloads[id]?.token = nil
+            }
+            downloads[id]?.sentToPeer = false
+            downloads[id]?.bytesPerSecond = 0
             downloads[id]?.state = .failed("\(reason ?? "Interrupted") at \(percent)%")
             emitDownload(id)
+            pumpDownloads()
         case let .uploading(token):
             finishUpload(token: token, succeeded: link.uploadDone)
         case .awaitingToken:
@@ -897,72 +1796,69 @@ public final class SoulseekClient: @unchecked Sendable {
         return result.isEmpty || result.hasPrefix(".") ? "_" + result : result
     }
 
-    // MARK: - Uploads
+    // MARK: - Uploads (Multi-Slot + Indirect Fallback + Clean EOF Shutdown)
 
     private func enqueueUpload(for username: String, path: String) {
         guard let share = shares[path] else {
             sendToPeer(username, [.uploadDenied(filename: path, reason: "File not shared.")])
             return
         }
-        if activeUpload?.username == username && activeUpload?.path == path { return }
+        if activeUploads.values.contains(where: { $0.username == username && $0.path == path }) { return }
         if uploadQueue.contains(where: { $0.username == username && $0.path == path }) { return }
         uploadQueue.append(UploadJob(username: username, path: path, share: share))
-        emitUpload(username: username, path: path, state: .queued, sent: 0, size: share.size)
-        startNextUpload()
+        emitUpload(username: username, path: path, state: .queued, sent: 0, size: share.size, speed: 0)
+        startNextUploads()
     }
 
-    private func startNextUpload() {
-        guard activeUpload == nil, isLoggedIn, !uploadQueue.isEmpty else { return }
-        var job = uploadQueue.removeFirst()
-        job.token = UInt32.random(in: 1..<UInt32.max)
-        activeUpload = job
-        let token = job.token
+    private func startNextUploads() {
+        while activeUploads.count < maxConcurrentUploads, isLoggedIn, !uploadQueue.isEmpty {
+            var job = uploadQueue.removeFirst()
+            job.token = nextToken()
+            activeUploads[job.token] = job
+            let token = job.token
 
-        sendToPeer(job.username, [.transferRequest(direction: .upload, token: token, filename: job.path, size: job.share.size)],
-                   onFailure: { [weak self] in self?.finishUpload(token: token, succeeded: false) })
+            sendToPeer(
+                job.username,
+                [.transferRequest(direction: .upload, token: token, filename: job.path, size: job.share.size)],
+                onFailure: { [weak self] in self?.finishUpload(token: token, succeeded: false) }
+            )
 
-        queue.asyncAfter(deadline: .now() + 60) { [weak self] in
-            guard let self, let active = self.activeUpload, active.token == token, !active.started else { return }
-            self.finishUpload(token: token, succeeded: false)
+            queue.asyncAfter(deadline: .now() + 45) { [weak self] in
+                guard let self, let active = self.activeUploads[token], !active.started else { return }
+                self.finishUpload(token: token, succeeded: false)
+            }
         }
     }
 
     private func handleUploadResponse(from username: String, token: UInt32, allowed: Bool, reason: String?) {
-        guard let job = activeUpload, job.token == token, job.username == username, !job.started else { return }
+        guard var job = activeUploads[token], job.username == username, !job.started else { return }
         guard allowed else {
             log("\(username) declined upload: \(reason ?? "no reason")")
             finishUpload(token: token, succeeded: false)
             return
         }
-        activeUpload?.started = true
+        job.started = true
+        activeUploads[token] = job
 
         resolveAddress(username) { [weak self] address in
-            guard let self else { return }
+            guard let self, self.activeUploads[token] != nil else { return }
             guard let address, let port = NWEndpoint.Port(rawValue: UInt16(truncatingIfNeeded: address.port)) else {
-                self.finishUpload(token: token, succeeded: false)
+                self.attemptIndirectUploadOrFail(job)
                 return
             }
-            let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 8))
-            let link = FileLink(username: username, connection: connection, role: .uploading(token))
-            self.fileLinks[ObjectIdentifier(link)] = link
-
-            connection.stateUpdateHandler = { [weak self, weak link] state in
-                guard let self, let link, !link.isClosed else { return }
+            let connection = NWConnection(host: NWEndpoint.Host(address.ip), port: port, using: Self.tcpParameters(timeout: 6))
+            connection.stateUpdateHandler = { [weak self] state in
+                guard let self, self.activeUploads[token] != nil else {
+                    connection.cancel()
+                    return
+                }
                 switch state {
                 case .ready:
-                    var writer = ByteWriter()
-                    writer.raw(PeerInitMessage.peerInit(username: self.username, type: "F").frame)
-                    writer.u32(token)
-                    connection.send(content: writer.data, completion: .contentProcessed { _ in })
-                    self.receive(on: connection, onData: { [weak self, weak link] data in
-                        guard let self, let link else { return }
-                        self.handleFileData(link, data)
-                    }, onClose: { [weak self, weak link] _ in
-                        guard let self, let link else { return }
-                        self.closeFile(link, reason: nil)
-                    })
+                    self.attachUploadConnection(job: job, connection: connection, sendPeerInit: true, leftover: Data())
                 case .waiting, .failed:
-                    self.closeFile(link, reason: nil)
+                    connection.stateUpdateHandler = nil
+                    connection.cancel()
+                    self.attemptIndirectUploadOrFail(job)
                 default:
                     break
                 }
@@ -971,12 +1867,61 @@ public final class SoulseekClient: @unchecked Sendable {
         }
     }
 
+    private func attemptIndirectUploadOrFail(_ job: UploadJob) {
+        guard isLoggedIn, activeListenPort > 0, activeUploads[job.token] != nil else {
+            finishUpload(token: job.token, succeeded: false)
+            return
+        }
+        let pierceToken = nextToken()
+        pendingIndirectFiles[pierceToken] = job
+        sendServer(.connectToPeer(token: pierceToken, username: job.username, type: .file))
+        queue.asyncAfter(deadline: .now() + 12) { [weak self] in
+            guard let self, let pending = self.pendingIndirectFiles.removeValue(forKey: pierceToken) else { return }
+            self.finishUpload(token: pending.token, succeeded: false)
+        }
+    }
+
+    private func attachUploadConnection(job: UploadJob, connection: NWConnection, sendPeerInit: Bool, leftover: Data) {
+        let link = FileLink(username: job.username, connection: connection, role: .uploading(job.token))
+        fileLinks[ObjectIdentifier(link)] = link
+
+        connection.stateUpdateHandler = { [weak self, weak link] state in
+            guard let self, let link, !link.isClosed else { return }
+            if case .failed = state {
+                self.closeFile(link, reason: nil)
+            }
+        }
+
+        var writer = ByteWriter()
+        if sendPeerInit {
+            writer.raw(PeerInitMessage.peerInit(username: username, type: "F").frame)
+        }
+        writer.u32(job.token)
+        connection.send(content: writer.data, completion: .contentProcessed { _ in })
+
+        if !leftover.isEmpty {
+            handleFileData(link, leftover)
+        }
+        guard !link.isClosed else { return }
+        receive(on: connection, onData: { [weak self, weak link] data in
+            guard let self, let link else { return }
+            self.handleFileData(link, data)
+        }, onClose: { [weak self, weak link] _ in
+            guard let self, let link else { return }
+            self.closeFile(link, reason: nil)
+        })
+    }
+
     private func handleUploadOffset(_ link: FileLink, _ data: Data) {
         guard link.handle == nil, !link.uploadDone else { return }
+        guard case let .uploading(token) = link.role, let job = activeUploads[token] else {
+            closeFile(link, reason: nil)
+            return
+        }
         link.pending.append(data)
         guard link.pending.count >= 8 else { return }
         var reader = ByteReader(link.pending)
-        guard let offset = try? reader.u64(), let job = activeUpload else { return }
+        guard let offset = try? reader.u64() else { return }
         link.pending = Data()
 
         do {
@@ -985,19 +1930,23 @@ public final class SoulseekClient: @unchecked Sendable {
             try handle.seek(toOffset: start)
             link.handle = handle
             link.sentBytes = start
+            link.lastSpeedSampleAt = Date()
+            link.bytesSinceSpeedSample = 0
         } catch {
             closeFile(link, reason: nil)
             return
         }
-        emitUpload(username: job.username, path: job.path, state: .transferring, sent: link.sentBytes, size: job.share.size)
-        sendNextUploadChunk(link)
+        emitUpload(username: job.username, path: job.path, state: .transferring, sent: link.sentBytes, size: job.share.size, speed: 0)
+        sendNextUploadChunk(link, token: token)
     }
 
-    private func sendNextUploadChunk(_ link: FileLink) {
+    private func sendNextUploadChunk(_ link: FileLink, token: UInt32) {
         guard !link.isClosed, let handle = link.handle else { return }
         let chunk: Data
         do {
-            chunk = try handle.read(upToCount: 64 * 1024) ?? Data()
+            chunk = try autoreleasepool {
+                try handle.read(upToCount: 256 * 1024) ?? Data()
+            }
         } catch {
             closeFile(link, reason: nil)
             return
@@ -1006,36 +1955,64 @@ public final class SoulseekClient: @unchecked Sendable {
             link.uploadDone = true
             try? handle.close()
             link.handle = nil
+            // Flush final FIN and guarantee slot release even if downloader delays closing socket.
+            link.connection.send(content: nil, contentContext: .finalMessage, isComplete: true, completion: .contentProcessed { [weak self, weak link] _ in
+                guard let self, let link else { return }
+                self.queue.asyncAfter(deadline: .now() + 2) { [weak self, weak link] in
+                    guard let self, let link, !link.isClosed else { return }
+                    self.closeFile(link, reason: nil)
+                }
+            })
             return
         }
         link.connection.send(content: chunk, completion: .contentProcessed { [weak self, weak link] error in
-            guard let self, let link else { return }
+            guard let self, let link, !link.isClosed else { return }
             if error != nil {
                 self.closeFile(link, reason: nil)
             } else {
                 link.sentBytes += UInt64(chunk.count)
-                if Date().timeIntervalSince(link.lastProgress) > 0.5, let job = self.activeUpload {
-                    link.lastProgress = Date()
-                    self.emitUpload(username: job.username, path: job.path, state: .transferring,
-                                    sent: link.sentBytes, size: job.share.size)
+                link.bytesSinceSpeedSample += UInt64(chunk.count)
+                let now = Date()
+                let dt = now.timeIntervalSince(link.lastSpeedSampleAt)
+                if dt >= 0.5, let job = self.activeUploads[token] {
+                    let instant = Double(link.bytesSinceSpeedSample) / dt
+                    link.ewmaSpeed = link.ewmaSpeed > 0 ? (link.ewmaSpeed * 0.6 + instant * 0.4) : instant
+                    link.bytesSinceSpeedSample = 0
+                    link.lastSpeedSampleAt = now
+                    if link.ewmaSpeed > 0 {
+                        self.averageUploadSpeed = UInt32(min(link.ewmaSpeed, Double(UInt32.max)))
+                    }
+                    self.emitUpload(
+                        username: job.username,
+                        path: job.path,
+                        state: .transferring,
+                        sent: link.sentBytes,
+                        size: job.share.size,
+                        speed: link.ewmaSpeed
+                    )
                 }
-                self.sendNextUploadChunk(link)
+                self.sendNextUploadChunk(link, token: token)
             }
         })
     }
 
     private func finishUpload(token: UInt32, succeeded: Bool) {
-        guard let job = activeUpload, job.token == token else { return }
-        emitUpload(username: job.username, path: job.path, state: succeeded ? .completed : .failed,
-                   sent: succeeded ? job.share.size : 0, size: job.share.size)
+        guard let job = activeUploads.removeValue(forKey: token) else { return }
+        emitUpload(
+            username: job.username,
+            path: job.path,
+            state: succeeded ? .completed : .failed,
+            sent: succeeded ? job.share.size : 0,
+            size: job.share.size,
+            speed: 0
+        )
         if succeeded {
             completedUploads += 1
             log("Uploaded \(job.path) to \(job.username)")
         } else if job.started && isLoggedIn {
             sendToPeer(job.username, [.uploadFailed(filename: job.path)])
         }
-        activeUpload = nil
-        startNextUpload()
+        startNextUploads()
     }
 
     private func sharedFolders() -> [SharedFolder] {
@@ -1053,6 +2030,10 @@ public final class SoulseekClient: @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    private func nextToken() -> UInt32 {
+        UInt32.random(in: 1..<UInt32.max)
+    }
 
     private func receive(on connection: NWConnection, onData: @escaping (Data) -> Void, onClose: @escaping (NWError?) -> Void) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
@@ -1076,13 +2057,13 @@ public final class SoulseekClient: @unchecked Sendable {
 
     private func tokenKey(_ username: String, _ token: UInt32) -> String { "\(username)|\(token)" }
 
-    private func emitUpload(username: String, path: String, state: UploadState, sent: UInt64, size: UInt64) {
-        emit(.upload(UploadUpdate(id: DownloadID(username: username, path: path), state: state, sent: sent, size: size)))
+    private func emitUpload(username: String, path: String, state: UploadState, sent: UInt64, size: UInt64, speed: Double) {
+        emit(.upload(UploadUpdate(id: DownloadID(username: username, path: path), state: state, sent: sent, size: size, bytesPerSecond: speed)))
     }
 
     private func emitDownload(_ id: DownloadID) {
         guard let record = downloads[id] else { return }
-        emit(.download(DownloadUpdate(id: id, state: record.state, received: record.received, size: record.size)))
+        emit(.download(DownloadUpdate(id: id, state: record.state, received: record.received, size: record.size, bytesPerSecond: record.bytesPerSecond)))
     }
 
     private func log(_ message: String) { emit(.log(message)) }
@@ -1098,12 +2079,34 @@ private struct PeerAddress {
     let port: UInt32
 }
 
+private struct CachedAddress {
+    let address: PeerAddress
+    let cachedAt: Date
+}
+
+private final class IncomingConnection {
+    let connection: NWConnection
+    var frames = FrameBuffer()
+
+    init(connection: NWConnection) {
+        self.connection = connection
+    }
+
+    func cancel() {
+        connection.stateUpdateHandler = nil
+        connection.cancel()
+    }
+}
+
 private final class PeerLink {
     let username: String
     var connection: NWConnection?
     var frames = FrameBuffer()
     var isReady = false
     var isClosed = false
+    var triedIndirect = false
+    var indirectToken: UInt32?
+    var lastActivity = Date()
     var outbox: [Data] = []
     var sentHandlers: [() -> Void] = []
     var failureHandlers: [() -> Void] = []
@@ -1128,7 +2131,10 @@ private final class FileLink {
     var isClosed = false
     var uploadDone = false
     var sentBytes: UInt64 = 0
-    var lastProgress = Date.distantPast
+    var lastDataAt = Date()
+    var lastSpeedSampleAt = Date()
+    var bytesSinceSpeedSample: UInt64 = 0
+    var ewmaSpeed: Double = 0
 
     init(username: String, connection: NWConnection, role: Role) {
         self.username = username
@@ -1145,6 +2151,8 @@ private struct DownloadRecord {
     var token: UInt32?
     var retries = 0
     var folderName: String?
+    var sentToPeer = false
+    var bytesPerSecond: Double = 0
 }
 
 private struct FolderBrowse {

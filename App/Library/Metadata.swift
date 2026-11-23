@@ -2,7 +2,7 @@ import AVFoundation
 import Foundation
 
 /// Tags we care about, cached per file so rescans don't reopen every track.
-struct TrackInfo: Codable, Equatable {
+struct TrackInfo: Codable, Equatable, Sendable {
     var title: String?
     var artist: String?
     var albumArtist: String?
@@ -41,14 +41,15 @@ enum MetadataReader {
         let parsed = parseFilename(url.deletingPathExtension().lastPathComponent)
         if info.title?.isEmpty ?? true { info.title = parsed.title }
         if info.trackNumber == nil { info.trackNumber = parsed.number }
+        if info.discNumber == nil { info.discNumber = parsed.disc }
         return info
     }
 
     private static func readWithAVFoundation(url: URL) async -> TrackInfo {
         var info = TrackInfo()
         let asset = AVURLAsset(url: url)
-        if let duration = try? await asset.load(.duration), duration.isNumeric {
-            info.duration = duration.seconds
+        if let duration = try? await asset.load(.duration), duration.isNumeric, duration.seconds.isFinite {
+            info.duration = max(0, duration.seconds)
         }
 
         let formatItems = (try? await asset.load(.metadata)) ?? []
@@ -56,10 +57,12 @@ enum MetadataReader {
         let items = formatItems + commonItems
 
         func string(_ identifiers: [AVMetadataIdentifier]) async -> String? {
-            for item in items {
-                guard let identifier = item.identifier, identifiers.contains(identifier) else { continue }
-                if let value = try? await item.load(.stringValue), !value.trimmingCharacters(in: .whitespaces).isEmpty {
-                    return value.trimmingCharacters(in: .whitespacesAndNewlines)
+            for identifier in identifiers {
+                for item in items where item.identifier == identifier {
+                    if let value = try? await item.load(.stringValue),
+                       !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
                 }
             }
             return nil
@@ -67,14 +70,15 @@ enum MetadataReader {
 
         /// ID3 stores "3/12" as text; iTunes "trkn"/"disk" are 8 bytes with the number at offset 2.
         func number(_ identifiers: [AVMetadataIdentifier]) async -> Int? {
-            for item in items {
-                guard let identifier = item.identifier, identifiers.contains(identifier) else { continue }
-                if let text = try? await item.load(.stringValue), let value = leadingNumber(text) { return value }
-                if let value = try? await item.load(.numberValue), value.intValue > 0 { return value.intValue }
-                if let data = try? await item.load(.dataValue), data.count >= 4 {
-                    let bytes = [UInt8](data)
-                    let value = Int(bytes[2]) << 8 | Int(bytes[3])
-                    if value > 0 { return value }
+            for identifier in identifiers {
+                for item in items where item.identifier == identifier {
+                    if let text = try? await item.load(.stringValue), let value = leadingNumber(text) { return value }
+                    if let value = try? await item.load(.numberValue), value.intValue > 0 { return value.intValue }
+                    if let data = try? await item.load(.dataValue), data.count >= 4 {
+                        let bytes = [UInt8](data)
+                        let value = Int(bytes[2]) << 8 | Int(bytes[3])
+                        if value > 0 { return value }
+                    }
                 }
             }
             return nil
@@ -112,7 +116,9 @@ enum MetadataReader {
 
     static func embeddedArtwork(url: URL) async -> Data? {
         if url.pathExtension.lowercased() == "flac" {
-            return FLACReader.read(url: url, wantPicture: true)?.picture
+            return await Task.detached(priority: .userInitiated) {
+                FLACReader.read(url: url, wantPicture: true)?.picture
+            }.value
         }
         let asset = AVURLAsset(url: url)
         let formatItems = (try? await asset.load(.metadata)) ?? []
@@ -128,43 +134,46 @@ enum MetadataReader {
 
     static func leadingNumber(_ text: String?) -> Int? {
         guard let text else { return nil }
-        let digits = text.trimmingCharacters(in: .whitespaces).prefix { $0.isNumber }
+        let digits = text.trimmingCharacters(in: .whitespaces).prefix { $0.isASCII && $0.isNumber }
         guard let value = Int(digits), value > 0 else { return nil }
         return value
     }
 
-    static func parseFilename(_ name: String) -> (number: Int?, title: String) {
+    static func parseFilename(_ name: String) -> (disc: Int?, number: Int?, title: String) {
         var rest = Substring(name)
+        var disc: Int?
         var number: Int?
-        let digits = rest.prefix { $0.isNumber }
+        let digits = rest.prefix { $0.isASCII && $0.isNumber }
         if !digits.isEmpty, digits.count <= 3 {
             var after = rest.dropFirst(digits.count)
             // "1-03 Title": disc-track
-            let trackDigits = after.first == "-" ? after.dropFirst().prefix(while: { $0.isNumber }) : Substring()
-            if !trackDigits.isEmpty {
-                number = Int(trackDigits)
+            let trackDigits = after.first == "-" ? after.dropFirst().prefix(while: { $0.isASCII && $0.isNumber }) : Substring()
+            if !trackDigits.isEmpty, trackDigits.count <= 4, let parsedTrack = Int(trackDigits) {
+                disc = Int(digits)
+                number = parsedTrack
                 after = after.dropFirst(1 + trackDigits.count)
-            } else {
-                number = Int(digits)
+            } else if let parsedNumber = Int(digits) {
+                number = parsedNumber
             }
             let separators: Set<Character> = [" ", ".", "-", "_", ")"]
             let trimmed = after.drop { separators.contains($0) }
             let startsWithSeparator = after.first.map { separators.contains($0) } ?? false
-            if !trimmed.isEmpty, startsWithSeparator {
+            if number != nil, !trimmed.isEmpty, startsWithSeparator {
                 rest = trimmed
             } else {
+                disc = nil
                 number = nil
             }
         }
         let title = rest.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
-        return (number, title.isEmpty ? name : title)
+        return (disc, number, title.isEmpty ? name : title)
     }
 }
 
 /// Minimal FLAC metadata reader: STREAMINFO, Vorbis comments and the front-cover PICTURE block.
-/// AVFoundation plays FLAC fine but doesn't reliably expose its tags.
+/// Supports FLAC files with prepended ID3v2 headers (common on Soulseek).
 enum FLACReader {
-    struct Result {
+    struct Result: Sendable {
         var tags: [String: String] = [:]
         var duration: Double = 0
         var channels = 2
@@ -175,10 +184,26 @@ enum FLACReader {
     static func read(url: URL, wantPicture: Bool) -> Result? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
         defer { try? handle.close() }
-        guard let magic = try? handle.read(upToCount: 4), magic == Data("fLaC".utf8) else { return nil }
+        guard let head = try? handle.read(upToCount: 4), head.count == 4 else { return nil }
+
+        // Skip optional prepended ID3v2 header before "fLaC".
+        if head.prefix(3) == Data("ID3".utf8) {
+            guard let id3Rest = try? handle.read(upToCount: 6), id3Rest.count == 6 else { return nil }
+            let flags = id3Rest[1]
+            let size = (Int(id3Rest[2] & 0x7F) << 21)
+                | (Int(id3Rest[3] & 0x7F) << 14)
+                | (Int(id3Rest[4] & 0x7F) << 7)
+                | Int(id3Rest[5] & 0x7F)
+            let footerSize = (flags & 0x10) != 0 ? 10 : 0
+            let flacOffset = UInt64(10 + size + footerSize)
+            guard (try? handle.seek(toOffset: flacOffset)) != nil,
+                  let magic = try? handle.read(upToCount: 4), magic == Data("fLaC".utf8) else { return nil }
+        } else if head != Data("fLaC".utf8) {
+            return nil
+        }
 
         var result = Result()
-        var bestPictureType: UInt32 = .max
+        var bestPictureRank: UInt64 = .max
         while true {
             guard let header = try? handle.read(upToCount: 4), header.count == 4 else { break }
             let bytes = [UInt8](header)
@@ -194,11 +219,11 @@ enum FLACReader {
                 result.hasPicture = true
                 if wantPicture {
                     guard let block = try? handle.read(upToCount: length), block.count == length else { return result }
-                    if let picture = parsePicture([UInt8](block)) {
-                        // Type 3 is "front cover"; otherwise keep the first picture.
-                        let rank: UInt32 = picture.type == 3 ? 0 : picture.type + 1
-                        if rank < bestPictureType {
-                            bestPictureType = rank
+                    if let picture = parsePicture(block) {
+                        // Type 3 is "front cover"; widen to UInt64 to avoid UInt32.max + 1 overflow.
+                        let rank: UInt64 = picture.type == 3 ? 0 : UInt64(picture.type) + 1
+                        if rank < bestPictureRank {
+                            bestPictureRank = rank
                             result.picture = picture.data
                         }
                     }
@@ -220,7 +245,6 @@ enum FLACReader {
 
     private static func parseStreamInfo(_ block: [UInt8], into result: inout Result) {
         guard block.count >= 18 else { return }
-        // Bytes 10...17: 20 bits sample rate, 3 bits channels-1, 5 bits bps-1, 36 bits total samples.
         let sampleRate = Int(block[10]) << 12 | Int(block[11]) << 4 | Int(block[12]) >> 4
         result.channels = Int((block[12] >> 1) & 0x07) + 1
         var totalSamples = UInt64(block[13] & 0x0F)
@@ -236,9 +260,9 @@ enum FLACReader {
             offset += 4
             return value
         }
-        guard let vendorLength = u32(), offset + vendorLength <= block.count else { return }
+        guard let vendorLength = u32(), vendorLength >= 0, offset + vendorLength <= block.count else { return }
         offset += vendorLength
-        guard let count = u32() else { return }
+        guard let count = u32(), count >= 0 else { return }
         for _ in 0..<count {
             guard let length = u32(), length >= 0, offset + length <= block.count else { return }
             let comment = String(decoding: block[offset..<(offset + length)], as: UTF8.self)
@@ -250,20 +274,27 @@ enum FLACReader {
         }
     }
 
-    private static func parsePicture(_ block: [UInt8]) -> (type: UInt32, data: Data)? {
+    /// Parses directly from Data without copying the entire picture block into `[UInt8]`.
+    private static func parsePicture(_ block: Data) -> (type: UInt32, data: Data)? {
+        let base = block.startIndex
         var offset = 0
-        func u32() -> Int? {
+        func u32() -> UInt32? {
             guard offset + 4 <= block.count else { return nil }
-            let value = Int(block[offset]) << 24 | Int(block[offset + 1]) << 16 | Int(block[offset + 2]) << 8 | Int(block[offset + 3])
+            let value = (UInt32(block[base + offset]) << 24)
+                | (UInt32(block[base + offset + 1]) << 16)
+                | (UInt32(block[base + offset + 2]) << 8)
+                | UInt32(block[base + offset + 3])
             offset += 4
             return value
         }
         guard let type = u32(), let mimeLength = u32() else { return nil }
-        offset += mimeLength
-        guard let descriptionLength = u32() else { return nil }
-        offset += descriptionLength
+        offset += Int(mimeLength)
+        guard offset <= block.count, let descriptionLength = u32() else { return nil }
+        offset += Int(descriptionLength)
         offset += 16  // width, height, depth, colours
-        guard let dataLength = u32(), offset + dataLength <= block.count, dataLength > 0 else { return nil }
-        return (type: UInt32(truncatingIfNeeded: type), data: Data(block[offset..<(offset + dataLength)]))
+        guard offset <= block.count, let dataLength = u32() else { return nil }
+        let len = Int(dataLength)
+        guard len > 0, offset + len <= block.count else { return nil }
+        return (type: type, data: Data(block[(base + offset)..<(base + offset + len)]))
     }
 }

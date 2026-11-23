@@ -1,10 +1,11 @@
 import Foundation
+import UIKit
 
 /// Listening and sharing statistics, kept on the phone only (stats.json in Application Support).
 /// Listening time is counted while audio actually plays, so seeking doesn't inflate it.
 @MainActor
 final class StatsStore: ObservableObject {
-    struct TrackStat: Codable {
+    struct TrackStat: Codable, Sendable {
         var plays: Int
         var seconds: Double
         var lastPlayed: Date?
@@ -12,9 +13,10 @@ final class StatsStore: ObservableObject {
         var title: String
         var artist: String
         var album: String?
+        var albumArtist: String?
     }
 
-    struct Totals: Codable {
+    struct Totals: Codable, Sendable {
         var downloadedBytes: UInt64 = 0
         var downloadedFiles = 0
         var uploadedBytes: UInt64 = 0
@@ -23,7 +25,7 @@ final class StatsStore: ObservableObject {
         var since = Date()
     }
 
-    private struct Stored: Codable {
+    private struct Stored: Codable, Sendable {
         var tracks: [String: TrackStat] = [:]
         /// "yyyy-MM-dd" → seconds listened that day.
         var days: [String: Double] = [:]
@@ -31,11 +33,11 @@ final class StatsStore: ObservableObject {
     }
 
     struct Ranked: Identifiable {
+        let id: String
         let name: String
         let detail: String
         let plays: Int
         let seconds: Double
-        var id: String { name + "|" + detail }
     }
 
     struct DayTotal: Identifiable {
@@ -52,9 +54,11 @@ final class StatsStore: ObservableObject {
     @Published private(set) var sessionDownloadedBytes: UInt64 = 0
 
     private var stored = Stored()
-    private var saveScheduled = false
-    private let fileURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("stats.json")
+    private var pendingSaveTask: Task<Void, Never>?
+    private let saveQueue = DispatchQueue(label: "seekios.stats")
+    private let fileURL = AppDirectories.applicationSupport.appendingPathComponent("stats.json")
+    private var cachedDayStart = Date.distantPast
+    private var cachedDayKey = ""
 
     private static let dayFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -64,7 +68,8 @@ final class StatsStore: ObservableObject {
     }()
 
     init() {
-        if let data = try? Data(contentsOf: fileURL), let decoded = try? JSONDecoder().decode(Stored.self, from: data) {
+        if let data = try? Data(contentsOf: fileURL),
+           let decoded = try? JSONDecoder().decode(Stored.self, from: data) {
             stored = decoded
         }
     }
@@ -72,8 +77,9 @@ final class StatsStore: ObservableObject {
     // MARK: Recording
 
     func addListening(_ track: Track, album: String?, seconds: Double) {
+        guard seconds.isFinite, seconds > 0 else { return }
         update(track, album: album) { $0.seconds += seconds }
-        stored.days[Self.dayFormatter.string(from: Date()), default: 0] += seconds
+        stored.days[todayKey(), default: 0] += seconds
         scheduleSave()
     }
 
@@ -96,23 +102,42 @@ final class StatsStore: ObservableObject {
     func recordUpload(bytes: UInt64, to username: String) {
         stored.totals.uploadedBytes += bytes
         stored.totals.uploadedFiles += 1
-        stored.totals.peers.insert(username)
+        if stored.totals.peers.count < 5_000 {
+            stored.totals.peers.insert(username)
+        }
         sessionUploadedBytes += bytes
         sessionUploadedFiles += 1
         scheduleSave()
     }
 
     func reset() {
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
         stored = Stored()
+        sessionUploadedBytes = 0
+        sessionUploadedFiles = 0
+        sessionDownloadedBytes = 0
         save()
+    }
+
+    private func todayKey() -> String {
+        let now = Date()
+        let dayStart = Calendar.current.startOfDay(for: now)
+        if dayStart != cachedDayStart || cachedDayKey.isEmpty {
+            cachedDayStart = dayStart
+            cachedDayKey = Self.dayFormatter.string(from: dayStart)
+        }
+        return cachedDayKey
     }
 
     private func update(_ track: Track, album: String?, _ change: (inout TrackStat) -> Void) {
         var stat = stored.tracks[track.id]
-            ?? TrackStat(plays: 0, seconds: 0, lastPlayed: nil, title: track.title, artist: track.artist, album: album)
+            ?? TrackStat(plays: 0, seconds: 0, lastPlayed: nil, title: track.title, artist: track.artist,
+                         album: album, albumArtist: track.albumArtist)
         stat.title = track.title
         stat.artist = track.artist
         stat.album = album ?? stat.album
+        stat.albumArtist = track.albumArtist ?? stat.albumArtist
         change(&stat)
         stored.tracks[track.id] = stat
     }
@@ -134,11 +159,13 @@ final class StatsStore: ObservableObject {
     }
 
     func topSongs(limit: Int) -> [Ranked] {
-        stored.tracks.values
-            .filter { $0.plays > 0 }
-            .sorted { ($0.plays, $0.seconds) > ($1.plays, $1.seconds) }
+        stored.tracks
+            .filter { $0.value.plays > 0 }
+            .sorted { ($0.value.plays, $0.value.seconds) > ($1.value.plays, $1.value.seconds) }
             .prefix(limit)
-            .map { Ranked(name: $0.title, detail: $0.artist, plays: $0.plays, seconds: $0.seconds) }
+            .map { id, stat in
+                Ranked(id: id, name: stat.title, detail: stat.artist, plays: stat.plays, seconds: stat.seconds)
+            }
     }
 
     func topArtists(limit: Int) -> [Ranked] {
@@ -151,7 +178,7 @@ final class StatsStore: ObservableObject {
         return seconds.keys
             .sorted { (seconds[$0] ?? 0) > (seconds[$1] ?? 0) }
             .prefix(limit)
-            .map { Ranked(name: $0, detail: "", plays: plays[$0] ?? 0, seconds: seconds[$0] ?? 0) }
+            .map { Ranked(id: "artist:\($0)", name: $0, detail: "", plays: plays[$0] ?? 0, seconds: seconds[$0] ?? 0) }
     }
 
     func topAlbums(limit: Int) -> [Ranked] {
@@ -160,14 +187,15 @@ final class StatsStore: ObservableObject {
         var seconds: [Key: Double] = [:]
         for stat in stored.tracks.values {
             guard let album = stat.album, !album.isEmpty else { continue }
-            let key = Key(album: album, artist: stat.artist)
+            let owner = stat.albumArtist ?? stat.artist
+            let key = Key(album: album, artist: owner)
             plays[key, default: 0] += stat.plays
             seconds[key, default: 0] += stat.seconds
         }
         return seconds.keys
             .sorted { (seconds[$0] ?? 0) > (seconds[$1] ?? 0) }
             .prefix(limit)
-            .map { Ranked(name: $0.album, detail: $0.artist, plays: plays[$0] ?? 0, seconds: seconds[$0] ?? 0) }
+            .map { Ranked(id: "album:\($0.artist)|\($0.album)", name: $0.album, detail: $0.artist, plays: plays[$0] ?? 0, seconds: seconds[$0] ?? 0) }
     }
 
     /// Listening per day for the last `count` days, oldest first, including zero days.
@@ -187,21 +215,43 @@ final class StatsStore: ObservableObject {
     // MARK: Saving
 
     private func scheduleSave() {
-        guard !saveScheduled else { return }
-        saveScheduled = true
-        Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 20_000_000_000)
-            self?.save()
+        guard pendingSaveTask == nil else { return }
+        pendingSaveTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 20_000_000_000)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.pendingSaveTask = nil
+            self.save()
         }
     }
 
-    /// Also called when the app goes to the background.
+    /// Also called when the app goes to the background; protected with a UIKit background task assertion.
     func save() {
-        saveScheduled = false
+        pendingSaveTask?.cancel()
+        pendingSaveTask = nil
         revision += 1
         let snapshot = stored
         let url = fileURL
-        Task.detached(priority: .background) {
+
+        var bgTaskID: UIBackgroundTaskIdentifier = .invalid
+        bgTaskID = UIApplication.shared.beginBackgroundTask(withName: "SeekiosStatsSave") {
+            UIApplication.shared.endBackgroundTask(bgTaskID)
+            bgTaskID = .invalid
+        }
+
+        saveQueue.async {
+            defer {
+                if bgTaskID != .invalid {
+                    let ended = bgTaskID
+                    DispatchQueue.main.async {
+                        UIApplication.shared.endBackgroundTask(ended)
+                    }
+                }
+            }
+            AppDirectories.ensureParentDirectory(for: url)
             if let data = try? JSONEncoder().encode(snapshot) {
                 try? data.write(to: url, options: .atomic)
             }

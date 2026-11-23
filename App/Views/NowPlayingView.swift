@@ -15,6 +15,7 @@ struct NowPlayingView: View {
     @EnvironmentObject private var router: AppRouter
     @State private var mode: Mode = .artwork
     @State private var showEqualizer = false
+    @State private var hasLocalLyrics = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -40,7 +41,7 @@ struct NowPlayingView: View {
                     QueueView()
                         .padding(.horizontal, -28)
                 }
-                ScrubBar()
+                ScrubBar(equalizer: player.equalizer)
                     .padding(.top, mode == .artwork ? 0 : 8)
                 transport
                     .padding(.vertical, 22)
@@ -61,10 +62,17 @@ struct NowPlayingView: View {
         .presentationDragIndicator(.hidden)
         .presentationBackground(.black)
         .sheet(isPresented: $showEqualizer) {
-            NavigationStack { EqualizerView(equalizer: player.equalizer) }
+            NavigationStack { EqualizerView(equalizer: player.equalizer, showDone: true) }
                 .presentationDetents([.medium, .large])
         }
         .animation(.spring(response: 0.4, dampingFraction: 0.85), value: mode)
+        .task(id: "\(player.current?.id ?? "")#\(router.lyricsRevision)") {
+            guard let track = player.current else { hasLocalLyrics = false; return }
+            let url = LibraryStore.lyricsURL(for: track)
+            hasLocalLyrics = await Task.detached(priority: .utility) {
+                FileManager.default.fileExists(atPath: url.path)
+            }.value
+        }
     }
 
     private var largeArtwork: some View {
@@ -152,9 +160,10 @@ struct NowPlayingView: View {
             } label: {
                 Label("Import Lyrics (.lrc)…", systemImage: "doc.text")
             }
-            if FileManager.default.fileExists(atPath: LibraryStore.lyricsURL(for: track).path) {
+            if hasLocalLyrics {
                 Button(role: .destructive) {
                     library.removeLyricsFile(for: track)
+                    hasLocalLyrics = false
                     router.lyricsChanged()
                 } label: {
                     Label("Remove Lyrics File", systemImage: "doc.badge.minus")
@@ -250,6 +259,7 @@ struct PlayerBackground: View {
                         .clipped()
                         .blur(radius: 70, opaque: true)
                         .saturation(1.4)
+                        .drawingGroup()
                         .transition(.opacity)
                 }
                 LinearGradient(colors: [.black.opacity(0.15), .black.opacity(0.45)], startPoint: .top, endPoint: .bottom)
@@ -262,6 +272,7 @@ struct PlayerBackground: View {
 
 /// Thin progress bar that grows while dragging, with elapsed / remaining times and format badges.
 struct ScrubBar: View {
+    @ObservedObject var equalizer: Equalizer
     @EnvironmentObject private var player: Player
     @EnvironmentObject private var clock: PlaybackClock
     @State private var dragValue: Double?
@@ -322,7 +333,7 @@ struct ScrubBar: View {
                 .lineLimit(1)
         } else if let ext = player.current?.fileExtension, ["flac", "alac", "wav", "aif", "aiff"].contains(ext) {
             Label("Lossless", systemImage: "waveform").font(.caption2.weight(.semibold))
-        } else if player.equalizer.isEnabled {
+        } else if equalizer.isEnabled {
             Label("EQ", systemImage: "slider.vertical.3").font(.caption2.weight(.semibold))
         }
     }
@@ -339,7 +350,7 @@ struct VolumeRow: View {
     }
 }
 
-/// The system volume slider (MPVolumeView), restyled to match.
+/// The system volume slider (MPVolumeView), restyled once on creation.
 struct SystemVolumeSlider: UIViewRepresentable {
     func makeUIView(context: Context) -> MPVolumeView {
         let view = MPVolumeView(frame: .zero)
@@ -348,9 +359,7 @@ struct SystemVolumeSlider: UIViewRepresentable {
         return view
     }
 
-    func updateUIView(_ view: MPVolumeView, context: Context) {
-        style(view)
-    }
+    func updateUIView(_ view: MPVolumeView, context: Context) {}
 
     private func style(_ view: MPVolumeView) {
         for case let slider as UISlider in view.subviews {
@@ -384,12 +393,22 @@ struct AirPlayButton: UIViewRepresentable {
 struct QueueView: View {
     @EnvironmentObject private var player: Player
     @EnvironmentObject private var library: LibraryStore
+    @State private var editMode: EditMode = .inactive
 
     var body: some View {
+        let upcoming = Array(player.upNextEntries)
         VStack(spacing: 10) {
             HStack {
                 Text("Up Next").font(.headline)
                 Spacer()
+                if !upcoming.isEmpty {
+                    Button(editMode == .active ? "Done" : "Edit") {
+                        withAnimation { editMode = (editMode == .active) ? .inactive : .active }
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .padding(.trailing, 4)
+                }
                 toggle(symbol: "shuffle", active: player.shuffle) { player.toggleShuffle() }
                 toggle(symbol: player.repeatMode == .one ? "repeat.1" : "repeat", active: player.repeatMode != .off) {
                     player.cycleRepeat()
@@ -397,22 +416,24 @@ struct QueueView: View {
             }
             .padding(.horizontal, 28)
 
-            if player.upNext.isEmpty {
+            if upcoming.isEmpty {
                 Spacer()
                 Text(player.repeatMode == .all ? "The queue will repeat." : "Nothing else queued.")
                     .foregroundStyle(.white.opacity(0.6))
                 Spacer()
             } else {
                 List {
-                    ForEach(Array(player.upNext.enumerated()), id: \.offset) { offset, track in
+                    ForEach(upcoming) { entry in
                         Button {
-                            player.jump(to: player.index + 1 + offset)
+                            if let offset = upcoming.firstIndex(where: { $0.id == entry.id }) {
+                                player.jump(to: player.index + 1 + offset)
+                            }
                         } label: {
                             HStack(spacing: 12) {
-                                ArtworkView(source: library.artwork(for: track), size: 44, cornerRadius: 5)
+                                ArtworkView(source: library.artwork(for: entry.track), size: 44, cornerRadius: 5)
                                 VStack(alignment: .leading, spacing: 2) {
-                                    Text(track.title).lineLimit(1)
-                                    Text(track.artist).font(.subheadline).foregroundStyle(.white.opacity(0.6)).lineLimit(1)
+                                    Text(entry.track.title).lineLimit(1)
+                                    Text(entry.track.artist).font(.subheadline).foregroundStyle(.white.opacity(0.6)).lineLimit(1)
                                 }
                                 Spacer()
                             }
@@ -427,7 +448,7 @@ struct QueueView: View {
                 }
                 .listStyle(.plain)
                 .scrollContentBackground(.hidden)
-                .environment(\.editMode, .constant(.active))
+                .environment(\.editMode, $editMode)
                 .mask(LinearGradient(stops: [.init(color: .black, location: 0), .init(color: .black, location: 0.92),
                                              .init(color: .clear, location: 1)], startPoint: .top, endPoint: .bottom))
             }

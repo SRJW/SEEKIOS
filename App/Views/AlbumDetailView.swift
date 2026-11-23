@@ -49,8 +49,8 @@ struct AlbumDetailView: View {
 
     private func discs(_ album: Album) -> [Disc] {
         var rows: [Int: [Row]] = [:]
-        for disc in Set(album.tracks.map { $0.discNumber ?? 1 }) {
-            let tracks = album.tracks.filter { ($0.discNumber ?? 1) == disc }
+        let grouped = Dictionary(grouping: album.tracks) { $0.discNumber ?? 1 }
+        for (disc, tracks) in grouped {
             rows[disc] = tracks.enumerated().map { offset, track in Row.track(track, number: track.trackNumber ?? offset + 1) }
         }
         for entry in missing { rows[entry.disc, default: []].append(.missing(entry)) }
@@ -85,7 +85,7 @@ struct AlbumDetailView: View {
                 }
                 HStack(spacing: 6) {
                     Text(details(album))
-                    if album.tracks.allSatisfy({ ["flac", "alac", "wav", "aif", "aiff"].contains($0.fileExtension) }) {
+                    if !album.tracks.isEmpty && album.tracks.allSatisfy({ ["flac", "alac", "wav", "aif", "aiff"].contains($0.fileExtension) }) {
                         BadgeLabel(text: "Lossless", systemImage: "waveform")
                     }
                     if album.isSpatial {
@@ -124,7 +124,9 @@ struct AlbumDetailView: View {
                         switch row {
                         case let .track(track, number):
                             Button {
-                                if let index = album.tracks.firstIndex(of: track) { player.play(album.tracks, startAt: index) }
+                                if let index = album.tracks.firstIndex(where: { $0.id == track.id }) {
+                                    player.play(album.tracks, startAt: index)
+                                }
                             } label: {
                                 TrackRow(track: track, number: number, showArtwork: false,
                                          subtitle: track.artist != album.artist ? track.artist : nil)
@@ -147,7 +149,7 @@ struct AlbumDetailView: View {
             .padding(.top, 16)
             .task(id: "\(album.id)#\(album.tracks.count)") { completeness.refresh(album) }
 
-            Text("\(album.tracks.count) song\(album.tracks.count == 1 ? "" : "s"), \(minutes(album.duration))")
+            Text("\(album.tracks.count) song\(album.tracks.count == 1 ? "" : "s"), \(Formatting.longDuration(album.duration))")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -182,7 +184,6 @@ struct AlbumDetailView: View {
                 .presentationDetents([.medium, .large])
         }
         .confirmDelete($pendingDelete) { deleted in
-            // Leave the page once the whole album is gone.
             let remaining = Set(album.tracks.map(\.id)).subtracting(deleted.map(\.id))
             if remaining.isEmpty { dismiss() }
         }
@@ -221,13 +222,8 @@ struct AlbumDetailView: View {
         let missingCount = missing.count
         let songs = missingCount > 0
             ? "\(album.tracks.count) of \(album.tracks.count + missingCount) songs"
-            : "\(album.tracks.count) songs"
+            : "\(album.tracks.count) song\(album.tracks.count == 1 ? "" : "s")"
         return [album.year.map(String.init), songs].compactMap { $0 }.joined(separator: " · ")
-    }
-
-    private func minutes(_ seconds: Double) -> String {
-        let total = Int(seconds / 60)
-        return total >= 60 ? "\(total / 60) hr \(total % 60) min" : "\(total) minute\(total == 1 ? "" : "s")"
     }
 }
 
@@ -236,6 +232,7 @@ struct ArtistDetailView: View {
 
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: Player
+    @Environment(\.dismiss) private var dismiss
     @State private var pendingDelete: [Track]?
 
     private var current: ArtistEntry { library.artist(named: artist.name) ?? artist }
@@ -290,7 +287,9 @@ struct ArtistDetailView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(artist.singles) { track in
                         Button {
-                            if let index = artist.singles.firstIndex(of: track) { player.play(artist.singles, startAt: index) }
+                            if let index = artist.singles.firstIndex(where: { $0.id == track.id }) {
+                                player.play(artist.singles, startAt: index)
+                            }
                         } label: {
                             TrackRow(track: track).padding(.horizontal, 20).padding(.vertical, 6)
                         }
@@ -303,7 +302,10 @@ struct ArtistDetailView: View {
         }
         .padding(.bottom, 24)
         .navigationTitle(artist.name)
-        .confirmDelete($pendingDelete)
+        .confirmDelete($pendingDelete) { deleted in
+            let remaining = Set(allTracks.map(\.id)).subtracting(deleted.map(\.id))
+            if remaining.isEmpty { dismiss() }
+        }
     }
 }
 
@@ -314,6 +316,7 @@ struct MissingTrackRow: View {
     let onFind: () -> Void
 
     @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var transfers: TransfersStore
 
     var body: some View {
         HStack(spacing: 12) {
@@ -338,8 +341,8 @@ struct MissingTrackRow: View {
     private var action: some View {
         switch track.source {
         case let .soulseek(username, file):
-            switch soulseek.state(of: file, from: username) {
-            case .none, .some(.failed):
+            switch transfers.state(of: file, from: username) {
+            case .none, .some(.failed), .some(.paused):
                 Button {
                     soulseek.downloadMissing(file, from: username, into: album)
                 } label: {
@@ -368,20 +371,21 @@ struct FindTrackSheet: View {
     let album: Album
 
     @EnvironmentObject private var soulseek: SoulseekModel
+    @EnvironmentObject private var searchStore: SearchStore
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             List {
                 Section {
-                    if soulseek.trackCandidates.isEmpty {
+                    if searchStore.trackCandidates.isEmpty {
                         HStack(spacing: 10) {
-                            if soulseek.isFindingTrack { ProgressView() }
-                            Text(soulseek.isFindingTrack ? "Searching…" : "No matching files found.")
+                            if searchStore.isFindingTrack { ProgressView() }
+                            Text(searchStore.isFindingTrack ? "Searching…" : "No matching files found.")
                                 .foregroundStyle(.secondary)
                         }
                     }
-                    ForEach(soulseek.trackCandidates) { candidate in
+                    ForEach(searchStore.trackCandidates) { candidate in
                         Button {
                             soulseek.downloadMissing(candidate.file, from: candidate.username, into: album)
                             dismiss()
@@ -416,6 +420,7 @@ struct FindTrackSheet: View {
                 }
             }
             .task { soulseek.findTrack(artist: album.artist, title: track.title) }
+            .onDisappear { soulseek.stopTrackSearch() }
         }
     }
 

@@ -220,4 +220,89 @@ final class ProtocolTests: XCTestCase {
         }
         XCTAssertEqual(folders.first?.files.first?.path, "song.mp3")
     }
+
+    // MARK: Nicotine+ protocol extensions
+
+    func testNewServerRequestsAndEvents() throws {
+        // WatchUser (code 5)
+        var watchPayload = ByteWriter()
+        watchPayload.u32(5)
+        watchPayload.string("peer_user")
+        watchPayload.bool(true)
+        watchPayload.u32(2)
+        XCTAssertEqual(try ServerEvent.decode(watchPayload.data),
+                       .watchUser(username: "peer_user", exists: true, status: .online))
+
+        // GetUserStatus (code 7)
+        var statusPayload = ByteWriter()
+        statusPayload.u32(7)
+        statusPayload.string("peer_user")
+        statusPayload.u32(1)
+        statusPayload.bool(false)
+        XCTAssertEqual(try ServerEvent.decode(statusPayload.data),
+                       .userStatus(username: "peer_user", status: .away))
+
+        // ServerPing (code 32)
+        var pingPayload = ByteWriter()
+        pingPayload.u32(32)
+        XCTAssertEqual(try ServerEvent.decode(pingPayload.data), .serverPing)
+        XCTAssertEqual(ServerRequest.serverPing.code, 32)
+
+        // WishlistSearch (code 103) & WishlistInterval (code 104)
+        let wishFrame = ServerRequest.wishlistSearch(token: 99, query: "boards of canada").frame
+        var fb = FrameBuffer()
+        fb.append(wishFrame)
+        let wishBody = try XCTUnwrap(try fb.nextFrame())
+        var wishReader = ByteReader(wishBody)
+        XCTAssertEqual(try wishReader.u32(), 103)
+        XCTAssertEqual(try wishReader.u32(), 99)
+        XCTAssertEqual(try wishReader.string(), "boards of canada")
+
+        var intervalPayload = ByteWriter()
+        intervalPayload.u32(104)
+        intervalPayload.u32(720)
+        XCTAssertEqual(try ServerEvent.decode(intervalPayload.data), .wishlistInterval(seconds: 720))
+
+        // PossibleParents (code 102)
+        var parentsPayload = ByteWriter()
+        parentsPayload.u32(102)
+        parentsPayload.u32(1)
+        parentsPayload.string("parent1")
+        parentsPayload.u32(0xC6336417) // 198.51.100.23
+        parentsPayload.u32(2234)
+        XCTAssertEqual(try ServerEvent.decode(parentsPayload.data),
+                       .possibleParents([DistributedParent(username: "parent1", ip: "198.51.100.23", port: 2234)]))
+    }
+
+    func testDistributedMessagesAndEmbedded() throws {
+        var searchBody = ByteWriter()
+        searchBody.u8(3)
+        searchBody.u32(0)
+        searchBody.string("seeker")
+        searchBody.u32(42)
+        searchBody.string("autechre flac")
+        XCTAssertEqual(try DistributedMessage.decode(searchBody.data),
+                       .searchRequest(username: "seeker", token: 42, query: "autechre flac"))
+
+        var embedded = ByteWriter()
+        embedded.u32(93)
+        embedded.raw(searchBody.data)
+        guard case let .embeddedMessage(code, payload) = try ServerEvent.decode(embedded.data) else {
+            return XCTFail("Expected embeddedMessage")
+        }
+        XCTAssertEqual(code, 3)
+        XCTAssertEqual(try DistributedMessage.decodePayload(code: code, payload: payload),
+                       .searchRequest(username: "seeker", token: 42, query: "autechre flac"))
+    }
+
+    func testFrameBufferCursorDrain() throws {
+        var fb = FrameBuffer()
+        let first = PeerInitMessage.pierceFirewall(token: 12345).frame
+        let rawTail = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        fb.append(first + rawTail)
+        let body = try XCTUnwrap(try fb.nextFrame())
+        XCTAssertEqual(try PeerInitMessage.decode(body), .pierceFirewall(token: 12345))
+        XCTAssertEqual(fb.drain(), rawTail)
+        XCTAssertEqual(fb.bufferedCount, 0)
+    }
 }

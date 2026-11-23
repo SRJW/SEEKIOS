@@ -56,7 +56,7 @@ struct PlaylistRequest: Identifiable {
 }
 
 /// App-wide navigation and the pickers/sheets any screen can ask for (context menus can't
-/// present things themselves). Also handles colon3:// links from the Dynamic Island,
+/// present things themselves). Also handles colon3:// and seekios:// links from Dynamic Island,
 /// Shortcuts and Back Tap.
 @MainActor
 final class AppRouter: ObservableObject {
@@ -92,16 +92,29 @@ final class AppRouter: ObservableObject {
         playlistRequest = PlaylistRequest(tracks: tracks)
     }
 
+    func openSearch(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        showPlayer = false
+        tab = .search
+        pendingSearch = trimmed
+    }
+
     func lyricsChanged() { lyricsRevision += 1 }
 
     private func presentImporter(_ kind: ImportKind) {
+        guard !showImporter else { return }
         importKind = kind
         showImporter = true
     }
 
-    /// colon3://player, colon3://downloads, colon3://library, colon3://search?q=…, colon3://wifi
+    /// colon3:// or seekios:// links (player, downloads, library, search?q=…, settings, wifi)
     func handle(_ url: URL) {
-        switch url.host?.lowercased() {
+        let hostTarget = url.host?.lowercased() ?? ""
+        let pathTarget = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased()
+        let route = hostTarget.isEmpty ? pathTarget : hostTarget
+
+        switch route {
         case "player", "nowplaying":
             showPlayer = true
         case "downloads", "transfers":
@@ -121,8 +134,13 @@ final class AppRouter: ObservableObject {
             tab = .settings
         case "wifi", "transfer":
             showPlayer = false
+            let needsTabSwitch = tab != .settings
             tab = .settings
-            showWiFiTransfer = true
+            if needsTabSwitch {
+                Task { @MainActor in self.showWiFiTransfer = true }
+            } else {
+                showWiFiTransfer = true
+            }
         default:
             break
         }
