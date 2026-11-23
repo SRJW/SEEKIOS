@@ -904,11 +904,11 @@ struct DownloadsView: View {
         }
     }
 
-    private func groupTint(_ group: TransferGroup) -> AnyShapeStyle {
-        if group.completedCount == group.items.count { return AnyShapeStyle(Color.green) }
-        if group.activeCount > 0 { return AnyShapeStyle(.tint) }
-        if group.failedCount > 0 || group.pausedCount > 0 { return AnyShapeStyle(Color.orange) }
-        return AnyShapeStyle(Color.secondary)
+    private func groupTint(_ group: TransferGroup) -> Color? {
+        if group.completedCount == group.items.count { return .green }
+        if group.activeCount > 0 { return nil }
+        if group.failedCount > 0 || group.pausedCount > 0 { return .orange }
+        return .secondary
     }
 
     private func localContainerFolder(for group: TransferGroup) -> URL {
@@ -1120,7 +1120,7 @@ struct DownloadRow: View {
 
             if item.isActive || (item.received > 0 && item.progress < 1.0) {
                 ProgressView(value: item.progress)
-                    .tint(item.isActive ? AnyShapeStyle(.tint) : AnyShapeStyle(.orange))
+                    .tint(item.isActive ? nil : Color.orange)
             }
         }
         .padding(.vertical, 3)
