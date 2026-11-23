@@ -50,8 +50,8 @@ final class TransferMonitor {
         // Immediate keep-alive response when playback state or active transfer counts change (no 1s lag).
         transfers.$activeDownloadCount
             .combineLatest(transfers.$activeUploadCount, player.$isPlaying)
-            .sink { [weak self] _, _, _ in
-                self?.syncBackgroundKeeper()
+            .sink { [weak self] activeDown, activeUp, _ in
+                self?.syncBackgroundKeeper(busyOverride: activeDown > 0 || activeUp > 0)
             }
             .store(in: &subscriptions)
 
@@ -88,8 +88,8 @@ final class TransferMonitor {
         update(downloads: transfers.downloads, uploads: transfers.uploads)
     }
 
-    private func syncBackgroundKeeper() {
-        let busy = transfers.activeDownloadCount > 0 || transfers.activeUploadCount > 0
+    private func syncBackgroundKeeper(busyOverride: Bool? = nil) {
+        let busy = busyOverride ?? (transfers.activeDownloadCount > 0 || transfers.activeUploadCount > 0)
         let seeding = isSeeding && soulseek.hasCredentials
         let wantsKeeper = (busy && AppSettings.flag(AppSettings.backgroundTransfersKey)) || seeding
         AudioSessionCoordinator.shared.setBackgroundKeepAliveNeeded(wantsKeeper)
