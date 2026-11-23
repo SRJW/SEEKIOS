@@ -211,9 +211,9 @@ public final class SoulseekClient: @unchecked Sendable {
                 }
                 let activeTokens = Array(self.activeUploads.keys)
                 for token in activeTokens {
-                    for link in self.fileLinks.values {
+                    for link in Array(self.fileLinks.values) {
                         if case let .uploading(t) = link.role, t == token {
-                            self.closeFileLink(link)
+                            self.closeFile(link, reason: nil)
                         }
                     }
                     self.finishUpload(token: token, succeeded: false)
